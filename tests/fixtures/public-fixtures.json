@@ -1,1 +1,18 @@
-[]
+[
+  {
+    "name": "vbo-rs-basic.vbo",
+    "url": "https://raw.githubusercontent.com/RephlexZero/vbo-rs/c043460974d707fff13a9267bbd49794067d207e/tests/fixtures/basic.vbo",
+    "sha256": "3c6e79f8cb5f5516a8c54f6f9c3e079dd5fa4412c82c5ad8deb937c273faffb1",
+    "license": "MIT",
+    "source": "https://github.com/RephlexZero/vbo-rs/tree/c043460974d707fff13a9267bbd49794067d207e/tests/fixtures",
+    "notes": "Racelogic VBOX II packed-coordinate example fixture."
+  },
+  {
+    "name": "vbo-rs-continuous-minutes.vbo",
+    "url": "https://raw.githubusercontent.com/RephlexZero/vbo-rs/c043460974d707fff13a9267bbd49794067d207e/tests/fixtures/continuous_minutes.vbo",
+    "sha256": "4a3efcfe96eec676882d8af464e0360342b3560ae0ee62fd73bfc7ae1a0358fb",
+    "license": "MIT",
+    "source": "https://github.com/RephlexZero/vbo-rs/tree/c043460974d707fff13a9267bbd49794067d207e/tests/fixtures",
+    "notes": "Real Video VBOX HD2 fixture using continuous-minutes coordinates."
+  }
+]
