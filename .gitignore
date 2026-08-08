@@ -8,4 +8,6 @@
 *.ldx
 *.vbo
 *.mp4
+
+/tests/fixtures/public/
 *.parquet
