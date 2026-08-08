@@ -126,17 +126,19 @@ fn u64le(data: &[u8], offset: usize) -> Option<u64> {
 
 fn utf16le(data: &[u8], offset: usize, max_bytes: usize) -> String {
     let end = offset.saturating_add(max_bytes).min(data.len());
-    let mut units = Vec::with_capacity((end.saturating_sub(offset)) / 2);
-    let mut pos = offset;
-    while pos + 1 < end {
-        let code = u16le(data, pos).unwrap_or(0);
-        if code == 0 {
-            break;
-        }
-        units.push(code);
-        pos += 2;
+    let units = (offset..end.saturating_sub(1))
+        .step_by(2)
+        .map(|pos| u16le(data, pos).unwrap_or(0))
+        .take_while(|code| *code != 0);
+    let mut text = String::with_capacity(end.saturating_sub(offset) / 2);
+    for decoded in char::decode_utf16(units) {
+        text.push(decoded.unwrap_or(char::REPLACEMENT_CHARACTER));
     }
-    String::from_utf16_lossy(&units).trim().to_owned()
+    if text.trim().len() == text.len() {
+        text
+    } else {
+        text.trim().to_owned()
+    }
 }
 
 fn read_entries_at(data: &[u8], start: usize) -> Vec<DirEntry> {
@@ -264,12 +266,12 @@ fn marker_defs(data: &[u8], layout: Layout) -> Vec<ChannelDef> {
     let records: Vec<&[u8]> = raw.iter().map(|(_, _, record)| *record).collect();
     let def_layout = DefLayout::detect(&records, 0x10);
 
-    raw.iter()
+    raw.into_iter()
         .map(|(id, name, record)| {
             let (unit, unit_source) = def_layout.resolve(record);
             ChannelDef {
-                id: *id,
-                name: name.clone(),
+                id,
+                name,
                 unit,
                 unit_source,
                 sample_type: SampleType::from_pds_code(u32le(record, 0xd8).unwrap_or(6)),
@@ -309,7 +311,7 @@ fn markerless_defs(data: &[u8], layout: Layout, is_export: bool) -> Vec<ChannelD
     let records: Vec<&[u8]> = raw.iter().map(|(_, _, record)| *record).collect();
     let def_layout = DefLayout::detect(&records, 8);
 
-    raw.iter()
+    raw.into_iter()
         .map(|(id, name, record)| {
             let (unit, unit_source) = def_layout.resolve(record);
             let code = if !is_export && record_size >= 0xd4 {
@@ -320,8 +322,8 @@ fn markerless_defs(data: &[u8], layout: Layout, is_export: bool) -> Vec<ChannelD
                 7
             };
             ChannelDef {
-                id: *id,
-                name: name.clone(),
+                id,
+                name,
                 unit,
                 unit_source,
                 sample_type: SampleType::from_pds_code(code),
@@ -451,39 +453,44 @@ impl CosworthFile {
         }
         let raw_chunks = parse_chunks(&data, layout, is_export);
 
-        let mut grouped: HashMap<u32, Vec<RawChunk>> = HashMap::new();
+        let by_id = defs
+            .iter()
+            .enumerate()
+            .map(|(index, def)| (def.id, index))
+            .collect::<HashMap<_, _>>();
+        let mut grouped = vec![Vec::<RawChunk>::new(); defs.len()];
         for chunk in raw_chunks {
-            grouped.entry(chunk.channel_id).or_default().push(chunk);
+            if let Some(&index) = by_id.get(&chunk.channel_id) {
+                grouped[index].push(chunk);
+            }
         }
         let mut channels = Vec::with_capacity(defs.len());
-        for def in defs {
+        for (def, raw) in defs.into_iter().zip(grouped) {
             let mut chunks = Vec::new();
             let mut sample_base = 0u64;
             let mut time_base_ns = 0u64;
-            if let Some(raw) = grouped.remove(&def.id) {
-                // Deliberately preserve chunk-index table order. `order` and
-                // data_ptr are not temporal keys in interrupted native logs.
-                for chunk in raw {
-                    let width = def.sample_type.byte_width() as u64;
-                    let max_count = (data.len() as u64).saturating_sub(chunk.data_ptr) / width;
-                    let count = chunk.sample_count.min(max_count);
-                    if count == 0 {
-                        continue;
-                    }
-                    chunks.push(Chunk {
-                        sample_period_ns: chunk.sample_period_ticks as u64 * TICK_NS,
-                        sample_count: count,
-                        data_ptr: chunk.data_ptr,
-                        sample_base,
-                        time_base_ns,
-                    });
-                    sample_base = sample_base.saturating_add(count);
-                    time_base_ns = time_base_ns.saturating_add(
-                        count
-                            .saturating_mul(chunk.sample_period_ticks as u64)
-                            .saturating_mul(TICK_NS),
-                    );
+            // Deliberately preserve chunk-index table order. `order` and
+            // data_ptr are not temporal keys in interrupted native logs.
+            for chunk in raw {
+                let width = def.sample_type.byte_width() as u64;
+                let max_count = (data.len() as u64).saturating_sub(chunk.data_ptr) / width;
+                let count = chunk.sample_count.min(max_count);
+                if count == 0 {
+                    continue;
                 }
+                chunks.push(Chunk {
+                    sample_period_ns: chunk.sample_period_ticks as u64 * TICK_NS,
+                    sample_count: count,
+                    data_ptr: chunk.data_ptr,
+                    sample_base,
+                    time_base_ns,
+                });
+                sample_base = sample_base.saturating_add(count);
+                time_base_ns = time_base_ns.saturating_add(
+                    count
+                        .saturating_mul(chunk.sample_period_ticks as u64)
+                        .saturating_mul(TICK_NS),
+                );
             }
             channels.push(Channel {
                 id: def.id,

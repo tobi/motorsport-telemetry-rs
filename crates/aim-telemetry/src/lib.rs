@@ -113,7 +113,7 @@ fn child(data: &[u8], parent: BoxRef, kind: &[u8; 4]) -> Option<BoxRef> {
 #[derive(Debug)]
 struct TrackSamples {
     _timescale: u32,
-    samples: Vec<(u64, u32, u64)>, // file offset, byte size, decode timestamp
+    samples: Vec<(u64, u32)>, // file offset, byte size
 }
 
 #[derive(Clone, Copy)]
@@ -198,18 +198,14 @@ fn parse_track(data: &[u8], trak: BoxRef, path: &str) -> Result<Option<TrackSamp
     let stts = child(data, stbl, b"stts").ok_or_else(|| invalid(path, "aimd track has no stts"))?;
     let stts_count =
         be32(data, stts.payload + 4).ok_or_else(|| invalid(path, "truncated stts"))? as usize;
-    let mut timestamps = Vec::with_capacity(count);
-    let mut time = 0u64;
+    let mut timestamp_count = 0usize;
     for i in 0..stts_count {
         let at = stts.payload + 8 + i * 8;
         let n = be32(data, at).ok_or_else(|| invalid(path, "truncated stts entries"))?;
-        let delta = be32(data, at + 4).ok_or_else(|| invalid(path, "truncated stts entries"))?;
-        for _ in 0..n {
-            timestamps.push(time);
-            time = time.saturating_add(delta as u64);
-        }
+        be32(data, at + 4).ok_or_else(|| invalid(path, "truncated stts entries"))?;
+        timestamp_count = timestamp_count.saturating_add(n as usize);
     }
-    if timestamps.len() != sizes.len() {
+    if timestamp_count != sizes.len() {
         return Err(invalid(path, "stts/stsz sample counts differ"));
     }
 
@@ -234,7 +230,7 @@ fn parse_track(data: &[u8], trak: BoxRef, path: &str) -> Result<Option<TrackSamp
             {
                 return Err(invalid(path, "aimd sample points outside the MP4"));
             }
-            locations.push((offset, size, timestamps[sample]));
+            locations.push((offset, size));
             offset += size as u64;
             sample += 1;
         }
@@ -348,6 +344,12 @@ fn video_frame_times_ns(data: &[u8], path: &str) -> Result<Vec<u64>, AimError> {
     Ok(Vec::new())
 }
 
+fn normalize_samples(samples: &mut [SampleRef], origin: u64) {
+    for sample in samples {
+        sample.time_ns = sample.time_ns.saturating_sub(origin);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SampleRef {
     value_offset: u64,
@@ -416,6 +418,7 @@ pub struct AimFile {
     pub channels: Vec<Channel>,
     data: Storage,
     aim_channels: Vec<AimChannel>,
+    gps_samples: Vec<SampleRef>,
     video_frame_times_ns: Vec<u64>,
 }
 
@@ -610,11 +613,18 @@ fn period_chunks(samples: &[SampleRef]) -> Vec<Chunk> {
     }
     // Logger timestamps have occasional millisecond jitter. Use the modal
     // delta as the native rate, splitting only at real acquisition gaps.
-    let mut counts = HashMap::<u64, usize>::new();
+    // Logger jitter normally produces only a handful of distinct deltas. A
+    // tiny linear table avoids hashing every sample in every channel while
+    // retaining the exact modal-delta tie break.
+    let mut counts = Vec::<(u64, usize)>::new();
     for pair in samples.windows(2) {
         let delta = pair[1].time_ns.saturating_sub(pair[0].time_ns);
         if delta > 0 {
-            *counts.entry(delta).or_default() += 1;
+            if let Some((_, count)) = counts.iter_mut().find(|(value, _)| *value == delta) {
+                *count += 1;
+            } else {
+                counts.push((delta, 1));
+            }
         }
     }
     let period = counts
@@ -647,6 +657,39 @@ fn period_chunks(samples: &[SampleRef]) -> Vec<Chunk> {
         time_base_ns: samples[start].time_ns,
     });
     chunks
+}
+
+#[inline]
+fn scalar_record_start(packet: &[u8], mut at: usize) -> Option<usize> {
+    while let Some(relative) = packet
+        .get(at..)?
+        .iter()
+        .position(|byte| *byte == RECORD_START[0])
+    {
+        let start = at + relative;
+        if packet.get(start + 1) == Some(&RECORD_START[1]) {
+            return Some(start);
+        }
+        at = start + 1;
+    }
+    None
+}
+
+#[inline]
+fn gps_record_start(packet: &[u8], mut at: usize) -> Option<usize> {
+    const GPS_START: &[u8; 5] = b"<hGPS";
+    while let Some(relative) = packet
+        .get(at..)?
+        .iter()
+        .position(|byte| *byte == GPS_START[0])
+    {
+        let start = at + relative;
+        if packet.get(start..start + GPS_START.len()) == Some(GPS_START) {
+            return Some(start);
+        }
+        at = start + 1;
+    }
+    None
 }
 
 impl AimFile {
@@ -688,20 +731,22 @@ impl AimFile {
         }
         let definitions = schema(first_bytes, &display)?;
         let (mut channels, mut aim_channels): (Vec<_>, Vec<_>) = definitions.into_iter().unzip();
-        let by_record = aim_channels
+        // Record IDs are protocol u16 values and occur in every scalar sample.
+        // A dense dispatch table makes the hot packet loop a bounds check and
+        // array load instead of a hash operation. Zero denotes an unknown or
+        // GPS-only record; scalar channel indices are stored one-based.
+        let mut by_record = vec![0u16; u16::MAX as usize + 1];
+        for (index, channel) in aim_channels.iter().enumerate() {
+            if !channel.representation.is_gps() {
+                by_record[channel.record_id as usize] = index as u16 + 1;
+            }
+        }
+        let has_gps = aim_channels
             .iter()
-            .enumerate()
-            .filter(|(_, channel)| !channel.representation.is_gps())
-            .map(|(i, channel)| (channel.record_id, i))
-            .collect::<HashMap<_, _>>();
-        let gps_indices = aim_channels
-            .iter()
-            .enumerate()
-            .filter(|(_, channel)| channel.representation.is_gps())
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+            .any(|channel| channel.representation.is_gps());
+        let mut gps_samples = Vec::new();
 
-        for &(offset, size, _) in track.samples.iter().skip(1) {
+        for &(offset, size) in track.samples.iter().skip(1) {
             let packet = &data[offset as usize..offset as usize + size as usize];
             if be16(packet, 0).map(usize::from) != Some(packet.len().saturating_sub(2)) {
                 return Err(invalid(
@@ -713,19 +758,17 @@ impl AimFile {
                 return Err(invalid(&display, "aimd packet has no amv0 signature"));
             }
             let mut at = 10usize;
-            while let Some(relative) = packet
-                .get(at..)
-                .and_then(|tail| tail.windows(2).position(|window| window == RECORD_START))
-            {
-                let start = at + relative;
+            while let Some(start) = scalar_record_start(packet, at) {
                 let timestamp = le32(packet, start + 2)
                     .ok_or_else(|| invalid(&display, "truncated AiM sample record"))?;
                 let record_id = le16(packet, start + 6)
                     .ok_or_else(|| invalid(&display, "truncated AiM sample record"))?;
-                let Some(&index) = by_record.get(&record_id) else {
+                let encoded_index = by_record[record_id as usize];
+                if encoded_index == 0 {
                     at = start + 2;
                     continue;
-                };
+                }
+                let index = encoded_index as usize - 1;
                 let width = aim_channels[index].width;
                 let value = start + 8;
                 if packet.get(value + width) != Some(&b')') {
@@ -740,18 +783,14 @@ impl AimFile {
             }
 
             let mut gps_at = 10usize;
-            while let Some(relative) = packet
-                .get(gps_at..)
-                .and_then(|tail| tail.windows(5).position(|window| window == b"<hGPS"))
-            {
-                let header = gps_at + relative;
+            while let Some(header) = gps_record_start(packet, gps_at) {
                 let size = le32(packet, header + 6).unwrap_or(0) as usize;
                 let payload = header + 12;
                 let end = payload.saturating_add(size);
                 if size == 56 && end <= packet.len() {
                     let timestamp = le32(packet, payload).unwrap_or(0);
-                    for &index in &gps_indices {
-                        aim_channels[index].samples.push(SampleRef {
+                    if has_gps {
+                        gps_samples.push(SampleRef {
                             value_offset: offset + payload as u64,
                             time_ns: timestamp as u64 * 1_000_000,
                         });
@@ -762,7 +801,9 @@ impl AimFile {
         }
         if aim_channels
             .iter()
+            .filter(|channel| !channel.representation.is_gps())
             .all(|channel| channel.samples.is_empty())
+            && gps_samples.is_empty()
         {
             return Err(invalid(
                 &display,
@@ -773,18 +814,27 @@ impl AimFile {
             .iter()
             .filter_map(|channel| channel.samples.first())
             .map(|sample| sample.time_ns)
+            .chain(gps_samples.first().map(|sample| sample.time_ns))
             .min()
             .unwrap_or(0);
         for raw in &mut aim_channels {
-            for sample in &mut raw.samples {
-                sample.time_ns = sample.time_ns.saturating_sub(origin);
-            }
+            normalize_samples(&mut raw.samples, origin);
         }
+        normalize_samples(&mut gps_samples, origin);
+        let gps_chunks = period_chunks(&gps_samples);
         for (channel, raw) in channels.iter_mut().zip(&aim_channels) {
-            channel.sample_count = raw.samples.len() as u64;
-            channel.chunks = period_chunks(&raw.samples);
-            channel.duration_ns = raw
-                .samples
+            let samples = if raw.representation.is_gps() {
+                &gps_samples
+            } else {
+                &raw.samples
+            };
+            channel.sample_count = samples.len() as u64;
+            channel.chunks = if raw.representation.is_gps() {
+                gps_chunks.clone()
+            } else {
+                period_chunks(samples)
+            };
+            channel.duration_ns = samples
                 .last()
                 .map(|sample| sample.time_ns + channel.first_period_ns().unwrap_or(1))
                 .unwrap_or(0);
@@ -794,6 +844,7 @@ impl AimFile {
             channels,
             data,
             aim_channels,
+            gps_samples,
             video_frame_times_ns,
         })
     }
@@ -861,7 +912,12 @@ impl TelemetrySource for AimFile {
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
         let chunk = &self.channels[channel_index].chunks[chunk_index];
         let raw = &self.aim_channels[channel_index];
-        let sample = raw.samples[(chunk.sample_base + local_index) as usize];
+        let samples = if raw.representation.is_gps() {
+            &self.gps_samples
+        } else {
+            &raw.samples
+        };
+        let sample = samples[(chunk.sample_base + local_index) as usize];
         let at = sample.value_offset as usize;
         match raw.representation {
             Representation::U8 => self.data[at] as f64,

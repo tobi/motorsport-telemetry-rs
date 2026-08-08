@@ -136,26 +136,26 @@ impl Quantity {
     /// accepts the spellings real files use rather than requiring an exact
     /// match against [`Self::si_unit`].
     fn accepts(self, unit: &str) -> bool {
-        let lower = unit.to_ascii_lowercase();
-        let text = lower.trim();
+        let text = unit.trim();
+        let any = |values: &[&str]| values.iter().any(|value| text.eq_ignore_ascii_case(value));
         match self {
-            Self::Length => matches!(text, "m" | "mm" | "cm" | "km"),
-            Self::Volume => matches!(text, "m^3" | "l" | "litre" | "liter" | "ml" | "cc"),
-            Self::Speed => matches!(text, "m/s" | "km/h" | "kph" | "mph"),
-            Self::Temperature => matches!(text, "k" | "c" | "degc" | "f"),
-            Self::Time => matches!(text, "s" | "sec" | "ms" | "us" | "min"),
-            Self::AbsoluteTime => matches!(text, "s" | "sec" | "date" | "time"),
-            Self::Angle => matches!(text, "rad" | "deg" | "degree" | "degrees"),
-            Self::AngularVelocity => matches!(text, "rad/s" | "rpm" | "deg/s"),
-            Self::AngularAcceleration => matches!(text, "rad/s^2" | "rad/s2" | "deg/s^2"),
-            Self::Pressure => matches!(text, "pa" | "kpa" | "bar" | "mbar" | "psi"),
-            Self::Acceleration => matches!(text, "m/s^2" | "m/s2" | "g" | "mps_2"),
-            Self::Voltage => matches!(text, "v" | "mv" | "volt" | "volts"),
-            Self::Current => matches!(text, "a" | "ma" | "amp" | "amps"),
-            Self::Mass => matches!(text, "kg" | "g" | "lb"),
-            Self::Force => matches!(text, "n" | "kn" | "lbf"),
-            Self::Torque => matches!(text, "nm" | "n.m" | "n-m" | "lbft"),
-            Self::PerUnit => matches!(text, "pp1" | "%" | "ratio" | ""),
+            Self::Length => any(&["m", "mm", "cm", "km"]),
+            Self::Volume => any(&["m^3", "l", "litre", "liter", "ml", "cc"]),
+            Self::Speed => any(&["m/s", "km/h", "kph", "mph"]),
+            Self::Temperature => any(&["k", "c", "degc", "f"]),
+            Self::Time => any(&["s", "sec", "ms", "us", "min"]),
+            Self::AbsoluteTime => any(&["s", "sec", "date", "time"]),
+            Self::Angle => any(&["rad", "deg", "degree", "degrees"]),
+            Self::AngularVelocity => any(&["rad/s", "rpm", "deg/s"]),
+            Self::AngularAcceleration => any(&["rad/s^2", "rad/s2", "deg/s^2"]),
+            Self::Pressure => any(&["pa", "kpa", "bar", "mbar", "psi"]),
+            Self::Acceleration => any(&["m/s^2", "m/s2", "g", "mps_2"]),
+            Self::Voltage => any(&["v", "mv", "volt", "volts"]),
+            Self::Current => any(&["a", "ma", "amp", "amps"]),
+            Self::Mass => any(&["kg", "g", "lb"]),
+            Self::Force => any(&["n", "kn", "lbf"]),
+            Self::Torque => any(&["nm", "n.m", "n-m", "lbft"]),
+            Self::PerUnit => any(&["pp1", "%", "ratio", ""]),
             // Dimensionless channels legitimately carry marker text.
             Self::Dimensionless => text.is_empty() || is_dimensionless_marker(text),
             Self::Unknown(_) => true,
@@ -261,9 +261,8 @@ impl DefLayout {
             }
             let mut hits = 0usize;
             for record in records {
-                match utf16_field(record, offset, 24) {
-                    Some(text) if !text.is_empty() && text.len() <= 12 => hits += 1,
-                    _ => {}
+                if let Some(1..=12) = utf16_field_len(record, offset, 24) {
+                    hits += 1;
                 }
             }
             if hits > 0 {
@@ -285,12 +284,17 @@ impl DefLayout {
         // Candidate quantity offsets: u32 values that stay small.
         let mut quantity_candidates: Vec<usize> = Vec::new();
         for offset in (0..record_len.saturating_sub(4)).step_by(4) {
-            let mut distinct = std::collections::BTreeSet::new();
+            let mut first = None;
+            let mut varies = false;
             let mut ok = true;
             for record in records {
                 match u32_field(record, offset) {
                     Some(value) if value <= 64 => {
-                        distinct.insert(value);
+                        if let Some(first) = first {
+                            varies |= value != first;
+                        } else {
+                            first = Some(value);
+                        }
                     }
                     _ => {
                         ok = false;
@@ -299,7 +303,7 @@ impl DefLayout {
                 }
             }
             // Require some variation: an all-zero word carries no information.
-            if ok && distinct.len() >= 2 {
+            if ok && varies {
                 quantity_candidates.push(offset);
             }
         }
@@ -424,6 +428,36 @@ impl DefLayout {
 fn u32_field(record: &[u8], offset: usize) -> Option<u32> {
     let bytes = record.get(offset..offset + 4)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Validate a UTF-16LE field and return its trimmed ASCII length without
+/// allocating. Layout detection only needs plausibility and length; actual
+/// strings are decoded after the layout has been selected.
+fn utf16_field_len(record: &[u8], offset: usize, max_bytes: usize) -> Option<usize> {
+    let end = (offset + max_bytes).min(record.len());
+    let slice = record.get(offset..end)?;
+    let mut length = 0usize;
+    let mut trimmed = 0usize;
+    let mut started = false;
+    for pair in slice.chunks_exact(2) {
+        let code = u16::from_le_bytes([pair[0], pair[1]]);
+        if code == 0 {
+            return Some(trimmed);
+        }
+        if !(0x20..0x7f).contains(&code) {
+            return None;
+        }
+        if code != b' ' as u16 {
+            started = true;
+        }
+        if started {
+            length += 1;
+        }
+        if started && code != b' ' as u16 {
+            trimmed = length;
+        }
+    }
+    Some(trimmed)
 }
 
 /// Decode a NUL-terminated UTF-16LE field.
