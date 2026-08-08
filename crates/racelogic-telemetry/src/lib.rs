@@ -6,16 +6,16 @@ use thiserror::Error;
 
 pub fn read_metadata(
     path: impl AsRef<Path>,
-) -> Result<motorsport_telemetry_core::FileMetadata, VboError> {
-    VboFile::open_mode(path, true)
+) -> Result<motorsport_telemetry_core::FileMetadata, RacelogicError> {
+    RacelogicFile::open_mode(path, true)
         .map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
 pub fn read_metadata_from_bytes(
     path: impl Into<String>,
     data: Vec<u8>,
-) -> Result<motorsport_telemetry_core::FileMetadata, VboError> {
-    VboFile::from_slice_mode(path.into(), &data, true)
+) -> Result<motorsport_telemetry_core::FileMetadata, RacelogicError> {
+    RacelogicFile::from_slice_mode(path.into(), &data, true)
         .map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
@@ -49,7 +49,7 @@ const BUILTIN_SHORT: [&str; 12] = [
 ];
 
 #[derive(Debug, Error)]
-pub enum VboError {
+pub enum RacelogicError {
     #[error("I/O error for {path}: {source}")]
     Io {
         path: String,
@@ -71,7 +71,7 @@ struct Sections<'a> {
 }
 
 #[derive(Debug)]
-pub struct VboFile {
+pub struct RacelogicFile {
     pub path: String,
     pub channels: Vec<Channel>,
     pub time_ns: Vec<u64>,
@@ -79,8 +79,8 @@ pub struct VboFile {
     absolute_start_ns: u64,
 }
 
-fn invalid(path: &str, message: impl Into<String>) -> VboError {
-    VboError::Invalid {
+fn invalid(path: &str, message: impl Into<String>) -> RacelogicError {
+    RacelogicError::Invalid {
         path: path.into(),
         message: message.into(),
     }
@@ -158,37 +158,33 @@ fn metadata_channel(name: &str) -> bool {
     )
 }
 
-impl VboFile {
-    /// Memory-maps the file and parses straight out of the mapping. VBO is a
-    /// text format, so the previous read-then-`String`-copy path held the whole
-    /// session twice on the heap before parsing began.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, VboError> {
+impl RacelogicFile {
+    /// Memory-maps the file and parses straight out of the mapping.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, RacelogicError> {
         Self::open_mode(path, false)
     }
 
-    fn open_mode(path: impl AsRef<Path>, metadata_only: bool) -> Result<Self, VboError> {
+    fn open_mode(path: impl AsRef<Path>, metadata_only: bool) -> Result<Self, RacelogicError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
-        let file = File::open(path).map_err(|source| VboError::Io {
+        let file = File::open(path).map_err(|source| RacelogicError::Io {
             path: display.clone(),
             source,
         })?;
-        // SAFETY: same contract as every other decoder in this workspace —
-        // telemetry files are treated as immutable evidence and are not
-        // written while open. External truncation would fault, as documented
-        // by memmap2.
-        let mapping = unsafe { Mmap::map(&file) }.map_err(|source| VboError::Io {
+        // SAFETY: the read-only mapping remains valid for this parse and
+        // callers must not truncate or rewrite the file concurrently.
+        let mapping = unsafe { Mmap::map(&file) }.map_err(|source| RacelogicError::Io {
             path: display.clone(),
             source,
         })?;
         Self::from_slice_mode(display, &mapping, metadata_only)
     }
 
-    pub fn from_bytes(path: impl Into<String>, bytes: Vec<u8>) -> Result<Self, VboError> {
+    pub fn from_bytes(path: impl Into<String>, bytes: Vec<u8>) -> Result<Self, RacelogicError> {
         Self::from_slice_mode(path.into(), &bytes, false)
     }
 
-    pub fn from_slice(path: impl Into<String>, bytes: &[u8]) -> Result<Self, VboError> {
+    pub fn from_slice(path: impl Into<String>, bytes: &[u8]) -> Result<Self, RacelogicError> {
         Self::from_slice_mode(path.into(), bytes, false)
     }
 
@@ -196,7 +192,7 @@ impl VboFile {
         display: String,
         bytes: &[u8],
         metadata_only: bool,
-    ) -> Result<Self, VboError> {
+    ) -> Result<Self, RacelogicError> {
         if bytes.is_empty() {
             return Err(invalid(&display, "empty file"));
         }
@@ -359,7 +355,7 @@ impl VboFile {
     }
 }
 
-impl TelemetrySource for VboFile {
+impl TelemetrySource for RacelogicFile {
     fn path(&self) -> &str {
         &self.path
     }
@@ -425,9 +421,10 @@ mod tests {
     #[test]
     fn parses_irregular_timestamps_and_interpolates_continuous_values() {
         let fixture = fixture("[header]\ntime\nvelocity kmh\n[column names]\ntime velocity\n[data]\n120000.0 10\n120000.5 20\n120001.5 40\n");
-        let file = VboFile::open(fixture.path()).unwrap();
+        let file = RacelogicFile::open(fixture.path()).unwrap();
         let in_memory =
-            VboFile::from_bytes("fixture.vbo", std::fs::read(fixture.path()).unwrap()).unwrap();
+            RacelogicFile::from_bytes("fixture.vbo", std::fs::read(fixture.path()).unwrap())
+                .unwrap();
         assert_eq!(in_memory.channels.len(), 2);
         let metadata = read_metadata(fixture.path()).unwrap();
         assert_eq!(metadata.channel_count, 2);
@@ -440,7 +437,7 @@ mod tests {
     #[test]
     fn handles_midnight_rollover_and_stepwise_gear() {
         let fixture = fixture("[header]\ntime\ngear\n[column names]\ntime Gear\n[data]\n235959.5 3\n000000.0 4\n000000.5 4\n");
-        let file = VboFile::open(fixture.path()).unwrap();
+        let file = RacelogicFile::open(fixture.path()).unwrap();
         assert_eq!(file.time_ns, [0, 500_000_000, 1_000_000_000]);
         assert_eq!(file.sample_at(1, 250_000_000, true), Some(3.0));
     }
@@ -461,7 +458,7 @@ mod tests {
              120000.0 1 2 3 4 5 6 7 8 9 10 11 12 13\n\
              120001.0 1 2 3 4 5 6 7 8 9 10 11 12 13\n"
         ));
-        let file = VboFile::open(fixture.path()).unwrap();
+        let file = RacelogicFile::open(fixture.path()).unwrap();
         assert_eq!(file.channels.len(), 14);
         // The first builtin column keeps its spec-fixed unit (or none); the
         // custom channels must carry exactly their declared units in order.
@@ -475,13 +472,13 @@ mod tests {
     fn rejects_missing_data_and_time_sections() {
         let no_data = fixture("[header]\ntime\n");
         assert!(matches!(
-            VboFile::open(no_data.path()),
-            Err(VboError::Invalid { .. })
+            RacelogicFile::open(no_data.path()),
+            Err(RacelogicError::Invalid { .. })
         ));
         let no_time = fixture("[column names]\nspeed\n[data]\n1\n2\n");
         assert!(matches!(
-            VboFile::open(no_time.path()),
-            Err(VboError::Invalid { .. })
+            RacelogicFile::open(no_time.path()),
+            Err(RacelogicError::Invalid { .. })
         ));
     }
 }

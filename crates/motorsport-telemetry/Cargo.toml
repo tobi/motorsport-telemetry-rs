@@ -1,0 +1,24 @@
+[package]
+name = "motorsport-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified Rust interface for motorsport telemetry formats, sessions, laps, video, GPS, and tracks"
+keywords = ["motorsport", "telemetry", "gps", "racing"]
+readme = "README.md"
+categories = ["parser-implementations", "science"]
+
+[dependencies]
+motorsport-telemetry-core.workspace = true
+motorsport-track-atlas.workspace = true
+aim-telemetry.workspace = true
+cosworth-telemetry.workspace = true
+motec-telemetry.workspace = true
+serde_json.workspace = true
+racelogic-telemetry.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

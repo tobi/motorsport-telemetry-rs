@@ -1,18 +1,11 @@
 /target/
-/build/
-/configure/
-*.duckdb
 .DS_Store
 
-/wasm-extension/target/
-/web/node_modules/
-/web/dist/
-/web/public/
-
-# Telemetry data is private and often large. The checked-in fixtures are small,
-# deterministic synthetic files; real telemetry logs must never be committed.
+# Real telemetry is private and often large. Only deterministic synthetic
+# fixtures under tests/fixtures are force-added.
 *.pds
 *.ld
 *.ldx
 *.vbo
+*.mp4
 *.parquet

@@ -1,9 +1,9 @@
 use motorsport_telemetry_core::TelemetrySource;
-use vbo_telemetry::VboFile;
+use racelogic_telemetry::RacelogicFile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).expect("usage: inspect FILE.vbo");
-    let file = VboFile::open(path)?;
+    let file = RacelogicFile::open(path)?;
     println!(
         "{}: {} rows, {} channels",
         file.path(),

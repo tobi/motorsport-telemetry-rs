@@ -1,0 +1,23 @@
+[package]
+name = "motorsport-track-atlas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Offline racing-circuit metadata and GPS track matching generated from track-atlas"
+keywords = ["motorsport", "tracks", "gps", "geojson"]
+readme = "README.md"
+categories = ["science", "data-structures"]
+include = ["src/**", "data/**", "build.rs", "Cargo.toml", "README.md"]
+build = "build.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
