@@ -31,11 +31,11 @@
 //!
 //! # Dimensionless is not a free pass
 //!
-//! Marker strings (`raw`, `flag`, `Driver`) map to [`Dimension::Dimensionless`]
-//! but are *not* mutually convertible with ratios like `%`. A gear position and
-//! a percentage are both "unitless" and converting between them is meaningless,
-//! so markers get their own [`Dimension::Marker`]. This is the distinction that
-//! stops "unitless" becoming a hole in the type system.
+//! Marker strings (`raw`, `flag`, `Driver`) map to [`Dimension::Marker`] and
+//! are *not* mutually convertible with ratios like `%`. A gear position and a
+//! percentage are both "unitless" and converting between them is meaningless.
+//! Keeping markers distinct from [`Dimension::Ratio`] stops "unitless" becoming
+//! a hole in the type system.
 
 use std::fmt;
 
@@ -43,27 +43,49 @@ use std::fmt;
 /// one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dimension {
+    /// Distance or displacement.
     Length,
+    /// Linear speed.
     Speed,
+    /// Linear acceleration.
     Acceleration,
+    /// Plane angle.
     Angle,
+    /// Rate of change of angle.
     AngularVelocity,
+    /// Rate of change of angular velocity.
     AngularAcceleration,
+    /// Force per unit area.
     Pressure,
+    /// Thermodynamic temperature.
     Temperature,
+    /// Duration.
     Time,
+    /// Cycles or events per unit time.
     Frequency,
+    /// Force.
     Force,
+    /// Rotational force.
     Torque,
+    /// Work or stored energy.
     Energy,
+    /// Energy per unit time.
     Power,
+    /// Electric potential.
     Voltage,
+    /// Electric current.
     Current,
+    /// Electrical resistance.
     Resistance,
+    /// Mass.
     Mass,
+    /// Three-dimensional volume.
     Volume,
+    /// Volume per unit time.
     VolumetricFlow,
+    /// Mass per unit time.
     MassFlow,
+    /// Dimensionless fraction or percentage.
     Ratio,
     /// A pure count or index: gear number, lap count, error code.
     Count,
@@ -157,9 +179,11 @@ impl fmt::Display for Dimension {
 pub struct UnitDef {
     /// Canonical spelling, e.g. `m/s`.
     pub canonical: &'static str,
+    /// Physical dimension measured by this unit.
     pub dimension: Dimension,
     /// `value_in_base = value * factor + offset`.
     pub factor: f64,
+    /// Affine offset applied after scaling into the base unit.
     pub offset: f64,
     /// Alternate spellings seen in real files.
     pub aliases: &'static [&'static str],
@@ -480,13 +504,22 @@ pub enum ConvertError {
     UnknownUnit(String),
     /// Both units are known but measure different things.
     DimensionMismatch {
+        /// Canonical source-unit spelling.
         from: String,
+        /// Physical dimension of the source unit.
         from_dimension: Dimension,
+        /// Canonical destination-unit spelling.
         to: String,
+        /// Physical dimension of the destination unit.
         to_dimension: Dimension,
     },
     /// The dimension is a label or count, so scaling it is meaningless.
-    NotConvertible { unit: String, dimension: Dimension },
+    NotConvertible {
+        /// Canonical unit spelling.
+        unit: String,
+        /// Non-scalable dimension assigned to the unit.
+        dimension: Dimension,
+    },
 }
 
 impl fmt::Display for ConvertError {

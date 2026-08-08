@@ -8,10 +8,12 @@ use motorsport_telemetry_core::TelemetrySource;
 
 const MIN_MARKER_SPACING_NS: u64 = 5_000_000_000;
 
+/// Lap beacon times inferred from one source channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LapMarkers {
     /// Beacon times relative to the beginning of the recording.
     pub times_ns: Vec<u64>,
+    /// Exact name of the channel used to infer the markers.
     pub source_channel: String,
 }
 

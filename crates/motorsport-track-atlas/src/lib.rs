@@ -1,42 +1,71 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
+
+/// One racing layout at a facility.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Layout {
+    /// Stable layout identifier within the track.
     pub id: &'static str,
+    /// Human-readable layout name.
     pub name: &'static str,
+    /// Official lap length in metres, when known.
     pub length_m: Option<f64>,
+    /// Declared driving direction, when known.
     pub direction: Option<&'static str>,
+    /// Original compact centerline representation from track-atlas.
     pub centerline: &'static str,
+    /// Centerline as an embedded GeoJSON feature collection.
     pub centerline_geojson: &'static str,
+    /// JSON array containing point layers such as corners and start/finish.
     pub point_layers_json: &'static str,
+    /// JSON array containing range layers such as sectors and complexes.
     pub range_layers_json: &'static str,
 }
 
+/// A racing facility and all of its known layouts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Track {
+    /// Stable track-atlas slug.
     pub slug: &'static str,
+    /// Human-readable facility name.
     pub name: &'static str,
+    /// ISO 3166-1 alpha-2 country code when available.
     pub country: &'static str,
+    /// Facility reference latitude in WGS84 degrees.
     pub latitude: f64,
+    /// Facility reference longitude in WGS84 degrees.
     pub longitude: f64,
+    /// Known configurations for this facility.
     pub layouts: &'static [Layout],
 }
 
+/// The nearest facility match and its default layout.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackMatch {
+    /// Matched racing facility.
     pub track: &'static Track,
+    /// Facility's default (first) layout.
     pub layout: &'static Layout,
+    /// Great-circle distance from the query point to the facility reference.
     pub distance_m: f64,
 }
 
 include!(concat!(env!("OUT_DIR"), "/track_atlas.rs"));
 
+/// Returns the complete embedded track catalog.
 pub fn tracks() -> &'static [Track] {
     TRACKS
 }
 
+/// Finds a facility by its exact track-atlas slug.
 pub fn find_track(slug: &str) -> Option<&'static Track> {
     TRACKS.iter().find(|track| track.slug == slug)
 }
 
+/// Finds the nearest facility within `max_distance_m` of a WGS84 point.
+///
+/// The returned layout is the facility's first layout. Returns `None` if no
+/// facility is close enough or the matched facility has no layouts.
 pub fn match_track(latitude: f64, longitude: f64, max_distance_m: f64) -> Option<TrackMatch> {
     TRACKS
         .iter()

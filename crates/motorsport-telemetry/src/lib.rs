@@ -1,3 +1,6 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
+
 use aim_telemetry::AimFile;
 use cosworth_telemetry::CosworthFile;
 use motec_telemetry::MotecFile;
@@ -8,33 +11,53 @@ use motorsport_telemetry_core::{
 use motorsport_track_atlas::{match_track, TrackMatch};
 use racelogic_telemetry::RacelogicFile;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use thiserror::Error;
 
 pub use motorsport_telemetry_core;
 pub use motorsport_track_atlas;
 
+/// Errors returned while selecting or opening a supported telemetry format.
 #[derive(Debug, Error)]
 pub enum TelemetryError {
+    /// The path does not have a supported telemetry extension.
     #[error("unsupported telemetry file {0}")]
     Unsupported(String),
+    /// The AiM MP4 parser rejected the input.
     #[error(transparent)]
     Aim(#[from] aim_telemetry::AimError),
+    /// The Pi/Cosworth PDS parser rejected the input.
     #[error(transparent)]
     Cosworth(#[from] cosworth_telemetry::CosworthError),
+    /// The MoTeC LD parser rejected the input.
     #[error(transparent)]
     Motec(#[from] motec_telemetry::MotecError),
+    /// The Racelogic VBOX parser rejected the input.
     #[error(transparent)]
     Racelogic(#[from] racelogic_telemetry::RacelogicError),
 }
 
+/// An opened telemetry file backed by one of the supported format readers.
+///
+/// This enum implements [`TelemetrySource`], so callers can inspect channels
+/// and samples without matching on the source format.
 #[derive(Debug)]
 pub enum TelemetryFile {
+    /// AiM `aimd` telemetry embedded in an MP4 recording.
     Aim(AimFile),
+    /// Pi/Cosworth PDS telemetry.
     Cosworth(CosworthFile),
+    /// MoTeC LD telemetry.
     Motec(MotecFile),
+    /// Racelogic VBOX VBO telemetry.
     Racelogic(RacelogicFile),
 }
 
+/// Opens a native telemetry file using its case-insensitive extension.
+///
+/// Supported extensions are `.mp4`, `.pds`, `.ld`, and `.vbo`. This function
+/// selects a parser by extension; the selected parser still validates the file
+/// contents.
 pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
     let path = path.as_ref();
     match path
@@ -104,95 +127,77 @@ impl TelemetrySource for TelemetryFile {
     }
 }
 
+/// Channel indexes selected for the facade's format-neutral signal roles.
+///
+/// A missing role is `None`. Indexes refer to [`TelemetrySource::channels`]
+/// for the same file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SignalRoles {
+    /// Vehicle or ground speed channel.
     pub speed: Option<usize>,
+    /// Driver throttle channel.
     pub throttle: Option<usize>,
+    /// Driver brake channel.
     pub brake: Option<usize>,
+    /// Distance or progress within the current lap.
     pub lap_distance: Option<usize>,
+    /// Current lap counter.
     pub lap_number: Option<usize>,
+    /// WGS84 latitude channel.
     pub latitude: Option<usize>,
+    /// WGS84 longitude channel.
     pub longitude: Option<usize>,
 }
 
+/// Format-neutral values sampled at one file-relative timestamp.
+///
+/// Values remain `None` when no suitable source channel exists or its unit
+/// cannot be converted safely.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NormalizedSample {
+    /// Speed in metres per second.
     pub speed_mps: Option<f64>,
+    /// Throttle position in the inclusive range `0.0..=1.0`.
     pub throttle_fraction: Option<f64>,
+    /// Brake position in the inclusive range `0.0..=1.0`.
     pub brake_fraction: Option<f64>,
+    /// Source lap number rounded to an integer.
     pub lap_number: Option<i64>,
+    /// Progress through the current lap in the range `0.0..=1.0`.
     pub lap_progress: Option<f64>,
+    /// WGS84 latitude in degrees.
     pub latitude_deg: Option<f64>,
+    /// WGS84 longitude in degrees.
     pub longitude_deg: Option<f64>,
 }
 
 impl TelemetryFile {
+    /// Derives the format-neutral metadata summary for this file.
     pub fn metadata(&self) -> FileMetadata {
         read_source_metadata(self)
     }
 
+    /// Infers normalized roles from known source channel names.
+    ///
+    /// Role inference never assigns or guesses units; unit validation happens
+    /// when values are normalized.
     pub fn signal_roles(&self) -> SignalRoles {
         infer_roles(self.channels())
     }
 
-    pub fn normalized_sample(
-        &self,
-        time_ns: u64,
-        roles: &SignalRoles,
-        track: Option<&TrackContext>,
-    ) -> NormalizedSample {
-        let value = |index: Option<usize>, linear| {
-            index.and_then(|index| self.sample_at(index, time_ns, linear))
-        };
-        let speed_mps = roles.speed.and_then(|index| {
-            let raw = value(Some(index), true)?;
-            normalize_speed(raw, &self.channels()[index].unit)
-        });
-        let throttle_fraction = roles.throttle.and_then(|index| {
-            normalize_fraction(value(Some(index), true)?, &self.channels()[index].unit)
-        });
-        let brake_fraction = roles.brake.and_then(|index| {
-            normalize_fraction(value(Some(index), true)?, &self.channels()[index].unit)
-        });
-        let latitude_deg = roles.latitude.and_then(|index| {
-            normalize_coordinate(value(Some(index), true)?, &self.channels()[index].unit)
-        });
-        let longitude_deg = roles.longitude.and_then(|index| {
-            normalize_coordinate(value(Some(index), true)?, &self.channels()[index].unit)
-        });
-        let lap_number = value(roles.lap_number, false)
-            .filter(|value| value.is_finite())
-            .map(|value| value.round() as i64);
-        let lap_progress = roles
-            .lap_distance
-            .and_then(|index| {
-                let raw = value(Some(index), true)?;
-                normalize_lap_distance(raw, &self.channels()[index].unit, track)
-            })
-            .or_else(|| {
-                latitude_deg
-                    .zip(longitude_deg)
-                    .and_then(|(lat, lon)| track.and_then(|track| track.progress(lat, lon)))
-            })
-            .or_else(|| {
-                self.metadata()
-                    .laps
-                    .iter()
-                    .find(|lap| time_ns >= lap.start_ns && time_ns < lap.end_ns)
-                    .filter(|lap| lap.duration_ns > 0)
-                    .map(|lap| time_ns.saturating_sub(lap.start_ns) as f64 / lap.duration_ns as f64)
-            });
-        NormalizedSample {
-            speed_mps,
-            throttle_fraction,
-            brake_fraction,
-            lap_number,
-            lap_progress,
-            latitude_deg,
-            longitude_deg,
-        }
+    /// Builds a reusable normalization context.
+    ///
+    /// Signal roles and track matching are resolved once. Lap metadata remains
+    /// lazy and, if needed as a fallback, is computed once for the lifetime of
+    /// the context rather than once per sample.
+    pub fn normalizer(&self) -> TelemetryNormalizer<'_> {
+        TelemetryNormalizer::new(self, self.signal_roles(), self.match_track())
     }
 
+    /// Matches sampled GPS positions to the nearest track within 50 km.
+    ///
+    /// Returns `None` when suitable GPS channels or valid units are absent, no
+    /// track is close enough, or the matched centerline cannot be decoded.
     pub fn match_track(&self) -> Option<TrackContext> {
         let roles = self.signal_roles();
         let (lat_index, lon_index) = roles.latitude.zip(roles.longitude)?;
@@ -223,8 +228,117 @@ impl TelemetryFile {
     }
 }
 
+/// Reusable state for high-throughput normalized sampling.
+#[derive(Debug)]
+pub struct TelemetryNormalizer<'a> {
+    source: &'a TelemetryFile,
+    roles: SignalRoles,
+    track: Option<TrackContext>,
+    laps: OnceLock<Vec<motorsport_telemetry_core::LapMetadata>>,
+}
+
+impl<'a> TelemetryNormalizer<'a> {
+    /// Creates a normalizer with caller-selected signal roles and track.
+    pub fn new(source: &'a TelemetryFile, roles: SignalRoles, track: Option<TrackContext>) -> Self {
+        Self {
+            source,
+            roles,
+            track,
+            laps: OnceLock::new(),
+        }
+    }
+
+    /// Returns the channel roles used by this normalizer.
+    pub fn roles(&self) -> &SignalRoles {
+        &self.roles
+    }
+
+    /// Returns the matched track context, when available.
+    pub fn track(&self) -> Option<&TrackContext> {
+        self.track.as_ref()
+    }
+
+    /// Returns the normalized values at a file-relative timestamp.
+    pub fn sample(&self, time_ns: u64) -> NormalizedSample {
+        normalize_sample(
+            self.source,
+            time_ns,
+            &self.roles,
+            self.track.as_ref(),
+            || {
+                let laps = self.laps.get_or_init(|| self.source.metadata().laps);
+                lap_progress_from_metadata(laps, time_ns)
+            },
+        )
+    }
+}
+
+fn normalize_sample(
+    source: &TelemetryFile,
+    time_ns: u64,
+    roles: &SignalRoles,
+    track: Option<&TrackContext>,
+    lap_fallback: impl FnOnce() -> Option<f64>,
+) -> NormalizedSample {
+    let value = |index: Option<usize>, linear| {
+        index.and_then(|index| source.sample_at(index, time_ns, linear))
+    };
+    let speed_mps = roles.speed.and_then(|index| {
+        let raw = value(Some(index), true)?;
+        normalize_speed(raw, &source.channels()[index].unit)
+    });
+    let throttle_fraction = roles.throttle.and_then(|index| {
+        normalize_fraction(value(Some(index), true)?, &source.channels()[index].unit)
+    });
+    let brake_fraction = roles.brake.and_then(|index| {
+        normalize_fraction(value(Some(index), true)?, &source.channels()[index].unit)
+    });
+    let latitude_deg = roles.latitude.and_then(|index| {
+        normalize_coordinate(value(Some(index), true)?, &source.channels()[index].unit)
+    });
+    let longitude_deg = roles.longitude.and_then(|index| {
+        normalize_coordinate(value(Some(index), true)?, &source.channels()[index].unit)
+    });
+    let lap_number = value(roles.lap_number, false)
+        .filter(|value| value.is_finite())
+        .map(|value| value.round() as i64);
+    let lap_progress = roles
+        .lap_distance
+        .and_then(|index| {
+            let raw = value(Some(index), true)?;
+            normalize_lap_distance(raw, &source.channels()[index].unit, track)
+        })
+        .or_else(|| {
+            latitude_deg
+                .zip(longitude_deg)
+                .and_then(|(lat, lon)| track.and_then(|track| track.progress(lat, lon)))
+        })
+        .or_else(lap_fallback);
+    NormalizedSample {
+        speed_mps,
+        throttle_fraction,
+        brake_fraction,
+        lap_number,
+        lap_progress,
+        latitude_deg,
+        longitude_deg,
+    }
+}
+
+fn lap_progress_from_metadata(
+    laps: &[motorsport_telemetry_core::LapMetadata],
+    time_ns: u64,
+) -> Option<f64> {
+    laps.iter()
+        .find(|lap| time_ns >= lap.start_ns && time_ns < lap.end_ns)
+        .filter(|lap| lap.duration_ns > 0)
+        .map(|lap| time_ns.saturating_sub(lap.start_ns) as f64 / lap.duration_ns as f64)
+}
+
+/// A matched track plus precomputed centerline distances for GPS projection.
 #[derive(Debug, Clone)]
 pub struct TrackContext {
+    /// The selected facility and layout from the offline track atlas.
     pub matched: TrackMatch,
     centerline: Vec<[f64; 2]>,
     cumulative_m: Vec<f64>,
@@ -232,6 +346,11 @@ pub struct TrackContext {
 }
 
 impl TrackContext {
+    /// Builds projection state from a track-atlas match.
+    ///
+    /// The error indicates that the layout's embedded centerline is not valid
+    /// GeoJSON. An empty or one-point centerline constructs successfully but
+    /// cannot produce progress values.
     pub fn new(matched: TrackMatch) -> Result<Self, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(matched.layout.centerline_geojson)?;
         let coordinates = &value["features"][0]["geometry"]["coordinates"];
@@ -259,6 +378,10 @@ impl TrackContext {
         })
     }
 
+    /// Projects a WGS84 point onto the centerline and returns lap progress.
+    ///
+    /// Progress is clamped to `0.0..=1.0`; `None` means that the layout has no
+    /// usable centerline.
     pub fn progress(&self, latitude: f64, longitude: f64) -> Option<f64> {
         if self.centerline.len() < 2 || self.total_m <= 0.0 {
             return None;
@@ -278,24 +401,42 @@ impl TrackContext {
     }
 }
 
+/// Files grouped into one session using internal clocks and identity.
 #[derive(Debug)]
 pub struct TelemetrySession {
+    /// Open files in session order.
     pub files: Vec<TelemetryFile>,
+    /// Per-file summaries in the same order as [`Self::files`].
     pub file_metadata: Vec<FileMetadata>,
+    /// Metadata merged across the session.
     pub metadata: SessionMetadata,
 }
 
+/// The source, video, driver, and lap state at one session timestamp.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionPosition {
+    /// Requested session-relative timestamp in nanoseconds.
     pub session_time_ns: u64,
+    /// Index into [`TelemetrySession::files`].
     pub file_index: usize,
+    /// Path reported by the selected telemetry source.
     pub source_path: PathBuf,
+    /// Corresponding file-relative timestamp in nanoseconds.
     pub file_time_ns: u64,
+    /// Video linkage reported at the file timestamp.
     pub video: VideoReference,
+    /// Internal driver identifier, when the format exposes one.
     pub driver_id: Option<i64>,
+    /// Current lap number, when a supported channel exists.
     pub lap_number: Option<i64>,
 }
 
+/// Opens files and groups compatible adjacent recordings into sessions.
+///
+/// `max_gap_ns` is the largest allowed gap between consecutive files with the
+/// same internal session key. Inputs lacking compatible absolute clocks and
+/// session keys are not joined. A failure to open any input returns an error
+/// and no partial session list.
 pub fn open_sessions<I, P>(
     paths: I,
     max_gap_ns: u64,
@@ -334,6 +475,10 @@ where
 }
 
 impl TelemetrySession {
+    /// Resolves a session-relative timestamp to its containing source file.
+    ///
+    /// Returns `None` for gaps, out-of-range timestamps, or sessions without a
+    /// usable absolute clock.
     pub fn position(&self, session_time_ns: u64) -> Option<SessionPosition> {
         let base = self.metadata.absolute_start_ns?;
         for (index, metadata) in self.file_metadata.iter().enumerate() {

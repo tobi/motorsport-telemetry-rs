@@ -14,7 +14,7 @@ summary, including embedded driver/vehicle/venue/date/time, lap information,
 and an internal session candidate key. `read_metadata_from_bytes` provides the
 same summary for owned input.
 
-```rust
+```rust,no_run
 use motec_telemetry::MotecFile;
 use motorsport_telemetry_core::TelemetrySource;
 
@@ -28,7 +28,7 @@ for channel in file.channels() {
 
 Sample parsing does not require the companion `.ldx`. The writer creates one alongside every exported LD, recovering beacon markers from a dedicated lap trigger (or an increasing lap counter as fallback) and carrying supplied session metadata:
 
-```rust
+```rust,no_run
 use motec_telemetry::{write_motec, MotecMetadata};
 # use motorsport_telemetry_core::TelemetrySource;
 # fn export(source: &dyn TelemetrySource) -> Result<(), Box<dyn std::error::Error>> {

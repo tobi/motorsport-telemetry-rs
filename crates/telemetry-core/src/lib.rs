@@ -1,5 +1,9 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
+
 use std::sync::Arc;
 
+/// Format-neutral file and session metadata derivation.
 pub mod metadata;
 pub mod units;
 
@@ -12,18 +16,30 @@ pub use units::{
     Dimension, UnitDef, UNITS,
 };
 
+/// Native scalar representation used by a telemetry channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleType {
+    /// Unsigned 8-bit integer.
     U8,
+    /// Signed 16-bit integer.
     I16,
+    /// Unsigned 16-bit integer.
     U16,
+    /// Signed 32-bit integer.
     I32,
+    /// Unsigned 32-bit integer.
     U32,
+    /// IEEE-754 32-bit floating point.
     F32,
+    /// IEEE-754 64-bit floating point.
     F64,
 }
 
 impl SampleType {
+    /// Maps a Pi/Cosworth PDS type code to its scalar representation.
+    ///
+    /// Unrecognized codes fall back to [`Self::F32`], matching the PDS
+    /// reader's compatibility behavior.
     pub fn from_pds_code(code: u32) -> Self {
         match code {
             1 => Self::U8,
@@ -36,6 +52,7 @@ impl SampleType {
         }
     }
 
+    /// Returns the stable numeric code used by schema hashing and PDS types.
     pub fn code(self) -> u32 {
         match self {
             Self::U8 => 1,
@@ -48,6 +65,7 @@ impl SampleType {
         }
     }
 
+    /// Returns the encoded width of one native sample in bytes.
     pub fn byte_width(self) -> usize {
         match self {
             Self::U8 => 1,
@@ -57,6 +75,7 @@ impl SampleType {
         }
     }
 
+    /// Returns a stable lowercase display name such as `float32`.
     pub fn name(self) -> &'static str {
         match self {
             Self::U8 => "uint8",
@@ -69,18 +88,24 @@ impl SampleType {
         }
     }
 
+    /// Returns whether this is a floating-point representation.
     pub fn is_float(self) -> bool {
         matches!(self, Self::F32 | Self::F64)
     }
 }
 
+/// One contiguous, constant-rate run of samples within a channel.
 #[derive(Debug, Clone)]
 pub struct Chunk {
+    /// Time between adjacent samples in nanoseconds.
     pub sample_period_ns: u64,
+    /// Number of samples in this chunk.
     pub sample_count: u64,
     /// Byte offset for binary formats, column-local offset for text formats.
     pub data_ptr: u64,
+    /// Channel-global sample index of this chunk's first sample.
     pub sample_base: u64,
+    /// File-relative timestamp of this chunk's first sample.
     pub time_base_ns: u64,
 }
 
@@ -102,6 +127,7 @@ pub enum UnitSource {
 }
 
 impl UnitSource {
+    /// Returns a stable lowercase provenance label.
     pub fn name(self) -> &'static str {
         match self {
             Self::Declared => "declared",
@@ -111,29 +137,43 @@ impl UnitSource {
     }
 }
 
+/// Source-exact metadata and chunk layout for one telemetry signal.
 #[derive(Debug, Clone)]
 pub struct Channel {
+    /// Format-specific channel or record identifier.
     pub id: u32,
+    /// Channel name reported by the source.
     pub name: String,
+    /// Unit reported or specified by the source format; empty if unknown.
     pub unit: String,
     /// Provenance of `unit`. Never infer a unit from a channel name and report
     /// it as [`UnitSource::Declared`].
     pub unit_source: UnitSource,
+    /// Native scalar representation.
     pub sample_type: SampleType,
+    /// Constant-rate sample runs ordered by time.
     pub chunks: Vec<Chunk>,
+    /// Total number of samples across all chunks.
     pub sample_count: u64,
+    /// File-relative end time of the channel in nanoseconds.
     pub duration_ns: u64,
 }
 
 impl Channel {
+    /// Returns the first chunk's sample period, if the channel has samples.
     pub fn first_period_ns(&self) -> Option<u64> {
         self.chunks.first().map(|chunk| chunk.sample_period_ns)
     }
 
+    /// Returns the first chunk's sampling frequency in hertz.
     pub fn frequency_hz(&self) -> Option<f64> {
         self.first_period_ns().map(|period| 1e9 / period as f64)
     }
 
+    /// Returns whether sampling should preserve discrete values instead of interpolating.
+    ///
+    /// Integer channels always step. Floating-point channels with known state,
+    /// counter, flag, or gear names also step.
     pub fn uses_step_interpolation(&self) -> bool {
         if !self.sample_type.is_float() {
             return true;
@@ -162,28 +202,46 @@ impl Channel {
     }
 }
 
+/// Shared random-access interface implemented by every format reader.
+///
+/// Implementations expose native channel metadata and decode samples on
+/// demand. Timestamps are file-relative nanoseconds unless explicitly stated.
 pub trait TelemetrySource: Send + Sync {
+    /// Returns the source path or caller-supplied input name.
     fn path(&self) -> &str;
+    /// Returns a stable lowercase format identifier.
     fn format(&self) -> &'static str;
+    /// Returns source-exact channel metadata in decode-index order.
     fn channels(&self) -> &[Channel];
+    /// Decodes one native sample as `f64`.
+    ///
+    /// The three indexes must identify an existing channel, chunk, and sample.
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64;
 
+    /// Returns the source's reliable absolute clock range, when available.
     fn absolute_time_range(&self) -> Option<AbsoluteTimeRange> {
         None
     }
 
+    /// Returns identity fields embedded in the source.
     fn identity(&self) -> SourceIdentity {
         SourceIdentity::default()
     }
 
+    /// Returns the number of frames in linked or embedded video, when known.
     fn video_frame_count(&self) -> Option<u64> {
         None
     }
 
+    /// Maps a file-relative telemetry timestamp to a video frame index.
     fn video_frame_at(&self, _time_ns: u64) -> Option<u64> {
         None
     }
 
+    /// Returns all video linkage available at a file-relative timestamp.
+    ///
+    /// The default implementation samples conventional VBOX AVI linkage
+    /// channels and calls [`Self::video_frame_at`].
     fn video_reference_at(&self, time_ns: u64) -> VideoReference {
         let file_index = self
             .channels()
@@ -215,6 +273,7 @@ pub trait TelemetrySource: Send + Sync {
         }
     }
 
+    /// Derives a format-neutral metadata summary from this source.
     fn metadata(&self) -> FileMetadata
     where
         Self: Sized,
@@ -222,11 +281,19 @@ pub trait TelemetrySource: Send + Sync {
         read_source_metadata(self)
     }
 
+    /// Returns the file-relative timestamp for one native sample.
     fn sample_time_ns(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> u64 {
         let chunk = &self.channels()[channel_index].chunks[chunk_index];
         chunk.time_base_ns + local_index * chunk.sample_period_ns
     }
 
+    /// Samples a channel at a file-relative timestamp.
+    ///
+    /// When `linear` is true, continuous floating-point signals are linearly
+    /// interpolated. Discrete channels selected by
+    /// [`Channel::uses_step_interpolation`] always use step sampling. Returns
+    /// `None` for an absent channel, an empty channel, or a timestamp at or
+    /// beyond the channel duration.
     fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
         let channel = self.channels().get(channel_index)?;
         if time_ns >= channel.duration_ns || channel.chunks.is_empty() {
@@ -269,6 +336,7 @@ pub trait TelemetrySource: Send + Sync {
     }
 }
 
+/// Shared, thread-safe ownership of a format-neutral telemetry source.
 pub type SourceRef = Arc<dyn TelemetrySource>;
 
 #[cfg(test)]

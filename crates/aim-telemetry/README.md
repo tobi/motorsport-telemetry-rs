@@ -12,7 +12,9 @@ Native reader for AiM Sports telemetry stored as an `aimd` track inside an ISO B
 - Uses the modal recorded timestamp delta as each channel's native frequency, while retaining acquisition gaps as separate chunks.
 - Rejects an MP4 immediately with `NoAimdTrack` when no `aimd` sample entry exists.
 
-See [`FORMAT.md`](FORMAT.md) for the documented MP4 tables, packet framing, `CHS` schema fields, scalar record layout, and compatibility policy.
+See the [format notes](https://github.com/tobi/motorsport-telemetry-rs/blob/master/crates/aim-telemetry/FORMAT.md)
+for the documented MP4 tables, packet framing, `CHS` schema fields, scalar
+record layout, and compatibility policy.
 
 `GPS0` is decoded into geodetic position, speed, heading, accuracy, satellite, timing and status channels at its native 25 Hz. `LapPk` remains unexpanded: it is defined but has no payload in any of the five available recordings, while lap number and lap timing are carried by ordinary scalar channels. Scalar channels without a safely decoded unit remain unitless with `unit_source = unknown`.
 
@@ -25,29 +27,6 @@ including internal driver IDs, lap information, GPS session clock, schema hash,
 and video-frame count. `read_metadata_from_bytes` provides the same summary for
 owned input.
 
-## DuckDB integration
-
-The native DuckDB adapter exposes this parser through:
-
-```sql
-SELECT * FROM telemetry_metadata('session.mp4');
-SELECT * FROM telemetry_samples(
-  'session.mp4',
-  channel := 'RPM,GPS Speed,GPS Latitude,GPS Longitude'
-);
-SELECT * FROM read_aim(
-  'session.mp4',
-  channels := 'RPM,GPS Speed,GPS Latitude,GPS Longitude',
-  rate := 10
-);
-```
-
-`read_aim` and `read_aimd` are AiM-specific wide-reader aliases;
-`read_telemetry('session.mp4', ...)` auto-detects the `aimd` track. These
-entry points are native-only in this workspace. The DuckDB-Wasm build does not
-link the AiM parser, so `.mp4` inputs and the `read_aim`/`read_aimd` functions
-are unavailable in the browser.
-
 `GPS0` expands into 15 derived channels: `GPS Latitude`, `GPS Longitude`,
 `GPS Altitude`, `GPS Speed`, `GPS Heading`, `GPS Satellites`,
 `GPS Position Accuracy`, `GPS Speed Accuracy`, `GPS ECEF Velocity X`,
@@ -56,10 +35,10 @@ are unavailable in the browser.
 
 The reader does not decode video or audio, does not reconstruct `LapPk` without
 a payload, and leaves scalar units unknown when the `CHS` record does not
-provide a validated quantity. See [`FORMAT.md`](FORMAT.md) for the exact
+provide a validated quantity. See the [format notes](https://github.com/tobi/motorsport-telemetry-rs/blob/master/crates/aim-telemetry/FORMAT.md) for the exact
 packet and field compatibility rules.
 
-```rust
+```rust,no_run
 use aim_telemetry::AimFile;
 use motorsport_telemetry_core::TelemetrySource;
 
@@ -68,4 +47,8 @@ for channel in recording.channels() {
     println!("{}: {:?} Hz", channel.name, channel.frequency_hz());
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+```sh
+cargo run -p aim-telemetry --example inspect -- smartycam.mp4
 ```

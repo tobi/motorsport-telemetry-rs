@@ -1,6 +1,8 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
+
 #[cfg(not(target_os = "emscripten"))]
 use memmap2::Mmap;
-use std::collections::HashMap;
 #[cfg(not(target_os = "emscripten"))]
 use std::fs::File;
 #[cfg(not(target_os = "emscripten"))]
@@ -12,15 +14,18 @@ pub mod units;
 use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
 use units::DefLayout;
 
+/// Duration of one native PDS clock tick in nanoseconds.
 pub const TICK_NS: u64 = 100;
 
 #[cfg(not(target_os = "emscripten"))]
+/// Opens a PDS file and derives its format-neutral metadata summary.
 pub fn read_metadata(
     path: impl AsRef<Path>,
 ) -> Result<motorsport_telemetry_core::FileMetadata, CosworthError> {
     CosworthFile::open(path).map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
+/// Derives format-neutral metadata from an owned PDS byte buffer.
 pub fn read_metadata_from_bytes(
     path: impl Into<String>,
     data: Vec<u8>,
@@ -30,15 +35,25 @@ pub fn read_metadata_from_bytes(
 }
 const MARKER: u64 = 0x7c72;
 
+/// Errors returned while opening or parsing Pi/Cosworth PDS telemetry.
 #[derive(Debug, Error)]
 pub enum CosworthError {
+    /// The PDS file could not be opened or memory-mapped.
     #[error("I/O error for {path}: {source}")]
     Io {
+        /// Path that was being opened.
         path: String,
+        /// Underlying filesystem error.
         source: std::io::Error,
     },
+    /// The PDS structure is malformed or unsupported.
     #[error("invalid PDS file {path}: {message}")]
-    Invalid { path: String, message: String },
+    Invalid {
+        /// Path or caller-supplied input name.
+        path: String,
+        /// Specific validation failure.
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -58,9 +73,12 @@ impl std::ops::Deref for Storage {
     }
 }
 
+/// An opened Pi/Cosworth PDS telemetry source.
 #[derive(Debug)]
 pub struct CosworthFile {
+    /// Source path or caller-supplied name.
     pub path: String,
+    /// Source-exact telemetry channel metadata.
     pub channels: Vec<Channel>,
     data: Storage,
 }
@@ -97,6 +115,56 @@ struct RawChunk {
     sample_period_ticks: u32,
     sample_count: u64,
     data_ptr: u64,
+}
+
+enum ChannelDispatch {
+    Dense { first: u32, indexes: Box<[usize]> },
+    Sparse(Box<[(u32, usize)]>),
+}
+
+impl ChannelDispatch {
+    fn new(channels: &[Channel]) -> Self {
+        let first = channels.iter().map(|channel| channel.id).min().unwrap_or(0);
+        let last = channels
+            .iter()
+            .map(|channel| channel.id)
+            .max()
+            .unwrap_or(first);
+        let span = u64::from(last) - u64::from(first) + 1;
+        if span <= channels.len().saturating_mul(4) as u64 {
+            let mut indexes = vec![usize::MAX; span as usize];
+            for (index, channel) in channels.iter().enumerate() {
+                indexes[(channel.id - first) as usize] = index;
+            }
+            Self::Dense {
+                first,
+                indexes: indexes.into_boxed_slice(),
+            }
+        } else {
+            let mut indexes = channels
+                .iter()
+                .enumerate()
+                .map(|(index, channel)| (channel.id, index))
+                .collect::<Vec<_>>();
+            indexes.sort_unstable_by_key(|entry| entry.0);
+            Self::Sparse(indexes.into_boxed_slice())
+        }
+    }
+
+    #[inline]
+    fn get(&self, channel_id: u32) -> Option<usize> {
+        match self {
+            Self::Dense { first, indexes } => channel_id
+                .checked_sub(*first)
+                .and_then(|index| indexes.get(index as usize))
+                .copied()
+                .filter(|index| *index != usize::MAX),
+            Self::Sparse(indexes) => indexes
+                .binary_search_by_key(&channel_id, |entry| entry.0)
+                .ok()
+                .map(|index| indexes[index].1),
+        }
+    }
 }
 
 fn invalid(path: &str, message: impl Into<String>) -> CosworthError {
@@ -141,32 +209,32 @@ fn utf16le(data: &[u8], offset: usize, max_bytes: usize) -> String {
     }
 }
 
+fn entry_at(data: &[u8], base: usize) -> Option<DirEntry> {
+    if base + 32 > data.len() {
+        return None;
+    }
+    let lo = u32le(data, base)? as u64;
+    let hi = u32le(data, base + 4)? as u64;
+    Some(DirEntry {
+        offset: lo | hi << 32,
+        count: u32le(data, base + 8)?,
+        class_b: u32le(data, base + 0x14)?,
+        next_count: u32le(data, base + 0x18)?,
+    })
+}
+
 fn read_entries_at(data: &[u8], start: usize) -> Vec<DirEntry> {
     (0..20)
-        .filter_map(|i| {
-            let base = start + i * 32;
-            if base + 32 > data.len() {
-                return None;
-            }
-            let lo = u32le(data, base)? as u64;
-            let hi = u32le(data, base + 4)? as u64;
-            Some(DirEntry {
-                offset: lo | hi << 32,
-                count: u32le(data, base + 8)?,
-                class_b: u32le(data, base + 0x14)?,
-                next_count: u32le(data, base + 0x18)?,
-            })
-        })
+        .filter_map(|index| entry_at(data, start + index * 32))
         .collect()
 }
 
 fn find_directory(data: &[u8]) -> Vec<DirEntry> {
-    let mut best = Vec::new();
+    let mut best_start = 0x80;
     let mut best_score = i32::MIN;
     for start in [0x80, 0x78, 0x70, 0x68, 0x60, 0x58, 0x50, 0x48, 0x40] {
-        let entries = read_entries_at(data, start);
-        let score = entries
-            .iter()
+        let score = (0..20)
+            .filter_map(|index| entry_at(data, start + index * 32))
             .map(|e| {
                 if e.class_b <= 3 && e.offset > 0 && e.offset < data.len() as u64 {
                     2
@@ -178,11 +246,11 @@ fn find_directory(data: &[u8]) -> Vec<DirEntry> {
             })
             .sum();
         if score > best_score {
-            best = entries;
+            best_start = start;
             best_score = score;
         }
     }
-    best
+    read_entries_at(data, best_start)
 }
 
 fn find_layout(
@@ -414,6 +482,7 @@ fn parse_chunks(data: &[u8], layout: Layout, is_export: bool) -> Vec<RawChunk> {
 
 impl CosworthFile {
     #[cfg(not(target_os = "emscripten"))]
+    /// Memory-maps and parses a local PDS file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CosworthError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
@@ -428,6 +497,7 @@ impl CosworthFile {
         Self::parse(display, Storage::Mapped(data))
     }
 
+    /// Parses PDS telemetry from an owned byte buffer.
     pub fn from_bytes(path: impl Into<String>, data: Vec<u8>) -> Result<Self, CosworthError> {
         Self::parse(path.into(), Storage::Owned(data.into_boxed_slice()))
     }
@@ -453,55 +523,48 @@ impl CosworthFile {
         }
         let raw_chunks = parse_chunks(&data, layout, is_export);
 
-        let by_id = defs
-            .iter()
-            .enumerate()
-            .map(|(index, def)| (def.id, index))
-            .collect::<HashMap<_, _>>();
-        let mut grouped = vec![Vec::<RawChunk>::new(); defs.len()];
-        for chunk in raw_chunks {
-            if let Some(&index) = by_id.get(&chunk.channel_id) {
-                grouped[index].push(chunk);
-            }
-        }
-        let mut channels = Vec::with_capacity(defs.len());
-        for (def, raw) in defs.into_iter().zip(grouped) {
-            let mut chunks = Vec::new();
-            let mut sample_base = 0u64;
-            let mut time_base_ns = 0u64;
-            // Deliberately preserve chunk-index table order. `order` and
-            // data_ptr are not temporal keys in interrupted native logs.
-            for chunk in raw {
-                let width = def.sample_type.byte_width() as u64;
-                let max_count = (data.len() as u64).saturating_sub(chunk.data_ptr) / width;
-                let count = chunk.sample_count.min(max_count);
-                if count == 0 {
-                    continue;
-                }
-                chunks.push(Chunk {
-                    sample_period_ns: chunk.sample_period_ticks as u64 * TICK_NS,
-                    sample_count: count,
-                    data_ptr: chunk.data_ptr,
-                    sample_base,
-                    time_base_ns,
-                });
-                sample_base = sample_base.saturating_add(count);
-                time_base_ns = time_base_ns.saturating_add(
-                    count
-                        .saturating_mul(chunk.sample_period_ticks as u64)
-                        .saturating_mul(TICK_NS),
-                );
-            }
-            channels.push(Channel {
+        let mut channels = defs
+            .into_iter()
+            .map(|def| Channel {
                 id: def.id,
                 name: def.name,
                 unit: def.unit,
                 unit_source: def.unit_source,
                 sample_type: def.sample_type,
-                chunks,
-                sample_count: sample_base,
-                duration_ns: time_base_ns,
+                chunks: Vec::new(),
+                sample_count: 0,
+                duration_ns: 0,
+            })
+            .collect::<Vec<_>>();
+        let by_id = ChannelDispatch::new(&channels);
+        // Deliberately preserve chunk-index table order. `order` and data_ptr
+        // are not temporal keys in interrupted native logs. Convert each raw
+        // descriptor directly into its final channel instead of building and
+        // then copying through a second set of per-channel vectors.
+        for raw in raw_chunks {
+            let Some(index) = by_id.get(raw.channel_id) else {
+                continue;
+            };
+            let channel = &mut channels[index];
+            let width = channel.sample_type.byte_width() as u64;
+            let max_count = (data.len() as u64).saturating_sub(raw.data_ptr) / width;
+            let count = raw.sample_count.min(max_count);
+            if count == 0 {
+                continue;
+            }
+            channel.chunks.push(Chunk {
+                sample_period_ns: raw.sample_period_ticks as u64 * TICK_NS,
+                sample_count: count,
+                data_ptr: raw.data_ptr,
+                sample_base: channel.sample_count,
+                time_base_ns: channel.duration_ns,
             });
+            channel.sample_count = channel.sample_count.saturating_add(count);
+            channel.duration_ns = channel.duration_ns.saturating_add(
+                count
+                    .saturating_mul(raw.sample_period_ticks as u64)
+                    .saturating_mul(TICK_NS),
+            );
         }
         Ok(Self {
             path: display,

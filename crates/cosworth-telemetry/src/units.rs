@@ -50,19 +50,33 @@ use motorsport_telemetry_core::UnitSource;
 pub enum Quantity {
     /// Counters, flags, alarms, gear positions, ratios: no dimension.
     Dimensionless,
+    /// Distance or displacement, stored in metres.
     Length,
+    /// Volume, stored in cubic metres.
     Volume,
+    /// Linear speed, stored in metres per second.
     Speed,
+    /// Absolute temperature, stored in kelvin.
     Temperature,
+    /// Duration, stored in seconds.
     Time,
+    /// Plane angle, stored in radians.
     Angle,
+    /// Angular speed, stored in radians per second.
     AngularVelocity,
+    /// Pressure, stored in pascals.
     Pressure,
+    /// Linear acceleration, stored in metres per second squared.
     Acceleration,
+    /// Electric potential, stored in volts.
     Voltage,
+    /// Electric current, stored in amperes.
     Current,
+    /// Mass, stored in kilograms.
     Mass,
+    /// Force, stored in newtons.
     Force,
+    /// Torque, stored in newton-metres.
     Torque,
     /// Per-unit ratio (`pp1`): dimensionless but conventionally displayed.
     PerUnit,

@@ -6,16 +6,62 @@ It exposes format detection, source-exact channels, normalized signal roles,
 laps, driver stints, multi-file sessions, video references, WGS84 GPS, track
 matching, and invariant lap progress.
 
-```rust
+| Extension | Parser |
+|---:|---|
+| `.mp4` | AiM `aimd` telemetry track |
+| `.pds` | Pi/Cosworth PDS |
+| `.ld` | MoTeC LD |
+| `.vbo` | Racelogic VBOX |
+
+Selection is case-insensitive and based on the extension. A recognized
+extension with invalid contents returns the underlying parser error.
+
+The crate also installs a fast, mmap-backed metadata command. It reads lap and
+driver metadata, event date, video linkage, vehicle identity, GPS, and the
+offline track match without decoding video payloads:
+
+```sh
+motorsport-telemetry recording.mp4
+motorsport-telemetry --json recording.mp4
+```
+
+Unknown fields are printed as `unknown` (or JSON `null`) instead of being
+guessed. In particular, one file can expose a session key but cannot prove that
+other parts of the same session exist, and VBOX video links may provide only a
+file index when the external filename is not stored in the telemetry. Event
+dates prefer a real source clock, but fall back to file creation when that clock
+is at least two years older or more than seven days newer.
+
+```rust,no_run
 use motorsport_telemetry::{open, motorsport_telemetry_core::TelemetrySource};
 
 let file = open("run.mp4")?;
 let metadata = file.metadata();
-let track = file.match_track();
-let roles = file.signal_roles();
-let sample = file.normalized_sample(0, &roles, track.as_ref());
+println!("{} channels", metadata.channel_count);
+let normalizer = file.normalizer();
+for time_ns in [0, 100_000_000, 200_000_000] {
+    let sample = normalizer.sample(time_ns);
+    println!("{:?}", sample.speed_mps);
+}
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Normalization is explicit and conservative: unsupported units or unavailable
-signals remain `None`; they are never guessed.
+signals remain `None`; they are never guessed. The reusable normalizer resolves
+roles and track context once and caches lazily derived lap boundaries.
+
+## Multi-file sessions
+
+`open_sessions` opens each input, derives internal metadata, and joins adjacent
+recordings only when their session keys and clocks are compatible within the
+requested gap. It does not infer identity from filenames.
+
+```rust,no_run
+use motorsport_telemetry::open_sessions;
+
+let sessions = open_sessions(["part-1.vbo", "part-2.vbo"], 5_000_000_000)?;
+for session in sessions {
+    println!("{} files, {} ns", session.files.len(), session.metadata.duration_ns);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```

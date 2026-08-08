@@ -1,3 +1,6 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
+
 #[cfg(not(target_os = "emscripten"))]
 use memmap2::Mmap;
 use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
@@ -21,12 +24,14 @@ pub use write::{
 };
 
 #[cfg(not(target_os = "emscripten"))]
+/// Opens an LD file and derives its format-neutral metadata summary.
 pub fn read_metadata(
     path: impl AsRef<Path>,
 ) -> Result<motorsport_telemetry_core::FileMetadata, MotecError> {
     MotecFile::open(path).map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
+/// Derives format-neutral metadata from an owned LD byte buffer.
 pub fn read_metadata_from_bytes(
     path: impl Into<String>,
     data: Vec<u8>,
@@ -35,15 +40,25 @@ pub fn read_metadata_from_bytes(
         .map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
+/// Errors returned while opening or parsing MoTeC LD telemetry.
 #[derive(Debug, Error)]
 pub enum MotecError {
+    /// The LD file could not be opened or memory-mapped.
     #[error("I/O error for {path}: {source}")]
     Io {
+        /// Path that was being opened.
         path: String,
+        /// Underlying filesystem error.
         source: std::io::Error,
     },
+    /// The LD structure is malformed or unsupported.
     #[error("invalid MoTeC LD file {path}: {message}")]
-    Invalid { path: String, message: String },
+    Invalid {
+        /// Path or caller-supplied input name.
+        path: String,
+        /// Specific validation failure.
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -73,17 +88,28 @@ impl std::ops::Deref for Storage {
     }
 }
 
+/// An opened MoTeC LD telemetry source and its embedded session identity.
 #[derive(Debug)]
 pub struct MotecFile {
+    /// Source path or caller-supplied name.
     pub path: String,
+    /// Driver name stored in the LD header.
     pub driver: String,
+    /// Vehicle name stored in the LD header.
     pub vehicle: String,
+    /// Venue name stored in the LD header.
     pub venue: String,
+    /// Recording date as stored by the source.
     pub date: String,
+    /// Recording time as stored by the source.
     pub time: String,
+    /// Event name stored in the LD metadata.
     pub event: String,
+    /// Session name stored in the LD metadata.
     pub session: String,
+    /// Recording comment stored in the LD metadata.
     pub comment: String,
+    /// Source-exact telemetry channel metadata.
     pub channels: Vec<Channel>,
     encodings: Vec<Encoding>,
     data: Storage,
@@ -154,6 +180,7 @@ fn parse_datetime_ns(date: &str, time: &str) -> Option<u64> {
 
 impl MotecFile {
     #[cfg(not(target_os = "emscripten"))]
+    /// Memory-maps and parses a local MoTeC LD file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MotecError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
@@ -168,6 +195,7 @@ impl MotecFile {
         Self::parse(display, Storage::Mapped(data))
     }
 
+    /// Parses MoTeC telemetry from an owned LD byte buffer.
     pub fn from_bytes(path: impl Into<String>, data: Vec<u8>) -> Result<Self, MotecError> {
         Self::parse(path.into(), Storage::Owned(data.into_boxed_slice()))
     }

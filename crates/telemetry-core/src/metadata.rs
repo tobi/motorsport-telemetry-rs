@@ -2,80 +2,138 @@ use crate::TelemetrySource;
 use std::collections::{BTreeMap, BTreeSet};
 
 const GPS_WEEK_MS: u64 = 604_800_000;
+const GPS_UNIX_EPOCH_MS: u64 = 315_964_800_000;
 
+/// One lap boundary derived from source channels or reported lap timing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LapMetadata {
+    /// Source lap number, or a conservative inferred number.
     pub number: i64,
+    /// File- or session-relative lap start in nanoseconds.
     pub start_ns: u64,
+    /// File- or session-relative lap end in nanoseconds.
     pub end_ns: u64,
+    /// Lap duration in nanoseconds.
     pub duration_ns: u64,
+    /// Whether both lap boundaries are known to fall within the recording.
     pub complete: bool,
 }
 
+/// A contiguous interval attributed to one internal driver identifier.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DriverStint {
+    /// Format-specific numeric driver identifier.
     pub driver_id: i64,
+    /// File- or session-relative stint start in nanoseconds.
     pub start_ns: u64,
+    /// File- or session-relative stint end in nanoseconds.
     pub end_ns: u64,
 }
 
+/// Reliable absolute clock coverage reported by a source format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsoluteTimeRange {
+    /// Clock name, such as `gps` or `utc`.
     pub clock: String,
+    /// Inclusive absolute start timestamp in nanoseconds.
     pub start_ns: u64,
+    /// Absolute end timestamp in nanoseconds.
     pub end_ns: u64,
+    /// Format-provided identity used as one component of a session key.
     pub session_hint: String,
 }
 
+/// Human-readable identity embedded in a telemetry source.
+///
+/// Empty strings represent unavailable fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceIdentity {
+    /// Driver name.
     pub driver: String,
+    /// Vehicle name or identifier.
     pub vehicle: String,
+    /// Circuit or venue name.
     pub venue: String,
+    /// Event name.
     pub event: String,
+    /// Session name.
     pub session: String,
+    /// Recording date in the source's original representation.
     pub date: String,
+    /// Recording time in the source's original representation.
     pub time: String,
 }
 
+/// Video linkage available at one telemetry timestamp.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoReference {
+    /// Source video file index, when the recording spans multiple files.
     pub file_index: Option<u32>,
+    /// Source-exact video synchronization time.
     pub sync_time: Option<f64>,
+    /// Presentation-order video frame index, when available.
     pub frame_index: Option<u64>,
 }
 
+/// Format-neutral summary derived for one telemetry file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileMetadata {
+    /// Source path or caller-supplied name.
     pub path: String,
+    /// Stable lowercase format identifier.
     pub format: String,
+    /// Total number of declared channels.
     pub channel_count: usize,
+    /// Number of channels containing at least one sample.
     pub sampled_channel_count: usize,
+    /// Sum of sample counts across all channels.
     pub sample_count: u64,
+    /// Longest channel duration in nanoseconds.
     pub duration_ns: u64,
+    /// Stable hash of channel names, units, and scalar types.
     pub schema_hash: u64,
+    /// Internal session candidate key, when a reliable clock is available.
     pub session_key: Option<String>,
+    /// Name of the absolute clock used by this file.
     pub absolute_clock: Option<String>,
+    /// Absolute recording start in nanoseconds.
     pub absolute_start_ns: Option<u64>,
+    /// Absolute recording end in nanoseconds.
     pub absolute_end_ns: Option<u64>,
+    /// Offset satisfying `absolute_ns = file_relative_ns + clock_offset_ns`.
     pub clock_offset_ns: Option<i128>,
+    /// Human-readable identity embedded in the source.
     pub identity: SourceIdentity,
+    /// Distinct internal driver identifiers in ascending order.
     pub driver_ids: Vec<i64>,
+    /// Driver intervals in file-relative time.
     pub driver_stints: Vec<DriverStint>,
+    /// Lap intervals in file-relative time.
     pub laps: Vec<LapMetadata>,
+    /// Fastest complete or explicitly reported lap.
     pub fastest_lap: Option<LapMetadata>,
+    /// Linked or embedded video frame count, when available.
     pub video_frame_count: Option<u64>,
 }
 
+/// Metadata merged across files that belong to one recording session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionMetadata {
+    /// Unique derived key for this grouped session.
     pub session_key: String,
+    /// Indexes into the [`FileMetadata`] slice passed to [`group_sessions`].
     pub files: Vec<usize>,
+    /// Earliest absolute file start in nanoseconds.
     pub absolute_start_ns: Option<u64>,
+    /// Latest absolute file end in nanoseconds.
     pub absolute_end_ns: Option<u64>,
+    /// Span from absolute start to absolute end in nanoseconds.
     pub duration_ns: u64,
+    /// Driver intervals translated to session-relative time.
     pub driver_stints: Vec<DriverStint>,
+    /// Lap intervals translated and merged in session-relative time.
     pub laps: Vec<LapMetadata>,
+    /// Fastest complete or explicitly reported session lap.
     pub fastest_lap: Option<LapMetadata>,
 }
 
@@ -144,6 +202,10 @@ fn schema_hash(source: &dyn TelemetrySource) -> u64 {
     hash
 }
 
+/// Derives counts, identity, clocks, stints, laps, and video metadata.
+///
+/// Channel names are matched conservatively after punctuation and case
+/// normalization. Missing evidence remains absent rather than being guessed.
 pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
     let duration_ns = source
         .channels()
@@ -164,10 +226,12 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         let start_ns = week
             .saturating_mul(GPS_WEEK_MS)
             .saturating_add(first_value.round().max(0.0) as u64)
+            .saturating_add(GPS_UNIX_EPOCH_MS)
             .saturating_mul(1_000_000);
         let end_ns = week
             .saturating_mul(GPS_WEEK_MS)
             .saturating_add(last_value.round().max(0.0) as u64)
+            .saturating_add(GPS_UNIX_EPOCH_MS)
             .saturating_mul(1_000_000);
         Some((week, first_time, start_ns, end_ns))
     });
@@ -400,6 +464,10 @@ fn absolute_time(metadata: &FileMetadata, relative_ns: u64) -> Option<u64> {
     u64::try_from(i128::from(relative_ns) + offset).ok()
 }
 
+/// Groups files with equal internal session keys and compatible absolute clocks.
+///
+/// `max_gap_ns` is the largest allowed gap between adjacent files. Unkeyed
+/// files form separate sessions. Filenames are never used for identity.
 pub fn group_sessions(files: &[FileMetadata], max_gap_ns: u64) -> Vec<SessionMetadata> {
     let mut indexed = files
         .iter()
@@ -539,6 +607,10 @@ pub fn group_sessions(files: &[FileMetadata], max_gap_ns: u64) -> Vec<SessionMet
         .collect()
 }
 
+/// Counts native samples for each value of a recognized driver-ID channel.
+///
+/// Returns an empty map if no recognized sampled channel exists. Finite values
+/// are rounded to the nearest integer identifier.
 pub fn driver_histogram(source: &dyn TelemetrySource) -> BTreeMap<i64, u64> {
     let Some(index) = channel_index(source, &["driverid", "driver", "driverindex"]) else {
         return BTreeMap::new();

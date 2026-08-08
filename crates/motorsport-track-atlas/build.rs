@@ -63,7 +63,7 @@ fn main() {
         ));
     }
     let output = format!(
-        "pub const TRACK_ATLAS_REVISION: &str = {};\npub static TRACKS: &[Track] = &[{}];\n",
+        "/// Upstream track-atlas Git revision used to generate this catalog.\npub const TRACK_ATLAS_REVISION: &str = {};\n/// Complete generated track catalog. Prefer [`tracks`] for normal access.\npub static TRACKS: &[Track] = &[{}];\n",
         q(&revision),
         tracks
     );

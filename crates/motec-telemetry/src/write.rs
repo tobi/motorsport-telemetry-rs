@@ -21,9 +21,13 @@ use motorsport_telemetry_core::{SampleType, TelemetrySource};
 use std::path::Path;
 use thiserror::Error;
 
+/// Size in bytes of the fixed LD header emitted by the writer.
 pub const HEADER_SIZE: usize = 0x6e2;
+/// Size in bytes of the fixed LD event block.
 pub const EVENT_SIZE: usize = 1154;
+/// Size in bytes of the fixed LD venue block.
 pub const VENUE_SIZE: usize = 1100;
+/// Size in bytes of the fixed LD vehicle block.
 pub const VEHICLE_SIZE: usize = 260;
 
 const EVENT_PTR: usize = HEADER_SIZE;
@@ -39,24 +43,41 @@ const UNIT_CAP: usize = 12;
 const IDENTITY_CAP: usize = 64;
 const COMMENT_CAP: usize = 1024;
 
+/// Errors returned while serializing or writing MoTeC LD/LDX output.
 #[derive(Debug, Error)]
 pub enum MotecWriteError {
+    /// An output file could not be written.
     #[error("I/O error for {path}: {source}")]
     Io {
+        /// Output path that failed.
         path: String,
+        /// Underlying filesystem error.
         source: std::io::Error,
     },
+    /// A source channel cannot be represented losslessly in LD.
     #[error("channel {channel:?}: {message}")]
-    Channel { channel: String, message: String },
+    Channel {
+        /// Source channel name.
+        channel: String,
+        /// Representation constraint that was violated.
+        message: String,
+    },
+    /// A metadata value does not fit its fixed-width LD field.
     #[error("field {field} does not fit in {capacity} bytes (got {len}): {value:?}")]
     FieldTooLong {
+        /// Name of the LD field.
         field: &'static str,
+        /// Available encoded bytes, including the terminator.
         capacity: usize,
+        /// Encoded value length in bytes.
         len: usize,
+        /// Value rejected by the writer.
         value: String,
     },
+    /// The source contains no sampled channels.
     #[error("nothing to write: source has no channels with samples")]
     Empty,
+    /// The output would exceed LD's 32-bit pointer space.
     #[error("file would exceed the 4 GiB addressable by LD 32-bit pointers")]
     TooLarge,
 }
@@ -64,14 +85,23 @@ pub enum MotecWriteError {
 /// Session identity written into the LD header and event/venue/vehicle blocks.
 #[derive(Debug, Clone, Default)]
 pub struct MotecMetadata {
+    /// Driver name.
     pub driver: String,
+    /// Vehicle name or model.
     pub vehicle: String,
+    /// Racing number or vehicle identifier.
     pub vehicle_number: String,
+    /// Team name.
     pub team: String,
+    /// Circuit or venue name.
     pub venue: String,
+    /// Event name.
     pub event: String,
+    /// Session name.
     pub session: String,
+    /// Short recording comment.
     pub short_comment: String,
+    /// Longer event comment written to the LDX sidecar.
     pub event_comment: String,
     /// `dd/mm/yyyy`; defaults to `01/01/1970` when empty.
     pub date: String,

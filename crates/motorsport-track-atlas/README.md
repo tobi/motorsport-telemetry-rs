@@ -21,4 +21,5 @@ offline and reproducible. Refresh it explicitly with:
 python scripts/update_track_atlas.py /path/to/track-atlas
 ```
 
-See the workspace `ATTRIBUTION.md` for ODbL and upstream data attribution.
+See the workspace [attribution notice](https://github.com/tobi/motorsport-telemetry-rs/blob/master/ATTRIBUTION.md)
+for ODbL and upstream data attribution.

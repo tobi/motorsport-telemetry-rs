@@ -2,7 +2,7 @@
 
 Standalone mmap-backed parser for Racelogic VBOX `.vbo` telemetry.
 
-```rust
+```rust,no_run
 use motorsport_telemetry_core::TelemetrySource;
 use racelogic_telemetry::RacelogicFile;
 
@@ -17,6 +17,7 @@ println!("first speed={}", file.decode(velocity, 0, 0));
 Public constructors:
 
 - `RacelogicFile::open` — native mmap path
+- `RacelogicFile::open_metadata` — mmap path that skips unrelated signal values
 - `RacelogicFile::from_bytes` / `from_slice` — embedded input
 - `read_metadata` / `read_metadata_from_bytes` — fast summary path
 

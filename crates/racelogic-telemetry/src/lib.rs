@@ -1,9 +1,13 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
+
 use memmap2::Mmap;
 use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
 use std::fs::File;
 use std::path::Path;
 use thiserror::Error;
 
+/// Opens a VBO file and derives its format-neutral metadata summary.
 pub fn read_metadata(
     path: impl AsRef<Path>,
 ) -> Result<motorsport_telemetry_core::FileMetadata, RacelogicError> {
@@ -11,6 +15,7 @@ pub fn read_metadata(
         .map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
+/// Derives format-neutral metadata from an owned VBO byte buffer.
 pub fn read_metadata_from_bytes(
     path: impl Into<String>,
     data: Vec<u8>,
@@ -48,15 +53,25 @@ const BUILTIN_SHORT: [&str; 12] = [
     "avitime",
 ];
 
+/// Errors returned while opening or parsing Racelogic VBOX telemetry.
 #[derive(Debug, Error)]
 pub enum RacelogicError {
+    /// The VBO file could not be opened or memory-mapped.
     #[error("I/O error for {path}: {source}")]
     Io {
+        /// Path that was being opened.
         path: String,
+        /// Underlying filesystem error.
         source: std::io::Error,
     },
+    /// The VBO structure or a sample value is malformed.
     #[error("invalid VBO file {path}: {message}")]
-    Invalid { path: String, message: String },
+    Invalid {
+        /// Path or caller-supplied input name.
+        path: String,
+        /// Specific validation failure.
+        message: String,
+    },
 }
 
 /// Sections borrow directly out of the mapped file: a VBO's `[data]` block is
@@ -64,17 +79,27 @@ pub enum RacelogicError {
 /// text we only ever read.
 #[derive(Default)]
 struct Sections<'a> {
+    created_date: String,
+    created_time: String,
     header: Vec<&'a str>,
     units: Vec<&'a str>,
     column_names: Vec<&'a str>,
     data: Vec<&'a str>,
 }
 
+/// An opened Racelogic VBOX telemetry source.
 #[derive(Debug)]
 pub struct RacelogicFile {
+    /// Source path or caller-supplied name.
     pub path: String,
+    /// Source-exact telemetry channel metadata.
     pub channels: Vec<Channel>,
+    /// File-relative timestamp for each VBO data row.
     pub time_ns: Vec<u64>,
+    /// Recording date from the VBOX preamble, when present.
+    pub date: String,
+    /// Recording time from the VBOX preamble, when present.
+    pub recording_time: String,
     values: Vec<Vec<f64>>,
     absolute_start_ns: u64,
 }
@@ -91,6 +116,12 @@ fn sections(text: &str) -> Sections<'_> {
     let mut current = String::new();
     for line in text.lines() {
         let trimmed = line.trim();
+        if let Some(created) = trimmed.strip_prefix("File created on ") {
+            if let Some((date, time)) = created.split_once(" at ") {
+                result.created_date = date.trim().to_owned();
+                result.created_time = time.trim().to_owned();
+            }
+        }
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             current = trimmed[1..trimmed.len() - 1].to_ascii_lowercase();
             continue;
@@ -137,6 +168,11 @@ fn metadata_channel(name: &str) -> bool {
             .as_str(),
         "time"
             | "tsample"
+            | "latitude"
+            | "longitude"
+            | "lat"
+            | "long"
+            | "lon"
             | "driver"
             | "driverid"
             | "driverindex"
@@ -155,6 +191,18 @@ fn metadata_channel(name: &str) -> bool {
             | "avifileindex"
             | "avisynctime"
             | "avitime"
+            | "cartype"
+            | "vehicletype"
+            | "vehiclemodel"
+            | "carmodel"
+            | "carnumber"
+            | "vehiclenumber"
+            | "racenumber"
+            | "competitionnumber"
+            | "carclass"
+            | "vehicleclass"
+            | "classid"
+            | "competitionclass"
     )
 }
 
@@ -162,6 +210,14 @@ impl RacelogicFile {
     /// Memory-maps the file and parses straight out of the mapping.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RacelogicError> {
         Self::open_mode(path, false)
+    }
+
+    /// Memory-maps a file and retains only channels used for metadata reports.
+    ///
+    /// Channel declarations remain visible, but sample values for unrelated
+    /// bulk signals are skipped while each text row is scanned.
+    pub fn open_metadata(path: impl AsRef<Path>) -> Result<Self, RacelogicError> {
+        Self::open_mode(path, true)
     }
 
     fn open_mode(path: impl AsRef<Path>, metadata_only: bool) -> Result<Self, RacelogicError> {
@@ -180,10 +236,15 @@ impl RacelogicFile {
         Self::from_slice_mode(display, &mapping, metadata_only)
     }
 
+    /// Parses VBO telemetry from an owned byte buffer.
     pub fn from_bytes(path: impl Into<String>, bytes: Vec<u8>) -> Result<Self, RacelogicError> {
         Self::from_slice_mode(path.into(), &bytes, false)
     }
 
+    /// Parses VBO telemetry from a borrowed byte slice.
+    ///
+    /// Parsed values are owned by the returned file; the input need not outlive
+    /// the result.
     pub fn from_slice(path: impl Into<String>, bytes: &[u8]) -> Result<Self, RacelogicError> {
         Self::from_slice_mode(path.into(), bytes, false)
     }
@@ -249,18 +310,19 @@ impl RacelogicFile {
             .collect::<Vec<Vec<f64>>>();
         let mut rows = 0usize;
         for line in &parsed.data {
-            let tokens = line.split_whitespace().collect::<Vec<_>>();
-            if tokens.len() < 2 {
+            if line.split_whitespace().nth(1).is_none() {
                 continue;
             }
             rows += 1;
+            let mut tokens = line.split_whitespace();
             for (column, output) in values.iter_mut().enumerate() {
                 if !selected[column] {
+                    tokens.next();
                     continue;
                 }
                 output.push(
                     tokens
-                        .get(column)
+                        .next()
                         .and_then(|token| token.parse().ok())
                         .unwrap_or(f64::NAN),
                 );
@@ -328,27 +390,33 @@ impl RacelogicFile {
                     None => (String::new(), UnitSource::Unknown),
                 }
             };
+            let sampled = selected[index];
             channels.push(Channel {
                 id: index as u32,
                 name,
                 unit,
                 unit_source,
                 sample_type: SampleType::F64,
-                chunks: vec![Chunk {
-                    sample_period_ns: sample_period,
-                    sample_count: rows as u64,
-                    data_ptr: 0,
-                    sample_base: 0,
-                    time_base_ns: 0,
-                }],
-                sample_count: rows as u64,
-                duration_ns: duration,
+                chunks: sampled
+                    .then_some(Chunk {
+                        sample_period_ns: sample_period,
+                        sample_count: rows as u64,
+                        data_ptr: 0,
+                        sample_base: 0,
+                        time_base_ns: 0,
+                    })
+                    .into_iter()
+                    .collect(),
+                sample_count: if sampled { rows as u64 } else { 0 },
+                duration_ns: if sampled { duration } else { 0 },
             });
         }
         Ok(Self {
             path: display,
             channels,
             time_ns,
+            date: parsed.created_date,
+            recording_time: parsed.created_time,
             values,
             absolute_start_ns: (first * 1e9).round().max(0.0) as u64,
         })
@@ -381,6 +449,13 @@ impl TelemetrySource for RacelogicFile {
             end_ns: self.absolute_start_ns.saturating_add(duration_ns),
             session_hint: "vbo:time_of_day".into(),
         })
+    }
+    fn identity(&self) -> motorsport_telemetry_core::SourceIdentity {
+        motorsport_telemetry_core::SourceIdentity {
+            date: self.date.clone(),
+            time: self.recording_time.clone(),
+            ..Default::default()
+        }
     }
     fn sample_time_ns(&self, _channel_index: usize, _chunk_index: usize, local_index: u64) -> u64 {
         self.time_ns[local_index as usize]
@@ -432,6 +507,24 @@ mod tests {
         assert_eq!(file.time_ns, [0, 500_000_000, 1_500_000_000]);
         assert_eq!(file.decode(1, 0, 2), 40.0);
         assert_eq!(file.sample_at(1, 1_000_000_000, true), Some(30.0));
+    }
+
+    #[test]
+    fn metadata_mode_keeps_gps_and_skips_bulk_values() {
+        let fixture = fixture("[header]\ntime\nlatitude\nlongitude\nthrottle\n[column names]\ntime lat long throttle\n[data]\n120000.0 2627.8 5279.3 10\n120000.5 2627.9 5279.4 20\n");
+        let file = RacelogicFile::open_metadata(fixture.path()).unwrap();
+        assert_eq!(file.channels[1].sample_count, 2, "latitude retained");
+        assert_eq!(file.channels[2].sample_count, 2, "longitude retained");
+        assert_eq!(file.channels[3].sample_count, 0, "throttle skipped");
+        assert_eq!(file.values[3], Vec::<f64>::new());
+    }
+
+    #[test]
+    fn preserves_recording_date_from_preamble() {
+        let fixture = fixture("File created on 31/07/2006 at 09:55:20\n[column names]\ntime velocity\n[data]\n120000.0 10\n120000.5 20\n");
+        let file = RacelogicFile::open(fixture.path()).unwrap();
+        assert_eq!(file.identity().date, "31/07/2006");
+        assert_eq!(file.identity().time, "09:55:20");
     }
 
     #[test]

@@ -6,4 +6,5 @@ Track geometry and named-corner coordinates derived from OpenStreetMap are © Op
 
 Ordered corner metadata may derive from [`Lovely-Sim-Racing/lovely-track-data`](https://github.com/Lovely-Sim-Racing/lovely-track-data); follow its upstream terms for reuse. Curated track-atlas overrides are MIT-licensed.
 
-The track catalog source revision is recorded in `data/track-atlas-revision.txt`.
+The track catalog source revision is recorded in
+[`crates/motorsport-track-atlas/data/track-atlas-revision.txt`](crates/motorsport-track-atlas/data/track-atlas-revision.txt).

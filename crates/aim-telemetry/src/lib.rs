@@ -1,3 +1,6 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
+
 //! AiM Sports `aimd` telemetry embedded in ISO Base Media (MP4) files.
 //!
 //! Local MP4 files are memory-mapped; `from_bytes` owns its input buffer.
@@ -9,17 +12,19 @@
 #[cfg(not(target_os = "emscripten"))]
 use memmap2::Mmap;
 use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
-use std::collections::HashMap;
+use std::collections::HashSet;
 #[cfg(not(target_os = "emscripten"))]
 use std::{fs::File, path::Path};
 
 #[cfg(not(target_os = "emscripten"))]
+/// Opens an MP4 and derives its format-neutral metadata summary.
 pub fn read_metadata(
     path: impl AsRef<Path>,
 ) -> Result<motorsport_telemetry_core::FileMetadata, AimError> {
     AimFile::open(path).map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
+/// Derives format-neutral metadata from an owned MP4 byte buffer.
 pub fn read_metadata_from_bytes(
     path: impl Into<String>,
     data: Vec<u8>,
@@ -32,17 +37,31 @@ use thiserror::Error;
 const AIMD: &[u8; 4] = b"aimd";
 const RECORD_START: &[u8; 2] = b"(S";
 
+/// Errors returned while opening or parsing AiM MP4 telemetry.
 #[derive(Debug, Error)]
 pub enum AimError {
+    /// The MP4 could not be opened or memory-mapped.
     #[error("I/O error for {path}: {source}")]
     Io {
+        /// Path that was being opened.
         path: String,
+        /// Underlying filesystem error.
         source: std::io::Error,
     },
+    /// The MP4 is valid enough to inspect but contains no `aimd` track.
     #[error("MP4 file {path} has no aimd telemetry track")]
-    NoAimdTrack { path: String },
+    NoAimdTrack {
+        /// Path or caller-supplied input name.
+        path: String,
+    },
+    /// The `aimd` track or its MP4 sample tables are malformed or unsupported.
     #[error("invalid AiM MP4 {path}: {message}")]
-    Invalid { path: String, message: String },
+    Invalid {
+        /// Path or caller-supplied input name.
+        path: String,
+        /// Specific validation failure.
+        message: String,
+    },
 }
 
 fn invalid(path: &str, message: impl Into<String>) -> AimError {
@@ -356,6 +375,71 @@ struct SampleRef {
     time_ns: u64,
 }
 
+enum RecordDispatch {
+    Dense { first: u16, indexes: Box<[u16]> },
+    Sparse(Box<[(u16, u16)]>),
+}
+
+impl RecordDispatch {
+    fn new(channels: &[AimChannel]) -> Self {
+        let scalar_count = channels
+            .iter()
+            .filter(|channel| !channel.representation.is_gps())
+            .count();
+        let first = channels
+            .iter()
+            .filter(|channel| !channel.representation.is_gps())
+            .map(|channel| channel.record_id)
+            .min()
+            .unwrap_or(0);
+        let last = channels
+            .iter()
+            .filter(|channel| !channel.representation.is_gps())
+            .map(|channel| channel.record_id)
+            .max()
+            .unwrap_or(first);
+        let span = usize::from(last) - usize::from(first) + 1;
+        if span <= scalar_count.saturating_mul(4) {
+            let mut indexes = vec![0; span];
+            for (index, channel) in channels.iter().enumerate() {
+                if !channel.representation.is_gps() {
+                    indexes[usize::from(channel.record_id - first)] = index as u16 + 1;
+                }
+            }
+            Self::Dense {
+                first,
+                indexes: indexes.into_boxed_slice(),
+            }
+        } else {
+            let mut indexes = channels
+                .iter()
+                .enumerate()
+                .filter(|(_, channel)| !channel.representation.is_gps())
+                .map(|(index, channel)| (channel.record_id, index as u16 + 1))
+                .collect::<Vec<_>>();
+            indexes.sort_unstable_by_key(|entry| entry.0);
+            Self::Sparse(indexes.into_boxed_slice())
+        }
+    }
+
+    #[inline]
+    fn get(&self, record_id: u16) -> Option<usize> {
+        let encoded = match self {
+            Self::Dense { first, indexes } => record_id
+                .checked_sub(*first)
+                .and_then(|index| indexes.get(usize::from(index)))
+                .copied()
+                .unwrap_or(0),
+            Self::Sparse(indexes) => indexes
+                .binary_search_by_key(&record_id, |entry| entry.0)
+                .ok()
+                .map(|index| indexes[index].1)
+                .unwrap_or(0),
+        };
+        (encoded != 0).then_some(usize::from(encoded - 1))
+    }
+}
+
 #[derive(Debug)]
 struct AimChannel {
     record_id: u16,
@@ -414,7 +498,9 @@ impl std::ops::Deref for Storage {
 /// An AiM telemetry stream embedded in an MP4 recording.
 #[derive(Debug)]
 pub struct AimFile {
+    /// Source path or caller-supplied name.
     pub path: String,
+    /// Source-exact telemetry channel metadata.
     pub channels: Vec<Channel>,
     data: Storage,
     aim_channels: Vec<AimChannel>,
@@ -521,7 +607,7 @@ fn schema(sample: &[u8], path: &str) -> Result<Vec<(Channel, AimChannel)>, AimEr
         return Err(invalid(path, "first aimd sample has no amv0 signature"));
     }
     let mut result = Vec::new();
-    let mut seen = HashMap::new();
+    let mut seen = HashSet::new();
     let mut gps_record = None;
     for payload in tagged_blocks(sample, *b"CHS") {
         if payload.len() < 100 {
@@ -538,7 +624,7 @@ fn schema(sample: &[u8], path: &str) -> Result<Vec<(Channel, AimChannel)>, AimEr
         if record_id > u16::MAX as u32 || name.is_empty() || !matches!(width, 1 | 4) {
             continue;
         }
-        if seen.insert(record_id as u16, name.clone()).is_some() {
+        if !seen.insert(record_id as u16) {
             return Err(invalid(
                 path,
                 format!("duplicate AiM record id {record_id}"),
@@ -694,6 +780,7 @@ fn gps_record_start(packet: &[u8], mut at: usize) -> Option<usize> {
 
 impl AimFile {
     #[cfg(not(target_os = "emscripten"))]
+    /// Memory-maps and parses an MP4 containing an AiM `aimd` track.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AimError> {
         let path_ref = path.as_ref();
         let display = path_ref.to_string_lossy().into_owned();
@@ -711,6 +798,7 @@ impl AimFile {
         Self::parse(display, Storage::Mapped(data))
     }
 
+    /// Parses AiM telemetry from an owned MP4 byte buffer.
     pub fn from_bytes(path: impl Into<String>, data: Vec<u8>) -> Result<Self, AimError> {
         Self::parse(path.into(), Storage::Owned(data.into_boxed_slice()))
     }
@@ -732,15 +820,10 @@ impl AimFile {
         let definitions = schema(first_bytes, &display)?;
         let (mut channels, mut aim_channels): (Vec<_>, Vec<_>) = definitions.into_iter().unzip();
         // Record IDs are protocol u16 values and occur in every scalar sample.
-        // A dense dispatch table makes the hot packet loop a bounds check and
-        // array load instead of a hash operation. Zero denotes an unknown or
-        // GPS-only record; scalar channel indices are stored one-based.
-        let mut by_record = vec![0u16; u16::MAX as usize + 1];
-        for (index, channel) in aim_channels.iter().enumerate() {
-            if !channel.representation.is_gps() {
-                by_record[channel.record_id as usize] = index as u16 + 1;
-            }
-        }
+        // Most loggers assign a compact range, so use a range-relative table
+        // instead of zeroing all 65,536 possible entries. Unusually sparse
+        // schemas use a sorted compact table.
+        let by_record = RecordDispatch::new(&aim_channels);
         let has_gps = aim_channels
             .iter()
             .any(|channel| channel.representation.is_gps());
@@ -763,12 +846,10 @@ impl AimFile {
                     .ok_or_else(|| invalid(&display, "truncated AiM sample record"))?;
                 let record_id = le16(packet, start + 6)
                     .ok_or_else(|| invalid(&display, "truncated AiM sample record"))?;
-                let encoded_index = by_record[record_id as usize];
-                if encoded_index == 0 {
+                let Some(index) = by_record.get(record_id) else {
                     at = start + 2;
                     continue;
-                }
-                let index = encoded_index as usize - 1;
+                };
                 let width = aim_channels[index].width;
                 let value = start + 8;
                 if packet.get(value + width) != Some(&b')') {
