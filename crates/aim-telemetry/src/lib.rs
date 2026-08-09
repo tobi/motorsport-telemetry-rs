@@ -518,7 +518,7 @@ impl RecordDispatch {
                 .map(|index| indexes[index].1)
                 .unwrap_or(0),
         };
-        (encoded != 0).then_some(usize::from(encoded - 1))
+        encoded.checked_sub(1).map(usize::from)
     }
 }
 
@@ -1158,6 +1158,26 @@ impl TelemetrySource for AimFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_dispatch_handles_present_and_missing_ids_without_underflow() {
+        let dense = RecordDispatch::Dense {
+            first: 10,
+            indexes: vec![1, 0, 3].into_boxed_slice(),
+        };
+        assert_eq!(dense.get(9), None);
+        assert_eq!(dense.get(10), Some(0));
+        assert_eq!(dense.get(11), None);
+        assert_eq!(dense.get(12), Some(2));
+        assert_eq!(dense.get(13), None);
+
+        let sparse = RecordDispatch::Sparse(vec![(10, 1), (30, 3)].into_boxed_slice());
+        assert_eq!(sparse.get(9), None);
+        assert_eq!(sparse.get(10), Some(0));
+        assert_eq!(sparse.get(20), None);
+        assert_eq!(sparse.get(30), Some(2));
+        assert_eq!(sparse.get(31), None);
+    }
 
     #[test]
     fn boxes_reject_truncated_size() {
