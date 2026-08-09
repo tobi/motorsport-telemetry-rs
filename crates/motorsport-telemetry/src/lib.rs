@@ -129,6 +129,14 @@ impl TelemetrySource for TelemetryFile {
     fn video_frame_at(&self, time_ns: u64) -> Option<u64> {
         delegate!(self, source => source.video_frame_at(time_ns))
     }
+
+    fn video_presentation_offset_ns(&self) -> Option<i128> {
+        delegate!(self, source => source.video_presentation_offset_ns())
+    }
+
+    fn video_presentation_time_ns(&self, time_ns: u64) -> Option<u64> {
+        delegate!(self, source => source.video_presentation_time_ns(time_ns))
+    }
 }
 
 /// Channel indexes selected for the facade's format-neutral signal roles.
@@ -285,7 +293,9 @@ fn normalize_sample(
     lap_fallback: impl FnOnce() -> Option<f64>,
 ) -> NormalizedSample {
     let value = |index: Option<usize>, linear| {
-        index.and_then(|index| source.sample_at(index, time_ns, linear))
+        index
+            .and_then(|index| source.sample_at(index, time_ns, linear))
+            .filter(|value| value.is_finite())
     };
     let speed_mps = roles.speed.and_then(|index| {
         let raw = value(Some(index), true)?;

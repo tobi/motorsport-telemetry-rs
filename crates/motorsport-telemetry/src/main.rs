@@ -22,6 +22,7 @@ struct Inspection {
     video_included: bool,
     video_filenames: Vec<String>,
     video_file_indices: Vec<u32>,
+    video_presentation_offset_ns: Option<i128>,
     session_key: Option<String>,
     car_type: Option<String>,
     car_number: Option<String>,
@@ -139,6 +140,7 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
         video_included,
         video_filenames,
         video_file_indices,
+        video_presentation_offset_ns: metadata.video_presentation_offset_ns,
         session_key: metadata.session_key.clone(),
         car_type,
         car_number,
@@ -352,17 +354,20 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_owned())
 }
 
-fn normalized(value: &str) -> String {
+fn normalized_eq(value: &str, wanted: &str) -> bool {
     value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .eq(wanted.bytes())
 }
 
 fn first_semantic_value(file: &TelemetryFile, names: &[&str]) -> Option<String> {
     let index = file.channels().iter().position(|channel| {
-        channel.sample_count > 0 && names.contains(&normalized(&channel.name).as_str())
+        channel.sample_count > 0
+            && names
+                .iter()
+                .any(|wanted| normalized_eq(&channel.name, wanted))
     })?;
     let value = file.decode(index, 0, 0);
     if !value.is_finite() {
@@ -476,11 +481,11 @@ fn valid_gps((latitude, longitude): (f64, f64)) -> bool {
 }
 
 fn channel_values(file: &TelemetryFile, names: &[&str]) -> Vec<f64> {
-    let Some(index) = file
-        .channels()
-        .iter()
-        .position(|channel| names.contains(&normalized(&channel.name).as_str()))
-    else {
+    let Some(index) = file.channels().iter().position(|channel| {
+        names
+            .iter()
+            .any(|wanted| normalized_eq(&channel.name, wanted))
+    }) else {
         return Vec::new();
     };
     let mut values = Vec::new();
@@ -597,6 +602,10 @@ fn print_human(inspection: &Inspection) {
                 .join(", ")
         );
     }
+    println!(
+        "video_presentation_offset_ns: {}",
+        display(inspection.video_presentation_offset_ns)
+    );
     println!("part_of_larger_session: unknown (single-file inspection)");
     println!(
         "session_key: {}",
@@ -660,6 +669,7 @@ fn print_json(inspection: &Inspection) {
             "video_included": inspection.video_included,
             "video_filenames": video_filenames,
             "video_file_indices": inspection.video_file_indices,
+            "video_presentation_offset_ns": inspection.video_presentation_offset_ns,
             "part_of_larger_session": null,
             "session_key": inspection.session_key,
             "car_type": inspection.car_type,

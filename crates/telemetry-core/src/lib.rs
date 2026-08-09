@@ -263,6 +263,16 @@ pub trait TelemetrySource: Send + Sync {
         None
     }
 
+    /// Returns the offset from file-relative time to the video movie timeline.
+    fn video_presentation_offset_ns(&self) -> Option<i128> {
+        None
+    }
+
+    /// Maps a file-relative telemetry timestamp to the video's movie timeline.
+    fn video_presentation_time_ns(&self, time_ns: u64) -> Option<u64> {
+        u64::try_from(i128::from(time_ns) + self.video_presentation_offset_ns()?).ok()
+    }
+
     /// Returns all video linkage available at a file-relative timestamp.
     ///
     /// The default implementation samples conventional VBOX AVI linkage
@@ -294,6 +304,7 @@ pub trait TelemetrySource: Send + Sync {
         VideoReference {
             file_index,
             sync_time,
+            presentation_time_ns: self.video_presentation_time_ns(time_ns),
             frame_index: self.video_frame_at(time_ns),
         }
     }

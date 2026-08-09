@@ -38,7 +38,8 @@ fn joins_aim_files_and_resolves_video_frame() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].files.len(), 2);
     let position = sessions[0].position(0).unwrap();
-    assert_eq!(position.video.frame_index, Some(0));
+    assert_eq!(position.video.presentation_time_ns, Some(104_000_000));
+    assert_eq!(position.video.frame_index, Some(2));
     assert_eq!(position.driver_id, Some(3));
 }
 

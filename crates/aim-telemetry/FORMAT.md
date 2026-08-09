@@ -20,7 +20,10 @@ provide an owned byte buffer through `AimFile::from_bytes`.
 
 For session queries, the reader also indexes the native video track timeline.
 `video_frame_index` is derived from `mdhd`/`stts` and optional `ctts`
-composition offsets; it is not an AiM telemetry channel.
+composition offsets. Telemetry time is translated to the movie presentation
+timeline through the `mvhd` timescale and the `aimd` track's `edts`/`elst`
+edit list; the resulting presentation-time offset is not inferred from packet
+contents or filenames.
 
 The parser does not inspect video or audio payloads. It requires an `aimd`
 sample-entry track and rejects malformed sample tables, missing `amv0`
@@ -88,27 +91,36 @@ One valid 56-byte `GPS0` payload produces:
 | `GPS Altitude` | `m` | WGS84 ellipsoid altitude |
 | `GPS Speed` | `m/s` | ECEF velocity magnitude |
 | `GPS Heading` | `deg` | True heading from ECEF velocity |
-| `GPS Satellites` | `count` | High byte of the packed field |
+| `GPS Satellites` | `count` | u-blox NAV-SOL `numSV` |
 | `GPS Position Accuracy` | `m` | Payload centimetres divided by 100 |
 | `GPS Speed Accuracy` | `m/s` | Payload centimetres per second divided by 100 |
 | `GPS ECEF Velocity X/Y/Z` | `m/s` | Payload centimetres per second divided by 100 |
 | `GPS iTOW` | `ms` | GPS time of week |
 | `GPS Week` | `count` | GPS week |
-| `GPS DOP` | `ratio` | Packed low 24 bits divided by 100 |
-| `GPS Fix Flags` | `raw` | Payload flags, unscaled |
+| `GPS DOP` | `ratio` | u-blox NAV-SOL `pDOP` divided by 100 |
+| `GPS Fix Type` | `raw` | u-blox NAV-SOL `gpsFix` |
+| `GPS Fix Flags` | `raw` | u-blox NAV-SOL `flags` |
 
 | GPS payload offset | Encoding | Export | Unit |
 |---:|---|---|---|
 | 0 | `u32le` | logger timestamp | ms |
 | 4 | `u32le` | GPS iTOW | ms |
 | 12 | `u16le` | GPS week | count |
+| 14 | `u8` | GPS fix type | raw |
+| 15 | `u8` | GPS fix flags | raw |
 | 16, 20, 24 | `i32le` | ECEF X/Y/Z position | cm |
 | 28 | `u32le` | position accuracy | cm |
 | 32, 36, 40 | `i32le` | ECEF X/Y/Z velocity | cm/s |
 | 44 | `u32le` | speed accuracy | cm/s |
-| 48, high byte | `u8` | satellite count | count |
-| 48, low 24 bits | unsigned | dilution of precision | 0.01 ratio |
-| 52 | `u32le` | fix/status flags | raw |
+| 48 | `u16le` | dilution of precision | 0.01 ratio |
+| 51 | `u8` | satellite count | count |
+
+Bytes 4 through 55 correspond to the u-blox `NAV-SOL` payload. ECEF position
+and velocity decode to unavailable (`NaN`) unless `gpsFix` reports a 2D, 3D,
+or GPS+dead-reckoning solution. The captures leave NAV-SOL's `GPSfixOK` bit
+clear even for stable 3D fixes, so the reader exposes that byte but does not
+reject an otherwise valid fix because of it. This prevents a stale or zero
+ECEF solution from being accepted as a real geographic position.
 
 The reader converts ECEF position to WGS84 latitude, longitude and ellipsoid altitude, and ECEF velocity to speed and true heading. The first packet resolves to `43.797816°, -87.989895°, 291.74 m`, at Road America. Velocity magnitude reaches `72.46 m/s` and agrees with the independent wheel-speed channel after converting that channel from km/h. These checks are included to distinguish decoded fields from plausible-looking guesses.
 

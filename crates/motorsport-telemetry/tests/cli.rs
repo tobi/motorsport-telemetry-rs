@@ -21,6 +21,7 @@ fn reports_requested_metadata() {
     assert!(stdout.contains("laps: 1\n"));
     assert!(stdout.contains("video_included: true\n"));
     assert!(stdout.contains("video_filenames: synthetic_aimd.mp4\n"));
+    assert!(stdout.contains("video_presentation_offset_ns: 104000000\n"));
     assert!(stdout.contains("part_of_larger_session: unknown (single-file inspection)\n"));
     assert!(stdout.contains("track_name: Road America\n"));
     assert!(stdout.contains("layout: Full Course\n"));
@@ -40,6 +41,7 @@ fn emits_machine_readable_json() {
     assert_eq!(report["event_date_source"], "gps_clock");
     assert_eq!(report["laps"], 1);
     assert_eq!(report["video_included"], true);
+    assert_eq!(report["video_presentation_offset_ns"], 104_000_000);
     assert_eq!(report["track_name"], "Road America");
     assert_eq!(report["layout"], "Full Course");
     assert_eq!(report["track_length_m"], 6514.0);

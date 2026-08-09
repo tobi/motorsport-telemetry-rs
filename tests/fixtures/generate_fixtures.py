@@ -72,8 +72,10 @@ def make_aimd(itow_ms: int = 573_634_560, driver_id: float = 3.0, lap_number: fl
     struct.pack_into("<I", gps, 28, 783)
     struct.pack_into("<3i", gps, 32, 5, -10, 8)
     struct.pack_into("<I", gps, 44, 6)
-    struct.pack_into("<I", gps, 48, 0x0900_00F8)
-    struct.pack_into("<I", gps, 52, 4096)
+    gps[14] = 3  # u-blox NAV-SOL gpsFix: 3D
+    gps[15] = 1  # u-blox NAV-SOL flags: GPSfixOK
+    struct.pack_into("<H", gps, 48, 248)
+    gps[51] = 9
     values.extend(b"<hGPS\x00")
     values.extend(struct.pack("<I", len(gps)))
     values.extend(b"\x01>")
@@ -118,7 +120,13 @@ def make_aimd(itow_ms: int = 573_634_560, driver_id: float = 3.0, lap_number: fl
     )
     minf = mp4_box(b"minf", stbl)
     mdia = mp4_box(b"mdia", mp4_box(b"mdhd", mdhd) + mp4_box(b"hdlr", hdlr) + minf)
-    aimd_trak = mp4_box(b"trak", mdia)
+    movie_timescale = 1000
+    empty_edit_ms = 104
+    aimd_elst = bytearray(32)
+    aimd_elst[7] = 2
+    struct.pack_into(">IiI", aimd_elst, 8, empty_edit_ms, -1, 0x00010000)
+    struct.pack_into(">IiI", aimd_elst, 20, 200, 0, 0x00010000)
+    aimd_trak = mp4_box(b"trak", mp4_box(b"edts", mp4_box(b"elst", aimd_elst)) + mdia)
 
     video_mdhd = bytearray(24)
     struct.pack_into(">I", video_mdhd, 12, 1000)
@@ -140,7 +148,9 @@ def make_aimd(itow_ms: int = 573_634_560, driver_id: float = 3.0, lap_number: fl
         mp4_box(b"mdhd", video_mdhd) + mp4_box(b"hdlr", video_hdlr) + video_minf,
     )
     video_trak = mp4_box(b"trak", video_mdia)
-    moov = mp4_box(b"moov", video_trak + aimd_trak)
+    mvhd = bytearray(24)
+    struct.pack_into(">I", mvhd, 12, movie_timescale)
+    moov = mp4_box(b"moov", mp4_box(b"mvhd", mvhd) + video_trak + aimd_trak)
     return ftyp + mdat + moov
 
 

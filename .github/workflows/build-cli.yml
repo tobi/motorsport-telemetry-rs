@@ -1,0 +1,49 @@
+name: Build CLI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            executable: target/release/motorsport-telemetry
+          - name: Windows x86_64
+            os: windows-latest
+            executable: target/release/motorsport-telemetry.exe
+          - name: macOS arm64
+            os: macos-14
+            executable: target/release/motorsport-telemetry
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.os }}
+
+      - name: Build release CLI
+        run: cargo build --release --locked -p motorsport-telemetry --bin motorsport-telemetry
+
+      - name: Smoke test CLI
+        run: ${{ matrix.executable }} --version
+        shell: bash
+
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: motorsport-telemetry-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ matrix.executable }}
+          if-no-files-found: error

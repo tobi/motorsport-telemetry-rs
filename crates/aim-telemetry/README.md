@@ -27,11 +27,13 @@ including internal driver IDs, lap information, GPS session clock, schema hash,
 and video-frame count. `read_metadata_from_bytes` provides the same summary for
 owned input.
 
-`GPS0` expands into 15 derived channels: `GPS Latitude`, `GPS Longitude`,
+`GPS0` expands into 16 derived channels: `GPS Latitude`, `GPS Longitude`,
 `GPS Altitude`, `GPS Speed`, `GPS Heading`, `GPS Satellites`,
 `GPS Position Accuracy`, `GPS Speed Accuracy`, `GPS ECEF Velocity X`,
 `GPS ECEF Velocity Y`, `GPS ECEF Velocity Z`, `GPS iTOW`, `GPS Week`,
-`GPS DOP`, and `GPS Fix Flags`.
+`GPS DOP`, `GPS Fix Type`, and `GPS Fix Flags`. ECEF-derived values are only
+reported for a u-blox position-bearing fix. MP4 edit lists provide the offset from
+file-relative telemetry timestamps to the video's presentation timeline.
 
 The reader does not decode video or audio, does not reconstruct `LapPk` without
 a payload, and leaves scalar units unknown when the `CHS` record does not

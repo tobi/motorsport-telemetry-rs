@@ -80,6 +80,8 @@ pub struct VideoReference {
     pub file_index: Option<u32>,
     /// Source-exact video synchronization time.
     pub sync_time: Option<f64>,
+    /// Presentation timestamp on the linked video's movie timeline.
+    pub presentation_time_ns: Option<u64>,
     /// Presentation-order video frame index, when available.
     pub frame_index: Option<u64>,
 }
@@ -123,6 +125,8 @@ pub struct FileMetadata {
     pub fastest_lap: Option<LapMetadata>,
     /// Linked or embedded video frame count, when available.
     pub video_frame_count: Option<u64>,
+    /// Offset satisfying `video_presentation_ns = file_relative_ns + offset`.
+    pub video_presentation_offset_ns: Option<i128>,
 }
 
 /// Metadata merged across files that belong to one recording session.
@@ -588,6 +592,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         laps,
         fastest_lap,
         video_frame_count: source.video_frame_count(),
+        video_presentation_offset_ns: source.video_presentation_offset_ns(),
     }
 }
 
