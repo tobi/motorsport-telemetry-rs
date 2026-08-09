@@ -8,6 +8,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "driver={} vehicle={} venue={}",
         file.driver, file.vehicle, file.venue
     );
+    if let Some(ldx) = &file.ldx {
+        println!(
+            "ldx_markers={} total_laps={} fastest_lap={}",
+            ldx.marker_times_ns.len(),
+            ldx.total_laps
+                .map_or_else(|| "unknown".into(), |value| value.to_string()),
+            ldx.fastest_lap
+                .map_or_else(|| "unknown".into(), |value| value.to_string())
+        );
+    }
     for channel in file
         .channels()
         .iter()

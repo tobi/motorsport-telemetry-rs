@@ -1,5 +1,7 @@
 use aim_telemetry::AimFile;
 use cosworth_telemetry::CosworthFile;
+use motec_telemetry::MotecFile;
+use motorsport_telemetry_core::TelemetrySource;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -97,4 +99,37 @@ fn main() {
     println!("METRIC pds_allocated_bytes={pds_bytes}");
     println!("METRIC mp4_allocations={mp4_allocations}");
     println!("METRIC mp4_allocated_bytes={mp4_bytes}");
+
+    if let Some(path) = std::env::args_os().nth(1) {
+        let path = PathBuf::from(path);
+        let mut open_times = Vec::with_capacity(BATCHES);
+        for _ in 0..BATCHES {
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(MotecFile::open(&path).unwrap());
+            }
+            open_times.push(start.elapsed().as_nanos() as u64 / ITERATIONS);
+        }
+
+        let file = MotecFile::open(&path).unwrap();
+        let sample_count = file
+            .channels()
+            .iter()
+            .map(|channel| channel.sample_count)
+            .sum::<u64>();
+        let start = Instant::now();
+        let mut checksum = 0.0;
+        for (channel_index, channel) in file.channels().iter().enumerate() {
+            for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
+                for local_index in 0..chunk.sample_count {
+                    checksum += file.decode(channel_index, chunk_index, local_index);
+                }
+            }
+        }
+        black_box(checksum);
+        let decode_ns = start.elapsed().as_nanos() as u64;
+        println!("METRIC motec_load_ns={}", median(open_times));
+        println!("METRIC motec_sample_count={sample_count}");
+        println!("METRIC motec_decode_all_ns={decode_ns}");
+    }
 }

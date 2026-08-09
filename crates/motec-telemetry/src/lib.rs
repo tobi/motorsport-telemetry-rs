@@ -3,7 +3,9 @@
 
 #[cfg(not(target_os = "emscripten"))]
 use memmap2::Mmap;
-use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
+use motorsport_telemetry_core::{
+    Channel, Chunk, SampleType, SourceLapMetadata, TelemetrySource, UnitSource,
+};
 #[cfg(not(target_os = "emscripten"))]
 use std::fs::File;
 #[cfg(not(target_os = "emscripten"))]
@@ -17,7 +19,9 @@ const MAX_CHANNELS: usize = 4096;
 
 pub mod ldx;
 pub mod write;
-pub use ldx::{infer_lap_markers, write_motec_ldx_bytes, LapMarkers};
+pub use ldx::{
+    infer_lap_markers, parse_motec_ldx_bytes, write_motec_ldx_bytes, LapMarkers, LdxMetadata,
+};
 pub use write::{
     motec_sidecar_path, write_motec, write_motec_bytes, write_motec_sidecar, MotecMetadata,
     MotecWriteError,
@@ -37,6 +41,16 @@ pub fn read_metadata_from_bytes(
     data: Vec<u8>,
 ) -> Result<motorsport_telemetry_core::FileMetadata, MotecError> {
     MotecFile::from_bytes(path, data)
+        .map(|file| motorsport_telemetry_core::read_source_metadata(&file))
+}
+
+/// Derives format-neutral metadata from owned LD bytes and an LDX sidecar.
+pub fn read_metadata_from_bytes_with_ldx(
+    path: impl Into<String>,
+    data: Vec<u8>,
+    ldx_data: &[u8],
+) -> Result<motorsport_telemetry_core::FileMetadata, MotecError> {
+    MotecFile::from_bytes_with_ldx(path, data, ldx_data)
         .map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
@@ -65,10 +79,8 @@ pub enum MotecError {
 struct Encoding {
     datatype_a: u16,
     width: usize,
-    shift: i16,
-    mul: i16,
-    scale: i16,
-    decimal_places: i16,
+    factor: f64,
+    offset: f64,
 }
 
 #[derive(Debug)]
@@ -111,6 +123,8 @@ pub struct MotecFile {
     pub comment: String,
     /// Source-exact telemetry channel metadata.
     pub channels: Vec<Channel>,
+    /// Parsed companion LDX metadata, when a valid sidecar was available.
+    pub ldx: Option<Box<LdxMetadata>>,
     encodings: Vec<Encoding>,
     data: Storage,
 }
@@ -192,12 +206,32 @@ impl MotecFile {
             path: display.clone(),
             source,
         })?;
-        Self::parse(display, Storage::Mapped(data))
+        let mut parsed = Self::parse(display, Storage::Mapped(data))?;
+        let sidecar = motec_sidecar_path(path);
+        if let Ok(bytes) = std::fs::read(&sidecar) {
+            parsed.ldx = parse_motec_ldx_bytes(sidecar.to_string_lossy(), &bytes)
+                .ok()
+                .map(Box::new);
+        }
+        Ok(parsed)
     }
 
     /// Parses MoTeC telemetry from an owned LD byte buffer.
     pub fn from_bytes(path: impl Into<String>, data: Vec<u8>) -> Result<Self, MotecError> {
         Self::parse(path.into(), Storage::Owned(data.into_boxed_slice()))
+    }
+
+    /// Parses an LD byte buffer together with its companion LDX sidecar.
+    pub fn from_bytes_with_ldx(
+        path: impl Into<String>,
+        data: Vec<u8>,
+        ldx_data: &[u8],
+    ) -> Result<Self, MotecError> {
+        let path = path.into();
+        let ldx = parse_motec_ldx_bytes(format!("{path}x"), ldx_data)?;
+        let mut parsed = Self::parse(path, Storage::Owned(data.into_boxed_slice()))?;
+        parsed.ldx = Some(Box::new(ldx));
+        Ok(parsed)
     }
 
     fn parse(display: String, data: Storage) -> Result<Self, MotecError> {
@@ -225,13 +259,17 @@ impl MotecFile {
             let datatype_a = u16le(&data, address + 0x12).unwrap_or(0);
             let width = u16le(&data, address + 0x14).unwrap_or(0) as usize;
             let frequency = u16le(&data, address + 0x16).unwrap_or(0) as u64;
+            let shift = i16le(&data, address + 0x18).unwrap_or(0);
+            let mul = i16le(&data, address + 0x1a).unwrap_or(0);
+            let scale = i16le(&data, address + 0x1c).unwrap_or(0);
+            let decimal_places = i16le(&data, address + 0x1e).unwrap_or(0);
+            let multiplier = if mul == 0 { 1.0 } else { f64::from(mul) };
+            let divisor = if scale == 0 { 1.0 } else { f64::from(scale) };
             let encoding = Encoding {
                 datatype_a,
                 width,
-                shift: i16le(&data, address + 0x18).unwrap_or(0),
-                mul: i16le(&data, address + 0x1a).unwrap_or(0),
-                scale: i16le(&data, address + 0x1c).unwrap_or(0),
-                decimal_places: i16le(&data, address + 0x1e).unwrap_or(0),
+                factor: multiplier / divisor * 10f64.powi(-i32::from(decimal_places)),
+                offset: f64::from(shift) * multiplier,
             };
             let name = text(&data, address + 0x20, 32);
             // Per the LD layout the 124-byte channel block holds name at 0x20
@@ -311,6 +349,7 @@ impl MotecFile {
             session,
             comment,
             channels,
+            ldx: None,
             encodings,
             data,
         })
@@ -360,6 +399,20 @@ impl TelemetrySource for MotecFile {
         }
     }
 
+    fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
+        let duration_ns = self
+            .channels
+            .iter()
+            .map(|channel| channel.duration_ns)
+            .max()
+            .unwrap_or(0);
+        self.ldx
+            .as_deref()
+            .filter(|ldx| ldx.has_lap_data())
+            .map(|ldx| ldx.to_source_lap_metadata(duration_ns))
+            .filter(|metadata| !metadata.laps.is_empty())
+    }
+
     fn decode(&self, channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
         let channel = &self.channels[channel_index];
         let encoding = &self.encodings[channel_index];
@@ -381,18 +434,7 @@ impl TelemetrySource for MotecFile {
             4 => i32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64,
             _ => return 0.0,
         };
-        let scale = if encoding.scale == 0 {
-            1.0
-        } else {
-            encoding.scale as f64
-        };
-        let multiplier = if encoding.mul == 0 {
-            1.0
-        } else {
-            encoding.mul as f64
-        };
-        (raw / scale * 10f64.powi(-(encoding.decimal_places as i32)) + encoding.shift as f64)
-            * multiplier
+        raw.mul_add(encoding.factor, encoding.offset)
     }
 }
 
@@ -474,5 +516,43 @@ mod tests {
             MotecFile::open(file.path()),
             Err(MotecError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn byte_parser_accepts_an_ldx_sidecar() {
+        let fixture = fixture();
+        let ldx = br#"<LDXFile><Layers><Layer><MarkerBlock><MarkerGroup>
+            <Marker ClassName="BCN" Time="7.5e+05"/>
+            </MarkerGroup></MarkerBlock></Layer><Details>
+            <String Id="Total Laps" Value="2"/>
+            <String Id="Fastest Time" Value="0:00.250"/>
+            <String Id="Fastest Lap" Value="1"/>
+            </Details></Layers></LDXFile>"#;
+        let file = MotecFile::from_bytes_with_ldx(
+            "fixture.ld",
+            std::fs::read(fixture.path()).unwrap(),
+            ldx,
+        )
+        .unwrap();
+        let metadata = file.metadata();
+        assert_eq!(metadata.laps.len(), 2);
+        assert_eq!(metadata.laps[0].start_ns, 500_000_000);
+        assert_eq!(metadata.fastest_lap, Some(metadata.laps[0].clone()));
+    }
+
+    #[test]
+    fn file_parser_discovers_the_companion_ldx() {
+        let fixture = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let ld_path = directory.path().join("run.ld");
+        std::fs::copy(fixture.path(), &ld_path).unwrap();
+        std::fs::write(
+            directory.path().join("run.ldx"),
+            br#"<LDXFile><Marker ClassName="BCN" Time="5e+05"/></LDXFile>"#,
+        )
+        .unwrap();
+
+        let file = MotecFile::open(&ld_path).unwrap();
+        assert_eq!(file.ldx.unwrap().marker_times_ns, [500_000_000]);
     }
 }

@@ -19,6 +19,15 @@ pub struct LapMetadata {
     pub complete: bool,
 }
 
+/// Authoritative lap information supplied directly by a source format.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SourceLapMetadata {
+    /// Known lap intervals in file-relative time.
+    pub laps: Vec<LapMetadata>,
+    /// Fastest lap explicitly reported by the source, when available.
+    pub fastest_lap: Option<LapMetadata>,
+}
+
 /// A contiguous interval attributed to one internal driver identifier.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DriverStint {
@@ -137,16 +146,20 @@ pub struct SessionMetadata {
     pub fastest_lap: Option<LapMetadata>,
 }
 
-fn normalized(name: &str) -> String {
-    name.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
+fn normalized_eq(value: &str, wanted: &str) -> bool {
+    value
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .eq(wanted.bytes())
 }
 
 fn channel_index(source: &dyn TelemetrySource, names: &[&str]) -> Option<usize> {
     source.channels().iter().position(|channel| {
-        channel.sample_count > 0 && names.contains(&normalized(&channel.name).as_str())
+        channel.sample_count > 0
+            && names
+                .iter()
+                .any(|wanted| normalized_eq(&channel.name, wanted))
     })
 }
 
@@ -185,14 +198,105 @@ fn integer_runs(values: &[(u64, f64)], duration_ns: u64) -> Vec<(i64, u64, u64)>
     runs
 }
 
+fn is_completed_lap_counter(channel: &crate::Channel) -> bool {
+    ["beaconeventcount", "beaconcount", "lapbeaconcount"]
+        .iter()
+        .any(|wanted| normalized_eq(&channel.name, wanted))
+}
+
+fn counter_lap_number_at(
+    source: &dyn TelemetrySource,
+    channel_index: usize,
+    time_ns: u64,
+    previous: bool,
+) -> Option<i64> {
+    let value = source.sample_at(channel_index, time_ns, false)?;
+    if !value.is_finite() {
+        return None;
+    }
+    let value = value.round() as i64;
+    let completed_count = is_completed_lap_counter(&source.channels()[channel_index]);
+    Some(match (completed_count, previous) {
+        (true, false) => value.saturating_add(1),
+        (true, true) | (false, false) => value,
+        (false, true) => value.saturating_sub(1),
+    })
+}
+
+fn increasing_counter_laps(
+    source: &dyn TelemetrySource,
+    channel_index: usize,
+    duration_ns: u64,
+) -> (Vec<LapMetadata>, usize) {
+    let channel = &source.channels()[channel_index];
+    let completed_count = is_completed_lap_counter(channel);
+    let number_offset = i64::from(completed_count);
+    let mut laps = Vec::new();
+    let mut current: Option<(i64, u64, bool)> = None;
+    let mut high_water: Option<i64> = None;
+    let mut crossings = 0;
+
+    for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
+        for local_index in 0..chunk.sample_count {
+            let value = source.decode(channel_index, chunk_index, local_index);
+            if !value.is_finite() {
+                continue;
+            }
+            let counter = value.round() as i64;
+            if counter < 0 {
+                continue;
+            }
+            let time_ns = source.sample_time_ns(channel_index, chunk_index, local_index);
+            let Some(before) = high_water else {
+                high_water = Some(counter);
+                current = Some((counter.saturating_add(number_offset), time_ns, false));
+                continue;
+            };
+            if counter <= before {
+                // Shutdown resets and transient backwards values are not lap
+                // crossings. Keep the high-water mark so a later 0 -> 1 does
+                // not create a second, overlapping lap sequence.
+                continue;
+            }
+            if let Some((number, start_ns, start_known)) =
+                current.replace((counter.saturating_add(number_offset), time_ns, true))
+            {
+                if number > 0 && time_ns > start_ns {
+                    laps.push(LapMetadata {
+                        number,
+                        start_ns,
+                        end_ns: time_ns,
+                        duration_ns: time_ns - start_ns,
+                        complete: start_known,
+                    });
+                }
+            }
+            high_water = Some(counter);
+            crossings += 1;
+        }
+    }
+    if let Some((number, start_ns, _)) = current {
+        if number > 0 && duration_ns > start_ns {
+            laps.push(LapMetadata {
+                number,
+                start_ns,
+                end_ns: duration_ns,
+                duration_ns: duration_ns - start_ns,
+                complete: false,
+            });
+        }
+    }
+    (laps, crossings)
+}
+
 fn schema_hash(source: &dyn TelemetrySource) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for channel in source.channels() {
-        for byte in channel.name.to_ascii_lowercase().bytes() {
+        for byte in channel.name.bytes().map(|byte| byte.to_ascii_lowercase()) {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
-        for byte in channel.unit.to_ascii_lowercase().bytes() {
+        for byte in channel.unit.bytes().map(|byte| byte.to_ascii_lowercase()) {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
@@ -282,49 +386,83 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         })
         .collect::<Vec<_>>();
 
-    let lap_channel_index = channel_index(
-        source,
-        &[
-            "lapnumber",
-            "lapnum",
-            "lapcount",
-            "lapcounter",
-            "currentlap",
-            "lap",
-        ],
-    );
-    let lap_runs = lap_channel_index
-        .map(|index| integer_runs(&samples(source, index), duration_ns))
+    let source_laps = source.source_lap_metadata();
+    let lap_channel_index = source_laps
+        .is_none()
+        .then(|| {
+            channel_index(
+                source,
+                &[
+                    "lapnumber",
+                    "lapnum",
+                    "lapcount",
+                    "lapcounter",
+                    "currentlap",
+                    "lap",
+                    "beaconeventcount",
+                    "beaconcount",
+                    "lapbeaconcount",
+                ],
+            )
+        })
+        .flatten();
+    let (counter_laps, counter_crossings) = source_laps
+        .is_none()
+        .then(|| {
+            lap_channel_index
+                .map(|index| increasing_counter_laps(source, index, duration_ns))
+                .unwrap_or_default()
+        })
         .unwrap_or_default();
-    let timer_resets = channel_index(
-        source,
-        &[
-            "currentlaptime",
-            "lapcurrentlaptime",
-            "laptime",
-            "laptimerunning",
-        ],
-    )
-    .map(|index| {
-        let values = samples(source, index);
-        let max_value = values
-            .iter()
-            .map(|(_, value)| *value)
-            .filter(|value| value.is_finite())
-            .fold(0.0_f64, f64::max);
-        let reset_threshold = if max_value > 1_000.0 { 5_000.0 } else { 5.0 };
-        values
-            .windows(2)
-            .filter_map(|pair| {
-                let before = pair[0].1;
-                let after = pair[1].1;
-                (before.is_finite() && after.is_finite() && before - after > reset_threshold)
-                    .then_some(pair[1].0)
+    let timer_resets = source_laps
+        .is_none()
+        .then(|| {
+            channel_index(
+                source,
+                &[
+                    "currentlaptime",
+                    "lapcurrentlaptime",
+                    "laptime",
+                    "laptimerunning",
+                    "lapprogression",
+                    "lapprogress",
+                    "lapprogresspct",
+                ],
+            )
+            .map(|index| {
+                let values = samples(source, index);
+                let is_progress = ["lapprogression", "lapprogress", "lapprogresspct"]
+                    .iter()
+                    .any(|wanted| normalized_eq(&source.channels()[index].name, wanted));
+                let max_value = values
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .filter(|value| value.is_finite())
+                    .fold(0.0_f64, f64::max);
+                let reset_threshold = if max_value > 1_000.0 { 5_000.0 } else { 5.0 };
+                values
+                    .windows(2)
+                    .filter_map(|pair| {
+                        let before = pair[0].1;
+                        let after = pair[1].1;
+                        let reset = if is_progress {
+                            let full_lap = if max_value > 2.0 { 100.0 } else { 1.0 };
+                            before >= full_lap * 0.75 && after <= full_lap * 0.25
+                        } else {
+                            before - after > reset_threshold
+                        };
+                        (before.is_finite() && after.is_finite() && reset).then_some(pair[1].0)
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
-    })
-    .unwrap_or_default();
-    let laps = if timer_resets.len() >= 2 {
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let laps = if let Some(source_laps) = &source_laps {
+        source_laps.laps.clone()
+    } else if counter_crossings > 0 {
+        counter_laps
+    } else if !timer_resets.is_empty() {
         let mut boundaries = Vec::with_capacity(timer_resets.len() + 2);
         boundaries.push(0);
         boundaries.extend(timer_resets);
@@ -335,9 +473,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
             .enumerate()
             .filter_map(|(index, pair)| {
                 let number = lap_channel_index
-                    .and_then(|channel| source.sample_at(channel, pair[0], false))
-                    .filter(|value| value.is_finite())
-                    .map(|value| value.round() as i64)
+                    .and_then(|channel| counter_lap_number_at(source, channel, pair[0], false))
                     .unwrap_or(index as i64 + 1);
                 (number > 0).then_some(LapMetadata {
                     number,
@@ -349,52 +485,50 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
             })
             .collect::<Vec<_>>()
     } else {
-        let lap_run_count = lap_runs.len();
-        lap_runs
-            .into_iter()
-            .enumerate()
-            .filter(|(_, (number, _, _))| *number > 0)
-            .map(|(index, (number, start_ns, end_ns))| LapMetadata {
-                number,
-                start_ns,
-                end_ns,
-                duration_ns: end_ns.saturating_sub(start_ns),
-                complete: index > 0 && index + 1 < lap_run_count,
-            })
-            .collect::<Vec<_>>()
+        counter_laps
     };
-    let reference_lap_ns =
-        channel_index(source, &["reflaptime", "referencelaptime"]).and_then(|index| {
-            let values = samples(source, index);
-            let max_value = values
-                .iter()
-                .map(|(_, value)| *value)
-                .filter(|value| value.is_finite())
-                .fold(0.0_f64, f64::max);
-            let scale = if max_value > 1_000.0 {
-                1_000_000.0
-            } else {
-                1_000_000_000.0
-            };
-            values
-                .into_iter()
-                .map(|(_, value)| value)
-                .find(|value| value.is_finite() && *value > 0.0)
-                .map(|value| (value * scale).round() as u64)
-        });
+    let reference_lap_ns = source_laps
+        .is_none()
+        .then(|| {
+            channel_index(source, &["reflaptime", "referencelaptime"]).and_then(|index| {
+                let values = samples(source, index);
+                let max_value = values
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .filter(|value| value.is_finite())
+                    .fold(0.0_f64, f64::max);
+                let scale = if max_value > 1_000.0 {
+                    1_000_000.0
+                } else {
+                    1_000_000_000.0
+                };
+                values
+                    .into_iter()
+                    .map(|(_, value)| value)
+                    .find(|value| value.is_finite() && *value > 0.0)
+                    .map(|value| (value * scale).round() as u64)
+            })
+        })
+        .flatten();
     let plausible_lap = |duration_ns: u64| {
         duration_ns >= 10_000_000_000
             && reference_lap_ns.is_none_or(|reference| {
                 duration_ns >= reference / 2 && duration_ns <= reference.saturating_mul(3) / 2
             })
     };
-    let mut fastest_lap = laps
-        .iter()
-        .filter(|lap| lap.complete && plausible_lap(lap.duration_ns))
-        .min_by_key(|lap| lap.duration_ns)
-        .cloned();
-    if let Some(previous_lap_index) =
-        channel_index(source, &["previouslt", "previouslaptime", "lastlaptime"])
+    let mut fastest_lap = source_laps
+        .as_ref()
+        .and_then(|source| source.fastest_lap.clone())
+        .or_else(|| {
+            laps.iter()
+                .filter(|lap| lap.complete && plausible_lap(lap.duration_ns))
+                .min_by_key(|lap| lap.duration_ns)
+                .cloned()
+        });
+    if let Some(previous_lap_index) = source_laps
+        .is_none()
+        .then(|| channel_index(source, &["previouslt", "previouslaptime", "lastlaptime"]))
+        .flatten()
     {
         let values = samples(source, previous_lap_index);
         let max_value = values
@@ -415,9 +549,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
             .min_by_key(|(_, duration_ns)| *duration_ns);
         if let Some((time_ns, duration_ns)) = reported {
             let number = lap_channel_index
-                .and_then(|channel| source.sample_at(channel, time_ns, false))
-                .filter(|value| value.is_finite())
-                .map(|value| value.round() as i64 - 1)
+                .and_then(|channel| counter_lap_number_at(source, channel, time_ns, true))
                 .unwrap_or(0);
             fastest_lap = Some(LapMetadata {
                 number,
@@ -714,6 +846,124 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("test-session:"));
+    }
+
+    #[test]
+    fn lap_progression_wraps_produce_lap_boundaries() {
+        let mut source = metadata_source("progress", 1_000_000_000_000, 3);
+        source.channels = vec![Channel {
+            id: 0,
+            name: "Lap Progression".into(),
+            unit: "%".into(),
+            unit_source: UnitSource::Declared,
+            sample_type: SampleType::F64,
+            chunks: vec![Chunk {
+                sample_period_ns: 1_000_000_000,
+                sample_count: 7,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: 0,
+            }],
+            sample_count: 7,
+            duration_ns: 7_000_000_000,
+        }];
+        source.values = vec![vec![80.0, 99.0, 2.0, 50.0, 98.0, 1.0, 30.0]];
+
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.laps.len(), 3);
+        assert_eq!(metadata.laps[1].start_ns, 2_000_000_000);
+        assert_eq!(metadata.laps[1].end_ns, 5_000_000_000);
+        assert!(metadata.laps[1].complete);
+    }
+
+    fn counter_source(name: &str, values: Vec<f64>) -> MetadataSource {
+        let count = values.len() as u64;
+        MetadataSource {
+            path: "counter".into(),
+            channels: vec![Channel {
+                id: 0,
+                name: name.into(),
+                unit: String::new(),
+                unit_source: UnitSource::Unknown,
+                sample_type: SampleType::F64,
+                chunks: vec![Chunk {
+                    sample_period_ns: 10_000_000_000,
+                    sample_count: count,
+                    data_ptr: 0,
+                    sample_base: 0,
+                    time_base_ns: 0,
+                }],
+                sample_count: count,
+                duration_ns: count * 10_000_000_000,
+            }],
+            values: vec![values],
+            absolute_start_ns: 1_000_000_000_000,
+        }
+    }
+
+    #[test]
+    fn upward_lap_counter_is_preferred_and_shutdown_reset_is_ignored() {
+        let source = counter_source("Lap Number", vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 0.0, 1.0]);
+        let metadata = read_source_metadata(&source);
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(|lap| (lap.number, lap.start_ns, lap.end_ns, lap.complete))
+                .collect::<Vec<_>>(),
+            [
+                (1, 0, 20_000_000_000, false),
+                (2, 20_000_000_000, 40_000_000_000, true),
+                (3, 40_000_000_000, 80_000_000_000, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_beacon_counter_offsets_the_active_lap_number() {
+        let source = counter_source(
+            "Beacon Event Count",
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0],
+        );
+        let metadata = read_source_metadata(&source);
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(|lap| (lap.number, lap.complete))
+                .collect::<Vec<_>>(),
+            [(1, false), (2, true), (3, true), (4, false)]
+        );
+    }
+
+    #[test]
+    fn constant_counter_falls_through_to_other_lap_signals() {
+        let mut source = counter_source("Lap Number", vec![1.0; 7]);
+        let count = source.channels[0].sample_count;
+        source.channels.push(Channel {
+            id: 1,
+            name: "Lap Progression".into(),
+            unit: "%".into(),
+            unit_source: UnitSource::Declared,
+            sample_type: SampleType::F64,
+            chunks: vec![Chunk {
+                sample_period_ns: 10_000_000_000,
+                sample_count: count,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: 0,
+            }],
+            sample_count: count,
+            duration_ns: count * 10_000_000_000,
+        });
+        source
+            .values
+            .push(vec![80.0, 99.0, 2.0, 50.0, 98.0, 1.0, 30.0]);
+
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.laps.len(), 3);
+        assert_eq!(metadata.laps[1].start_ns, 20_000_000_000);
+        assert_eq!(metadata.laps[1].end_ns, 50_000_000_000);
     }
 
     #[test]

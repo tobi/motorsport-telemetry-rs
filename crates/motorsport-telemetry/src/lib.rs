@@ -118,6 +118,10 @@ impl TelemetrySource for TelemetryFile {
         delegate!(self, source => source.identity())
     }
 
+    fn source_lap_metadata(&self) -> Option<motorsport_telemetry_core::SourceLapMetadata> {
+        delegate!(self, source => source.source_lap_metadata())
+    }
+
     fn video_frame_count(&self) -> Option<u64> {
         delegate!(self, source => source.video_frame_count())
     }
@@ -552,6 +556,9 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
                 "lapdistance",
                 "lapdist",
                 "lapdistpct",
+                "lapprogression",
+                "lapprogress",
+                "lapprogresspct",
                 "linelapdistancel",
                 "distance",
             ],
@@ -579,7 +586,7 @@ fn find(channels: &[Channel], names: &[&str]) -> Option<usize> {
     names.iter().find_map(|wanted| {
         channels
             .iter()
-            .position(|channel| channel.sample_count > 0 && normalized(&channel.name) == *wanted)
+            .position(|channel| channel.sample_count > 0 && normalized_eq(&channel.name, wanted))
     })
 }
 
@@ -590,11 +597,12 @@ fn semantic_value(file: &TelemetryFile, time_ns: u64, names: &[&str]) -> Option<
         .map(|value| value.round() as i64)
 }
 
-fn normalized(name: &str) -> String {
-    name.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
+fn normalized_eq(value: &str, wanted: &str) -> bool {
+    value
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .eq(wanted.bytes())
 }
 
 fn normalize_speed(value: f64, unit: &str) -> Option<f64> {

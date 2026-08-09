@@ -9,7 +9,7 @@ pub mod units;
 
 pub use metadata::{
     driver_histogram, group_sessions, read_source_metadata, AbsoluteTimeRange, DriverStint,
-    FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, VideoReference,
+    FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, SourceLapMetadata, VideoReference,
 };
 pub use units::{
     can_convert, convert, lookup as lookup_unit, normalize as normalize_unit, ConvertError,
@@ -178,17 +178,13 @@ impl Channel {
         if !self.sample_type.is_float() {
             return true;
         }
-        let name = self
-            .name
-            .to_ascii_lowercase()
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect::<String>();
         [
             "gear",
             "lapnumber",
             "lapbeacon",
             "laptrigger",
+            "beaconeventcount",
+            "beaconcount",
             "switch",
             "status",
             "state",
@@ -198,8 +194,28 @@ impl Channel {
             "solutiontype",
         ]
         .iter()
-        .any(|token| name.contains(token))
+        .any(|token| normalized_contains(&self.name, token))
     }
+}
+
+fn normalized_contains(value: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    value
+        .char_indices()
+        .filter(|(_, character)| character.is_ascii_alphanumeric())
+        .any(|(start, _)| {
+            let mut matched = 0;
+            for byte in value[start..].bytes().filter(u8::is_ascii_alphanumeric) {
+                if byte.to_ascii_lowercase() != needle[matched] {
+                    return false;
+                }
+                matched += 1;
+                if matched == needle.len() {
+                    return true;
+                }
+            }
+            false
+        })
 }
 
 /// Shared random-access interface implemented by every format reader.
@@ -226,6 +242,15 @@ pub trait TelemetrySource: Send + Sync {
     /// Returns identity fields embedded in the source.
     fn identity(&self) -> SourceIdentity {
         SourceIdentity::default()
+    }
+
+    /// Returns authoritative source-provided lap intervals, when available.
+    ///
+    /// Format readers can use this hook for sidecars or native lap packets.
+    /// The generic metadata derivation falls back to conventional channels
+    /// only when the source returns `None`.
+    fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
+        None
     }
 
     /// Returns the number of frames in linked or embedded video, when known.

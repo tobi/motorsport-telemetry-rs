@@ -8,6 +8,8 @@
 *.ldx
 *.vbo
 *.mp4
+!/tests/fixtures/synthetic_motec_multilap.ld
+!/tests/fixtures/synthetic_motec_multilap.ldx
 
 /tests/fixtures/public/
 *.parquet

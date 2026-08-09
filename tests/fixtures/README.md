@@ -2,6 +2,19 @@
 
 Small deterministic files are committed for every supported format.
 
+`synthetic_motec_multilap.ld` and its `.ldx` companion exercise realistic
+multi-rate lap telemetry: 100 Hz lap progression, 2 Hz lap state, partial
+opening/closing laps, an invalidated lap, sidecar beacons, and a shutdown
+counter reset. The rates and channel roles were informed by aggregate local
+recording structure; all durations, samples, identities, and timing values are
+invented. No proprietary data is embedded in the fixtures.
+
+Regenerate all synthetic fixtures with:
+
+```sh
+python tests/fixtures/generate_fixtures.py tests/fixtures
+```
+
 `public-fixtures.json` contains only externally hosted fixtures whose format,
 license, provenance, immutable URL, and SHA-256 have been verified. Run:
 

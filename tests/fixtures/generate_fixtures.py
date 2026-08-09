@@ -203,40 +203,141 @@ def make_pds() -> bytes:
     return bytes(data)
 
 
-def make_motec() -> bytes:
-    channels = [
-        ("Speed", "m/s", SAMPLES["speed"]),
-        ("Throttle Pos", "%", SAMPLES["throttle"]),
-        ("Brake Pedal Pos", "%", SAMPLES["brake"]),
-        ("G_FORCE_LAT", "m/s^2", SAMPLES["g_lat"]),
-        ("G_FORCE_LONG", "m/s^2", SAMPLES["g_long"]),
-        ("Lap Distance", "m", SAMPLES["distance"]),
-        ("Lap Number", "count", SAMPLES["lap"]),
-        ("GPS Latitude", "deg", SAMPLES["latitude"]),
-        ("GPS Longitude", "deg", SAMPLES["longitude"]),
-    ]
+def make_motec_channels(
+    channels: list[tuple[str, str, int, tuple[float, ...] | list[float]]],
+) -> bytes:
     block_size = 124
     first_block = 0x200
     data_start = first_block + block_size * len(channels) + 0x40
-    data = bytearray(data_start + 4 * len(channels) * 4)
+    data = bytearray(data_start + sum(4 * len(values) for _, _, _, values in channels))
     struct.pack_into("<I", data, 0, 0x40)
     struct.pack_into("<I", data, 0x08, first_block)
-    for index, (name, unit, values) in enumerate(channels):
+    pointer = data_start
+    for index, (name, unit, frequency, values) in enumerate(channels):
         block = first_block + index * block_size
         next_block = block + block_size if index + 1 < len(channels) else 0
-        pointer = data_start + index * 4 * 4
         struct.pack_into("<I", data, block + 4, next_block)
         struct.pack_into("<I", data, block + 8, pointer)
-        struct.pack_into("<I", data, block + 0x0C, 4)
+        struct.pack_into("<I", data, block + 0x0C, len(values))
         struct.pack_into("<H", data, block + 0x12, 0x07)
         struct.pack_into("<H", data, block + 0x14, 4)
-        struct.pack_into("<H", data, block + 0x16, 2)
+        struct.pack_into("<H", data, block + 0x16, frequency)
         encoded_name = name.encode("ascii")
         encoded_unit = unit.encode("ascii")
         data[block + 0x20 : block + 0x20 + len(encoded_name)] = encoded_name
         data[block + 0x48 : block + 0x48 + len(encoded_unit)] = encoded_unit
-        struct.pack_into("<4f", data, pointer, *values)
+        struct.pack_into(f"<{len(values)}f", data, pointer, *values)
+        pointer += 4 * len(values)
     return bytes(data)
+
+
+def make_motec() -> bytes:
+    return make_motec_channels([
+        ("Speed", "m/s", 2, SAMPLES["speed"]),
+        ("Throttle Pos", "%", 2, SAMPLES["throttle"]),
+        ("Brake Pedal Pos", "%", 2, SAMPLES["brake"]),
+        ("G_FORCE_LAT", "m/s^2", 2, SAMPLES["g_lat"]),
+        ("G_FORCE_LONG", "m/s^2", 2, SAMPLES["g_long"]),
+        ("Lap Distance", "m", 2, SAMPLES["distance"]),
+        ("Lap Number", "count", 2, SAMPLES["lap"]),
+        ("GPS Latitude", "deg", 2, SAMPLES["latitude"]),
+        ("GPS Longitude", "deg", 2, SAMPLES["longitude"]),
+    ])
+
+
+# These rates and channel roles mirror aggregate structure seen in the local
+# reference corpus. Durations and every sample value below are invented.
+MULTILAP_DURATIONS_SECONDS = (
+    12.5, 13.0, 11.5, 14.0, 12.0, 15.0,
+    11.0, 13.5, 12.5, 14.0, 13.0, 9.0,
+)
+
+
+def multilap_segment(time_seconds: float) -> tuple[int, float]:
+    start = 0.0
+    for index, duration in enumerate(MULTILAP_DURATIONS_SECONDS):
+        end = start + duration
+        if time_seconds < end or index + 1 == len(MULTILAP_DURATIONS_SECONDS):
+            return index, start
+        start = end
+    raise AssertionError("unreachable")
+
+
+def make_motec_multilap() -> bytes:
+    high_rate = 100
+    low_rate = 2
+    total_seconds = sum(MULTILAP_DURATIONS_SECONDS)
+    high_times = [index / high_rate for index in range(round(total_seconds * high_rate))]
+    low_times = [index / low_rate for index in range(round(total_seconds * low_rate))]
+
+    speed = []
+    progression = []
+    for time_seconds in high_times:
+        segment, start = multilap_segment(time_seconds)
+        duration = MULTILAP_DURATIONS_SECONDS[segment]
+        progress = 100.0 * (time_seconds - start) / duration
+        progression.append(progress)
+        # A deterministic triangle wave keeps the high-rate payload nontrivial.
+        speed.append(42.0 + 0.18 * min(progress, 100.0 - progress))
+
+    lap_count = []
+    previous_lap_time = []
+    invalidated = []
+    for time_seconds in low_times:
+        segment, _ = multilap_segment(time_seconds)
+        active_lap = 4 + segment
+        # Model a logger shutdown reset followed by a low-count restart. The
+        # high-water fallback must not turn 0 -> 1 into a new lap crossing.
+        if time_seconds >= total_seconds - 1.0:
+            active_lap = 1
+        elif time_seconds >= total_seconds - 2.0:
+            active_lap = 0
+        lap_count.append(float(active_lap))
+        previous_lap_time.append(
+            0.0 if segment == 0 else MULTILAP_DURATIONS_SECONDS[segment - 1]
+        )
+        invalidated.append(float(segment == 4))
+
+    return make_motec_channels([
+        ("Speed", "m/s", high_rate, speed),
+        ("Lap Progression", "%", high_rate, progression),
+        ("Lap Count", "", low_rate, lap_count),
+        ("Lap Invalidated", "", low_rate, invalidated),
+        ("Lap Length", "m", low_rate, [5000.0] * len(low_times)),
+        ("Previous Lap Time", "s", low_rate, previous_lap_time),
+        ("Reference Lap Time", "s", low_rate, [12.5] * len(low_times)),
+    ])
+
+
+def make_motec_multilap_ldx() -> bytes:
+    marker_times = []
+    elapsed = 0.0
+    for duration in MULTILAP_DURATIONS_SECONDS[:-1]:
+        elapsed += duration
+        marker_times.append(elapsed)
+    markers = "\n".join(
+        f'     <Marker Version="100" ClassName="BCN" Name="Manual.{index}" '
+        f'Flags="77" Time="{seconds * 1_000_000:.17e}"/>'
+        for index, seconds in enumerate(marker_times, 1)
+    )
+    return f'''<?xml version="1.0"?>
+<LDXFile Locale="English_United States.1252" DefaultLocale="C" Version="1.6">
+ <Layers>
+  <Layer>
+   <MarkerBlock>
+    <MarkerGroup Name="Beacons" Index="3">
+{markers}
+    </MarkerGroup>
+   </MarkerBlock>
+  </Layer>
+  <Details>
+   <String Id="Total Laps" Value="12"/>
+   <String Id="Fastest Time" Value="0:11.000"/>
+   <String Id="Fastest Lap" Value="7"/>
+  </Details>
+ </Layers>
+</LDXFile>
+'''.encode("ascii")
 
 
 def make_vbo() -> bytes:
@@ -272,6 +373,8 @@ def main() -> None:
         "synthetic_aimd_part2.mp4": make_aimd(573_634_760, 3.0, 1.0),
         "synthetic_cosworth.pds": make_pds(),
         "synthetic_motec.ld": make_motec(),
+        "synthetic_motec_multilap.ld": make_motec_multilap(),
+        "synthetic_motec_multilap.ldx": make_motec_multilap_ldx(),
         "synthetic_vbo.vbo": make_vbo(),
     }
     for name, content in files.items():
