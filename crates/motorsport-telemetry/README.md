@@ -25,6 +25,12 @@ motorsport-telemetry recording.mp4
 motorsport-telemetry --json recording.mp4
 ```
 
+For application indexes and lap filmstrips, use `open_metadata(path)` or the
+smaller `read_lap_metadata(path)` convenience API. These return every derived
+lap interval without requiring callers to know whether a format supplies
+native lap packets, an LDX sidecar, counters, or timer resets. `open(path)`
+remains the full signal-analysis path.
+
 Unknown fields are printed as `unknown` (or JSON `null`) instead of being
 guessed. In particular, one file can expose a session key but cannot prove that
 other parts of the same session exist, and VBOX video links may provide only a

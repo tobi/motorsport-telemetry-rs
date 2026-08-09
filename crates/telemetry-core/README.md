@@ -28,6 +28,10 @@ summary: counts, schema hash, internal driver IDs/stints, lap fragments,
 fastest complete lap, absolute clock range/session candidate key, and video
 frame count when available.
 
+`TelemetrySource::source_lap_metadata()` is only an optional native/sidecar
+override. Consumers should read `FileMetadata::laps`, which also derives laps
+from conventional counters and timers when that hook is absent.
+
 `group_sessions(&files, max_gap_ns)` orders files by internal clocks and groups
 only adjacent compatible candidates. It merges driver and lap fragments across
 file boundaries while preserving real gaps. Filenames are never part of the

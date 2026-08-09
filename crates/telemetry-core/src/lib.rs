@@ -248,7 +248,9 @@ pub trait TelemetrySource: Send + Sync {
     ///
     /// Format readers can use this hook for sidecars or native lap packets.
     /// The generic metadata derivation falls back to conventional channels
-    /// only when the source returns `None`.
+    /// only when the source returns `None`. This hook is intentionally optional
+    /// and is not the cross-format lap-summary API; use the `laps` field from
+    /// [`FileMetadata`] for the complete format-neutral result.
     fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
         None
     }

@@ -41,6 +41,7 @@ The benchmark harness, workspace manifests/lockfile, and generic Rust parser/lib
 - Attempt 10 (discarded): cursor lookup for selected sample indexes regressed to 215.723 ms; reverted.
 - Attempt 11 (final verification): full workspace tests passed; repeat median was 222.206 ms and the retained best remains 213.785 ms. Results are retained at `/tmp/omatrack-folder-scan.A0yKcQ`.
 - Post-session user override: replace SHA-256 with BLAKE3 for the local cache fingerprint and bump the namespace. The same path, size, primary prefix, sidecar prefix, and missing marker remain covered.
+- Post-session lap-filmstrip requirement: metadata mode now walks all AiM telemetry packets only for recognized lap counters/timers, while unrelated previews remain bounded to 19 packets. On the changed live inventory (457 sources), the median is 1,022.910 ms; Rust summary parsing is the new 893.064 ms bottleneck. This is still 94.327% below the original 18,032.086 ms baseline and makes complete lap intervals available without a full multi-GB parse.
 
 ## Final Result
 
@@ -49,3 +50,4 @@ The benchmark harness, workspace manifests/lockfile, and generic Rust parser/lib
 - Post-session BLAKE3 override: 195.055 ms (98.918% below baseline), warm 122.484 ms.
 - BLAKE3 phases: fingerprint 110.011 ms, summary 71.550 ms, discovery 12.438 ms, folder metadata 0.193 ms, cache serialization 0.546 ms.
 - Remaining bottleneck: required 476,820,927-byte BLAKE3 fingerprint pass.
+- With complete AiM filmstrip laps enabled, lap-record scanning is the new dominant phase (893.064 ms of a 1,022.910 ms median on the current 457-source inventory).

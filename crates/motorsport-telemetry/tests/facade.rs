@@ -1,5 +1,6 @@
 use motorsport_telemetry::{
-    motorsport_telemetry_core::TelemetrySource, open, open_sessions, TelemetryNormalizer,
+    motorsport_telemetry_core::TelemetrySource, open, open_metadata, open_sessions,
+    read_lap_metadata, TelemetryNormalizer,
 };
 use std::path::PathBuf;
 
@@ -64,4 +65,22 @@ fn reusable_normalizer_uses_lap_metadata_fallback() {
 
     assert_eq!(normalizer.sample(1_000_000_000).lap_progress, Some(0.25));
     assert_eq!(normalizer.sample(2_000_000_000).lap_progress, Some(0.5));
+}
+
+#[test]
+fn metadata_open_and_lap_api_cover_every_format() {
+    for name in [
+        "synthetic_aimd.mp4",
+        "synthetic_cosworth.pds",
+        "synthetic_motec_multilap.ld",
+        "synthetic_vbo.vbo",
+    ] {
+        let path = fixture(name);
+        let file = open_metadata(&path).unwrap();
+        assert_eq!(
+            file.metadata().laps,
+            read_lap_metadata(&path).unwrap(),
+            "{name}"
+        );
+    }
 }

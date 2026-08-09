@@ -18,9 +18,12 @@ record layout, and compatibility policy.
 
 `GPS0` is decoded into geodetic position, speed, heading, accuracy, satellite, timing and status channels at its native 25 Hz. `LapPk` remains unexpanded: it is defined but has no payload in any of the five available recordings, while lap number and lap timing are carried by ordinary scalar channels. Scalar channels without a safely decoded unit remain unitless with `unit_source = unknown`.
 
-The standalone library exposes `AimFile::open(path)` for local native MP4s;
-it memory-maps the file. `AimFile::from_bytes(path, bytes)` is the equivalent
-owned-buffer constructor for callers that already have MP4 bytes.
+The standalone library exposes `AimFile::open(path)` for full analysis and
+`AimFile::open_index(path)` for fast metadata and filmstrip laps. Index mode
+walks every `aimd` packet only for lap counters/timers, while retaining at most
+19 representative packets for unrelated channel previews and GPS; it does not
+build the video-frame index. `from_bytes` and `from_bytes_index` are the owned
+buffer equivalents.
 
 `aim_telemetry::read_metadata(path)` returns a fast `FileMetadata` summary,
 including internal driver IDs, lap information, GPS session clock, schema hash,

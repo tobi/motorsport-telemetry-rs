@@ -1,8 +1,7 @@
-use aim_telemetry::AimFile;
 use blake3::Hasher;
 use memmap2::MmapOptions;
 use motorsport_telemetry::motorsport_telemetry_core::TelemetrySource;
-use motorsport_telemetry::{open, SignalRoles, TelemetryFile};
+use motorsport_telemetry::{open_metadata, SignalRoles};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -652,11 +651,7 @@ fn add_file_fingerprint(hash: &mut Hasher, path: &Path) -> io::Result<u64> {
 
 fn summarize(path: &Path) -> Result<CachedSummary, String> {
     let is_video = VIDEO_EXTENSIONS.contains(&extension(path).as_str());
-    let file = if is_video {
-        TelemetryFile::Aim(AimFile::open_index(path).map_err(|error| error.to_string())?)
-    } else {
-        open(path).map_err(|error| error.to_string())?
-    };
+    let file = open_metadata(path).map_err(|error| error.to_string())?;
     let metadata = file.metadata();
     let (source_channels, automatic_channel_mappings, gps) = if is_video {
         (

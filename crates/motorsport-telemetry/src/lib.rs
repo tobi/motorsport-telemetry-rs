@@ -75,6 +75,43 @@ pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
     }
 }
 
+/// Opens a telemetry file for fast metadata and lap-filmstrip construction.
+///
+/// The returned source preserves every signal needed to derive
+/// [`FileMetadata::laps`] while formats with expensive bulk data may retain
+/// only representative samples for unrelated channels. Use [`open`] when
+/// complete signal arrays or exact video-frame indexing are required.
+pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
+    let path = path.as_ref();
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" => Ok(TelemetryFile::Aim(AimFile::open_index(path)?)),
+        "pds" => Ok(TelemetryFile::Cosworth(CosworthFile::open(path)?)),
+        "ld" => Ok(TelemetryFile::Motec(MotecFile::open(path)?)),
+        "vbo" => Ok(TelemetryFile::Racelogic(RacelogicFile::open_metadata(
+            path,
+        )?)),
+        _ => Err(TelemetryError::Unsupported(path.display().to_string())),
+    }
+}
+
+/// Quickly returns all format-neutral lap intervals needed by a session or
+/// video filmstrip.
+///
+/// This is the stable public lap-summary API. Parsers may obtain the result
+/// from native lap packets, sidecars, counters, or timer resets; callers do not
+/// need to inspect the optional [`TelemetrySource::source_lap_metadata`] hook.
+pub fn read_lap_metadata(
+    path: impl AsRef<Path>,
+) -> Result<Vec<motorsport_telemetry_core::LapMetadata>, TelemetryError> {
+    Ok(open_metadata(path)?.metadata().laps)
+}
+
 macro_rules! delegate {
     ($self:expr, $source:ident => $body:expr) => {
         match $self {
