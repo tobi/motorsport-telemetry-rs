@@ -89,6 +89,7 @@ mod tests {
             comment: String::new(),
             clock: None,
             driver_stints: Vec::new(),
+            videos: Vec::new(),
         };
         let bytes = encode(&catalog).unwrap();
         let decoded = decode(&bytes).unwrap();

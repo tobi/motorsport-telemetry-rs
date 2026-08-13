@@ -97,6 +97,13 @@ heuristics in `read_source_metadata`:
 `.telemetry` stores the result in the header (`laps` plus the `valid_laps`
 scalar) so later `read_laps` / `read_valid_laps` do not scan samples.
 
+VBOX recordings that roll to a second video (`avifileindex` 1 then 2, files
+`stem_0001.mp4` / `stem_0002.mp4`) keep both files in the catalog. Mapping at a
+timestamp still uses the `avifileindex` / `avisynctime` channels; those stay
+ordinary lossless columns. `video_reference_at` reports the active file index
+and sync time. Video payloads stay in the MP4s; the catalog stores basename
+plus BLAKE3 when the files were present at convert time.
+
 Unknown or incompatible inputs remain `None`; the library never guesses a unit or fabricates a frame.
 
 ## Lap times, top speed, and brake pressure

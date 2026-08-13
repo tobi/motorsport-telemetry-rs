@@ -4,7 +4,7 @@ use crate::zip::ZipError;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use motorsport_telemetry_core::{
     lookup_unit, normalize_unit, AbsoluteTimeRange, Channel, Chunk, DriverStint, FileMetadata,
-    LapMetadata, SampleType, SourceIdentity, UnitSource,
+    LapMetadata, SampleType, SourceIdentity, UnitSource, VideoFileRef,
 };
 
 const V: fn(u16) -> flatbuffers::VOffsetT = |field| 4 + field * 2;
@@ -27,6 +27,7 @@ pub struct Catalog {
     pub comment: String,
     pub clock: Option<AbsoluteTimeRange>,
     pub driver_stints: Vec<DriverStint>,
+    pub videos: Vec<VideoFileRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +88,7 @@ impl Catalog {
             fastest_lap,
             video_frame_count: None,
             video_presentation_offset_ns: None,
+            videos: self.videos.clone(),
         }
     }
 }
@@ -115,6 +117,7 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
     let laps = builder.create_vector(&pack_laps(&catalog.laps));
     let channels = builder.create_vector(&pack_channels(&catalog.channels));
     let stints = builder.create_vector(&pack_stints(&catalog.driver_stints));
+    let videos = builder.create_vector(&pack_videos(&catalog.videos));
 
     let source_format = builder.create_string(&catalog.source_format);
     let source_path = builder.create_string(&catalog.source_path);
@@ -141,6 +144,7 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
     builder.push_slot_always::<WIPOffset<_>>(V(14), comment);
     builder.push_slot_always::<WIPOffset<_>>(V(15), session_hint);
     builder.push_slot_always::<WIPOffset<_>>(V(16), stints);
+    builder.push_slot_always::<WIPOffset<_>>(V(20), videos);
     if let (Some(clock), Some(name)) = (catalog.clock.as_ref(), clock_name) {
         builder.push_slot_always::<WIPOffset<_>>(V(17), name);
         builder.push_slot(V(18), clock.start_ns, 0);
@@ -206,6 +210,7 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         comment: table.string(14).unwrap_or_default(),
         clock,
         driver_stints,
+        videos: unpack_videos(&table.u8s(20)),
     })
 }
 
@@ -341,6 +346,66 @@ impl<'a> Table<'a> {
         let rel = u32::from_le_bytes(self.buf.get(at..at + 4)?.try_into().ok()?) as usize;
         Some(at + rel)
     }
+}
+
+fn pack_videos(videos: &[VideoFileRef]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(videos.len() as u32).to_le_bytes());
+    for video in videos {
+        pack_string(&mut out, &video.filename);
+        out.extend_from_slice(&video.index.to_le_bytes());
+        match video.blake3 {
+            Some(hash) => {
+                out.push(1);
+                out.extend_from_slice(&hash);
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&video.frame_count.to_le_bytes());
+    }
+    out
+}
+
+fn unpack_videos(bytes: &[u8]) -> Vec<VideoFileRef> {
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut cursor = 4;
+    let mut videos = Vec::with_capacity(count);
+    for _ in 0..count {
+        let filename = unpack_string(bytes, &mut cursor);
+        if cursor + 4 + 1 > bytes.len() {
+            break;
+        }
+        let index = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        cursor += 4;
+        let hashed = bytes[cursor];
+        cursor += 1;
+        let blake3 = if hashed != 0 {
+            if cursor + 32 > bytes.len() {
+                break;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&bytes[cursor..cursor + 32]);
+            cursor += 32;
+            Some(hash)
+        } else {
+            None
+        };
+        if cursor + 8 > bytes.len() {
+            break;
+        }
+        let frame_count = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        cursor += 8;
+        videos.push(VideoFileRef {
+            filename,
+            index,
+            blake3,
+            frame_count,
+        });
+    }
+    videos
 }
 
 fn pack_laps(laps: &[LapMetadata]) -> Vec<u8> {

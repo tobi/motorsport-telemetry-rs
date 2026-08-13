@@ -73,6 +73,19 @@ pub struct SourceIdentity {
     pub time: String,
 }
 
+/// A linked video file referenced by a telemetry recording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoFileRef {
+    /// Basename only (`foo_0001.mp4`). Never a session key.
+    pub filename: String,
+    /// Source file index (`avifileindex`), when the recording spans files.
+    pub index: u32,
+    /// BLAKE3-256 of the video file, when it was present at convert time.
+    pub blake3: Option<[u8; 32]>,
+    /// Presentation-order frame count, when known.
+    pub frame_count: u64,
+}
+
 /// Video linkage available at one telemetry timestamp.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoReference {
@@ -129,6 +142,8 @@ pub struct FileMetadata {
     pub video_frame_count: Option<u64>,
     /// Offset satisfying `video_presentation_ns = file_relative_ns + offset`.
     pub video_presentation_offset_ns: Option<i128>,
+    /// Linked video files in index order. Empty when the recording has no video.
+    pub videos: Vec<VideoFileRef>,
 }
 
 /// Metadata merged across files that belong to one recording session.
@@ -648,6 +663,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         fastest_lap,
         video_frame_count: source.video_frame_count(),
         video_presentation_offset_ns: source.video_presentation_offset_ns(),
+        videos: source.video_files().to_vec(),
     }
 }
 

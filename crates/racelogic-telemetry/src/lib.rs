@@ -2,7 +2,9 @@
 #![deny(missing_docs)]
 
 use memmap2::Mmap;
-use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
+use motorsport_telemetry_core::{
+    Channel, Chunk, SampleType, TelemetrySource, UnitSource, VideoFileRef,
+};
 use std::fs::File;
 use std::path::Path;
 use thiserror::Error;
@@ -85,6 +87,7 @@ struct Sections<'a> {
     units: Vec<&'a str>,
     column_names: Vec<&'a str>,
     data: Vec<&'a str>,
+    avi: Vec<&'a str>,
 }
 
 /// An opened Racelogic VBOX telemetry source.
@@ -100,6 +103,8 @@ pub struct RacelogicFile {
     pub date: String,
     /// Recording time from the VBOX preamble, when present.
     pub recording_time: String,
+    /// Linked video files discovered next to the VBO (`prefixNNNN.ext`).
+    pub videos: Vec<VideoFileRef>,
     values: Vec<Vec<f64>>,
     absolute_start_ns: u64,
 }
@@ -137,6 +142,7 @@ fn sections(text: &str) -> Sections<'_> {
                 current.clear();
             }
             "data" => result.data.push(trimmed),
+            "avi" => result.avi.push(trimmed),
             _ => {}
         }
     }
@@ -411,16 +417,69 @@ impl RacelogicFile {
                 duration_ns: if sampled { duration } else { 0 },
             });
         }
+        let videos = discover_videos(&display, &parsed.avi, &short_names, &values);
         Ok(Self {
             path: display,
             channels,
             time_ns,
             date: parsed.created_date,
             recording_time: parsed.created_time,
+            videos,
             values,
             absolute_start_ns: (first * 1e9).round().max(0.0) as u64,
         })
     }
+}
+
+fn discover_videos(
+    path: &str,
+    avi: &[&str],
+    short_names: &[&str],
+    values: &[Vec<f64>],
+) -> Vec<VideoFileRef> {
+    let prefix = avi.first().copied().unwrap_or("");
+    let ext = avi
+        .get(1)
+        .copied()
+        .unwrap_or("avi")
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    let parent = Path::new(path).parent();
+    let mut indices = std::collections::BTreeSet::new();
+    if let Some(column) = short_names
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("avifileindex"))
+    {
+        for value in &values[column] {
+            if value.is_finite() && *value >= 0.0 {
+                indices.insert(value.round() as u32);
+            }
+        }
+    }
+    if indices.is_empty() && !prefix.is_empty() {
+        indices.insert(1);
+    }
+    indices
+        .into_iter()
+        .filter(|index| *index > 0)
+        .map(|index| {
+            let filename = if prefix.is_empty() {
+                format!("{index:04}.{ext}")
+            } else {
+                format!("{prefix}{index:04}.{ext}")
+            };
+            let present = parent
+                .map(|dir| dir.join(&filename).is_file())
+                .unwrap_or(false);
+            let _ = present;
+            VideoFileRef {
+                filename,
+                index,
+                blake3: None,
+                frame_count: 0,
+            }
+        })
+        .collect()
 }
 
 impl TelemetrySource for RacelogicFile {
@@ -432,6 +491,9 @@ impl TelemetrySource for RacelogicFile {
     }
     fn channels(&self) -> &[Channel] {
         &self.channels
+    }
+    fn video_files(&self) -> &[VideoFileRef] {
+        &self.videos
     }
     fn decode(&self, channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
         self.values[channel_index][local_index as usize]
@@ -533,6 +595,32 @@ mod tests {
         let file = RacelogicFile::open(fixture.path()).unwrap();
         assert_eq!(file.time_ns, [0, 500_000_000, 1_000_000_000]);
         assert_eq!(file.sample_at(1, 250_000_000, true), Some(3.0));
+    }
+
+    #[test]
+    fn discovers_two_avi_files_from_avifileindex() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("run_0001.mp4"), b"one").unwrap();
+        std::fs::write(dir.path().join("run_0002.mp4"), b"two").unwrap();
+        let vbo = dir.path().join("run.vbo");
+        std::fs::write(
+            &vbo,
+            "[header]\ntime\navifileindex\navisynctime\n\
+             [column names]\ntime avifileindex avitime\n\
+             [AVI]\nrun_\nmp4\n\
+             [data]\n120000.0 0001 10\n120000.5 0001 20\n120001.0 0002 0\n120001.5 0002 5\n",
+        )
+        .unwrap();
+        let file = RacelogicFile::open(&vbo).unwrap();
+        assert_eq!(file.videos.len(), 2);
+        assert_eq!(file.videos[0].index, 1);
+        assert_eq!(file.videos[0].filename, "run_0001.mp4");
+        assert_eq!(file.videos[1].index, 2);
+        assert_eq!(file.videos[1].filename, "run_0002.mp4");
+        let at_first = file.video_reference_at(0);
+        let at_second = file.video_reference_at(1_000_000_000);
+        assert_eq!(at_first.file_index, Some(1));
+        assert_eq!(at_second.file_index, Some(2));
     }
 
     #[test]

@@ -10,7 +10,7 @@ pub mod units;
 pub use metadata::{
     driver_histogram, group_sessions, read_source_metadata, schema_hash, AbsoluteTimeRange,
     DriverStint, FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, SourceLapMetadata,
-    VideoReference,
+    VideoFileRef, VideoReference,
 };
 pub use units::{
     can_convert, convert, lookup as lookup_unit, normalize as normalize_unit, ConvertError,
@@ -270,6 +270,11 @@ pub trait TelemetrySource: Send + Sync {
     /// [`FileMetadata`] for the complete format-neutral result.
     fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
         None
+    }
+
+    /// Linked video files. Empty when the recording has no video.
+    fn video_files(&self) -> &[crate::VideoFileRef] {
+        &[]
     }
 
     /// Returns the number of frames in linked or embedded video, when known.

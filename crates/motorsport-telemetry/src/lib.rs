@@ -207,6 +207,10 @@ impl TelemetrySource for TelemetryFile {
         delegate!(self, source => source.source_lap_metadata())
     }
 
+    fn video_files(&self) -> &[motorsport_telemetry_core::VideoFileRef] {
+        delegate!(self, source => source.video_files())
+    }
+
     fn video_frame_count(&self) -> Option<u64> {
         delegate!(self, source => source.video_frame_count())
     }

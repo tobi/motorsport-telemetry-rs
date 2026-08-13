@@ -87,6 +87,7 @@ fn write_to(
         comment: String::new(),
         clock: source.absolute_time_range(),
         driver_stints: metadata.driver_stints.clone(),
+        videos: hash_videos(source),
     };
 
     let mut zip = ZipWriter::new(writer);
@@ -101,6 +102,39 @@ fn write_to(
     }
     zip.finish()?;
     Ok(())
+}
+
+fn hash_videos(source: &dyn TelemetrySource) -> Vec<motorsport_telemetry_core::VideoFileRef> {
+    let parent = Path::new(source.path()).parent();
+    source
+        .video_files()
+        .iter()
+        .cloned()
+        .map(|mut video| {
+            if video.blake3.is_none() {
+                if let Some(path) = parent.map(|dir| dir.join(&video.filename)) {
+                    if path.is_file() {
+                        video.blake3 = hash_file(&path);
+                    }
+                }
+            }
+            video
+        })
+        .collect()
+}
+
+fn hash_file(path: &Path) -> Option<[u8; 32]> {
+    let mut file = File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 1 << 16];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Some(*hasher.finalize().as_bytes())
 }
 
 fn collect_channel(

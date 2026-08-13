@@ -6,6 +6,7 @@ use crate::zip::{parse_members, read_first_member};
 use memmap2::Mmap;
 use motorsport_telemetry_core::{
     Channel, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata, TelemetrySource,
+    VideoFileRef,
 };
 use std::fs::File;
 use std::path::Path;
@@ -236,8 +237,50 @@ impl TelemetrySource for NativeRecording {
         chunk.time_base_ns + local_index * chunk.sample_period_ns
     }
 
+    fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
+        let Some((start, size)) = self.times.get(channel_index).copied().flatten() else {
+            return default_dense_sample_at(self, channel_index, time_ns, linear);
+        };
+        let count = size / 8;
+        if count == 0 {
+            return None;
+        }
+        let time_at = |index: usize| {
+            u64::from_le_bytes(
+                self.data[start + index * 8..start + index * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if time_at(mid) <= time_ns {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let lower = lo.saturating_sub(1).min(count - 1);
+        let a = self.decode(channel_index, 0, lower as u64);
+        if !linear || self.channels[channel_index].uses_step_interpolation() || lo >= count {
+            return Some(a);
+        }
+        let interval = time_at(lo).saturating_sub(time_at(lower));
+        if interval == 0 {
+            return Some(a);
+        }
+        let fraction = time_ns.saturating_sub(time_at(lower)) as f64 / interval as f64;
+        Some(a + (self.decode(channel_index, 0, lo as u64) - a) * fraction)
+    }
+
     fn identity(&self) -> SourceIdentity {
         self.catalog.identity.clone()
+    }
+
+    fn video_files(&self) -> &[VideoFileRef] {
+        &self.catalog.videos
     }
 
     fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
@@ -256,4 +299,39 @@ impl TelemetrySource for NativeRecording {
     fn absolute_time_range(&self) -> Option<motorsport_telemetry_core::AbsoluteTimeRange> {
         self.catalog.clock.clone()
     }
+}
+
+fn default_dense_sample_at(
+    source: &NativeRecording,
+    channel_index: usize,
+    time_ns: u64,
+    linear: bool,
+) -> Option<f64> {
+    let channel = source.channels().get(channel_index)?;
+    if time_ns >= channel.duration_ns || channel.chunks.is_empty() {
+        return None;
+    }
+    let chunk_index = channel.chunks.partition_point(|chunk| {
+        chunk
+            .time_base_ns
+            .saturating_add(chunk.sample_count.saturating_mul(chunk.sample_period_ns))
+            <= time_ns
+    });
+    let chunk = channel.chunks.get(chunk_index)?;
+    let sample = (time_ns.saturating_sub(chunk.time_base_ns) / chunk.sample_period_ns)
+        .min(chunk.sample_count - 1);
+    let a = source.decode(channel_index, chunk_index, sample);
+    if !linear || channel.uses_step_interpolation() {
+        return Some(a);
+    }
+    if sample + 1 >= chunk.sample_count {
+        return Some(a);
+    }
+    let interval = chunk.sample_period_ns;
+    if interval == 0 {
+        return Some(a);
+    }
+    let fraction =
+        time_ns.saturating_sub(chunk.time_base_ns + sample * interval) as f64 / interval as f64;
+    Some(a + (source.decode(channel_index, chunk_index, sample + 1) - a) * fraction)
 }
