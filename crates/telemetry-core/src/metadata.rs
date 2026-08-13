@@ -17,6 +17,8 @@ pub struct LapMetadata {
     pub duration_ns: u64,
     /// Whether both lap boundaries are known to fall within the recording.
     pub complete: bool,
+    /// Presentation-order video frame at [`Self::start_ns`], when known.
+    pub first_video_frame: Option<u64>,
 }
 
 /// Authoritative lap information supplied directly by a source format.
@@ -84,6 +86,8 @@ pub struct VideoFileRef {
     pub blake3: Option<[u8; 32]>,
     /// Presentation-order frame count, when known.
     pub frame_count: u64,
+    /// Offset satisfying `video_presentation_ns = file_relative_ns + offset`.
+    pub presentation_offset_ns: Option<i128>,
 }
 
 /// Video linkage available at one telemetry timestamp.
@@ -106,6 +110,8 @@ pub struct FileMetadata {
     pub path: String,
     /// Stable lowercase format identifier.
     pub format: String,
+    /// `.telemetry` catalog version. Absent on vendor source files.
+    pub format_version: Option<u16>,
     /// Total number of declared channels.
     pub channel_count: usize,
     /// Number of channels containing at least one sample.
@@ -362,6 +368,7 @@ fn increasing_counter_laps(
                         end_ns: time_ns,
                         duration_ns: time_ns - start_ns,
                         complete: start_known,
+                        first_video_frame: None,
                     });
                 }
             }
@@ -377,6 +384,7 @@ fn increasing_counter_laps(
                 end_ns: duration_ns,
                 duration_ns: duration_ns - start_ns,
                 complete: false,
+                first_video_frame: None,
             });
         }
     }
@@ -531,7 +539,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    let laps = if let Some(source_laps) = &source_laps {
+    let mut laps = if let Some(source_laps) = &source_laps {
         source_laps.laps.clone()
     } else if counter_crossings > 0 {
         counter_laps
@@ -554,6 +562,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
                     end_ns: pair[1],
                     duration_ns: pair[1].saturating_sub(pair[0]),
                     complete: index > 0 && index + 1 < count,
+                    first_video_frame: None,
                 })
             })
             .collect::<Vec<_>>()
@@ -630,7 +639,15 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
                 end_ns: time_ns,
                 duration_ns,
                 complete: true,
+                first_video_frame: None,
             });
+        }
+    }
+
+    stamp_lap_video_frames(source, &mut laps);
+    if let Some(fastest) = &mut fastest_lap {
+        if fastest.first_video_frame.is_none() {
+            fastest.first_video_frame = source.video_frame_at(fastest.start_ns);
         }
     }
 
@@ -650,6 +667,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
             .sum(),
         duration_ns,
         schema_hash: hash,
+        format_version: None,
         session_key,
         absolute_clock,
         absolute_start_ns,
@@ -663,7 +681,33 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         fastest_lap,
         video_frame_count: source.video_frame_count(),
         video_presentation_offset_ns: source.video_presentation_offset_ns(),
-        videos: source.video_files().to_vec(),
+        videos: {
+            let offset = source.video_presentation_offset_ns();
+            source
+                .video_files()
+                .iter()
+                .cloned()
+                .map(|mut video| {
+                    if video.presentation_offset_ns.is_none() {
+                        video.presentation_offset_ns = offset;
+                    }
+                    if video.frame_count == 0 {
+                        if let Some(count) = source.video_frame_count() {
+                            video.frame_count = count;
+                        }
+                    }
+                    video
+                })
+                .collect()
+        },
+    }
+}
+
+fn stamp_lap_video_frames(source: &dyn TelemetrySource, laps: &mut [LapMetadata]) {
+    for lap in laps {
+        if lap.first_video_frame.is_none() {
+            lap.first_video_frame = source.video_frame_at(lap.start_ns);
+        }
     }
 }
 
@@ -761,6 +805,7 @@ pub fn group_sessions(files: &[FileMetadata], max_gap_ns: u64) -> Vec<SessionMet
                             end_ns: to.saturating_sub(base),
                             duration_ns: to.saturating_sub(from),
                             complete: false,
+                            first_video_frame: lap.first_video_frame,
                         });
                     }
                 }

@@ -2,12 +2,24 @@
 
 mod catalog;
 mod file;
+mod migrate;
 mod write;
 mod zip;
 
-pub use catalog::Catalog;
+pub use catalog::{needs_update, Catalog, FORMAT_VERSION};
 pub use file::NativeRecording;
-pub use write::{write_from_source, TelemetryFormatError};
+pub use migrate::apply as apply_migrations;
+pub use write::{write_from_source, write_from_source_version, TelemetryFormatError};
+
+/// Reads the catalog format version from `metadata.fb` only.
+pub fn read_format_version(path: impl AsRef<std::path::Path>) -> Result<u16, TelemetryFormatError> {
+    NativeRecording::read_format_version(path)
+}
+
+/// Header-only check: the file is older than [`FORMAT_VERSION`].
+pub fn file_needs_update(path: impl AsRef<std::path::Path>) -> Result<bool, TelemetryFormatError> {
+    Ok(needs_update(read_format_version(path)?))
+}
 
 /// Reads catalog metadata without mapping channel payloads.
 pub fn read_metadata(
@@ -45,6 +57,7 @@ mod tests {
         use crate::catalog::{decode, encode, Catalog, CatalogChannel};
         use motorsport_telemetry_core::{Channel, Chunk, SampleType, UnitSource};
         let catalog = Catalog {
+            format_version: FORMAT_VERSION,
             identity: Default::default(),
             laps: vec![motorsport_telemetry_core::LapMetadata {
                 number: 2,
@@ -52,6 +65,7 @@ mod tests {
                 end_ns: 2,
                 duration_ns: 1,
                 complete: true,
+                first_video_frame: Some(4),
             }],
             valid_laps: 1,
             channels: vec![CatalogChannel {
@@ -90,9 +104,19 @@ mod tests {
             clock: None,
             driver_stints: Vec::new(),
             videos: Vec::new(),
+            presentation_offset_ns: Some(104_000_000),
         };
         let bytes = encode(&catalog).unwrap();
         let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.format_version, FORMAT_VERSION);
+        assert!(!needs_update(decoded.format_version));
+        let mut stale = catalog.clone();
+        stale.format_version = 1;
+        assert!(needs_update(
+            decode(&encode(&stale).unwrap()).unwrap().format_version
+        ));
+        assert_eq!(decoded.presentation_offset_ns, Some(104_000_000));
+        assert_eq!(decoded.laps[0].first_video_frame, Some(4));
         assert_eq!(decoded.valid_laps, 1);
         assert_eq!(decoded.laps.len(), 1);
         assert_eq!(decoded.channels.len(), 1);
@@ -120,6 +144,9 @@ mod tests {
         write_from_source(&source, &dest).unwrap();
 
         let header = NativeRecording::read_header(&dest).unwrap();
+        assert_eq!(header.format_version, FORMAT_VERSION);
+        assert_eq!(read_format_version(&dest).unwrap(), FORMAT_VERSION);
+        assert!(!file_needs_update(&dest).unwrap());
         assert_eq!(header.valid_laps, source.metadata().valid_laps);
         assert_eq!(header.source_format, "pds");
         assert_eq!(read_valid_laps(&dest).unwrap(), header.valid_laps);
@@ -181,5 +208,44 @@ mod tests {
             assert_eq!(opened.decode(index, 0, 0), source.decode(index, 0, 0));
             assert_eq!(opened.sample_affine(index), source.sample_affine(index));
         }
+    }
+
+    #[test]
+    fn open_rewrites_older_writable_files() {
+        let source =
+            cosworth_telemetry::CosworthFile::open(fixture("synthetic_cosworth.pds")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("stale.telemetry");
+        write_from_source_version(&source, &dest, 1).unwrap();
+        assert_eq!(read_format_version(&dest).unwrap(), 1);
+        assert!(file_needs_update(&dest).unwrap());
+
+        let opened = NativeRecording::open(&dest).unwrap();
+        assert_eq!(opened.catalog().format_version, FORMAT_VERSION);
+        assert!(!opened.needs_update());
+        assert_eq!(read_format_version(&dest).unwrap(), FORMAT_VERSION);
+        assert!(!file_needs_update(&dest).unwrap());
+        assert_eq!(opened.decode(0, 0, 0), source.decode(0, 0, 0));
+    }
+
+    #[test]
+    fn open_leaves_read_only_older_files() {
+        let source =
+            cosworth_telemetry::CosworthFile::open(fixture("synthetic_cosworth.pds")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("readonly.telemetry");
+        write_from_source_version(&source, &dest, 1).unwrap();
+        let mut permissions = std::fs::metadata(&dest).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&dest, permissions).unwrap();
+
+        let opened = NativeRecording::open(&dest).unwrap();
+        assert_eq!(opened.catalog().format_version, 1);
+        assert!(opened.needs_update());
+        assert_eq!(read_format_version(&dest).unwrap(), 1);
+
+        let mut permissions = std::fs::metadata(&dest).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&dest, permissions).unwrap();
     }
 }

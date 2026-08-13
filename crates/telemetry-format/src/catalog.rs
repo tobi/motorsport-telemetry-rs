@@ -9,9 +9,19 @@ use motorsport_telemetry_core::{
 
 const V: fn(u16) -> flatbuffers::VOffsetT = |field| 4 + field * 2;
 
+/// Catalog format written by this crate.
+///
+/// `1` was the original catalog. `2` adds `video_frames.bin` and
+/// `presentation_offset_ns`. `3` stores `first_video_frame` on each lap and
+/// the presentation offset on each video handle. Bump this when the on-disk
+/// layout changes and add a step in `migrate.rs`.
+/// [`crate::NativeRecording::open`] rewrites writable older files.
+pub const FORMAT_VERSION: u16 = 3;
+
 /// Parsed FlatBuffers catalog from `metadata.fb`.
 #[derive(Debug, Clone)]
 pub struct Catalog {
+    pub format_version: u16,
     pub identity: SourceIdentity,
     pub laps: Vec<LapMetadata>,
     pub valid_laps: u32,
@@ -28,6 +38,7 @@ pub struct Catalog {
     pub clock: Option<AbsoluteTimeRange>,
     pub driver_stints: Vec<DriverStint>,
     pub videos: Vec<VideoFileRef>,
+    pub presentation_offset_ns: Option<i128>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +81,7 @@ impl Catalog {
         FileMetadata {
             path: self.source_path.clone(),
             format: self.source_format.clone(),
+            format_version: Some(self.format_version),
             channel_count: self.channel_count as usize,
             sampled_channel_count: self.sampled_channel_count as usize,
             sample_count: self.sample_count,
@@ -86,9 +98,24 @@ impl Catalog {
             laps: self.laps.clone(),
             valid_laps: self.valid_laps,
             fastest_lap,
-            video_frame_count: None,
-            video_presentation_offset_ns: None,
-            videos: self.videos.clone(),
+            video_frame_count: self
+                .videos
+                .first()
+                .and_then(|video| (video.frame_count > 0).then_some(video.frame_count)),
+            video_presentation_offset_ns: self.presentation_offset_ns,
+            videos: {
+                let offset = self.presentation_offset_ns;
+                self.videos
+                    .iter()
+                    .cloned()
+                    .map(|mut video| {
+                        if video.presentation_offset_ns.is_none() {
+                            video.presentation_offset_ns = offset;
+                        }
+                        video
+                    })
+                    .collect()
+            },
         }
     }
 }
@@ -114,10 +141,10 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
         builder.end_table(start)
     };
 
-    let laps = builder.create_vector(&pack_laps(&catalog.laps));
+    let laps = builder.create_vector(&pack_laps(&catalog.laps, catalog.format_version));
     let channels = builder.create_vector(&pack_channels(&catalog.channels));
     let stints = builder.create_vector(&pack_stints(&catalog.driver_stints));
-    let videos = builder.create_vector(&pack_videos(&catalog.videos));
+    let videos = builder.create_vector(&pack_videos(&catalog.videos, catalog.format_version));
 
     let source_format = builder.create_string(&catalog.source_format);
     let source_path = builder.create_string(&catalog.source_path);
@@ -129,7 +156,7 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
         .map(|clock| builder.create_string(&clock.clock));
 
     let start = builder.start_table();
-    builder.push_slot(V(0), 1u16, 0);
+    builder.push_slot(V(0), catalog.format_version, 0);
     builder.push_slot_always::<WIPOffset<_>>(V(1), identity);
     builder.push_slot_always::<WIPOffset<_>>(V(3), laps);
     builder.push_slot_always::<WIPOffset<_>>(V(4), channels);
@@ -150,9 +177,23 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
         builder.push_slot(V(18), clock.start_ns, 0);
         builder.push_slot(V(19), clock.end_ns, 0);
     }
+    if let Some(offset) = catalog.presentation_offset_ns {
+        builder.push_slot(V(21), 1u32, 0);
+        builder.push_slot(V(22), i64::try_from(offset).unwrap_or(i64::MAX), 0);
+    }
     let root = builder.end_table(start);
     builder.finish(root, None);
     Ok(builder.finished_data().to_vec())
+}
+
+/// Reads only the catalog format version from a catalog buffer.
+pub fn decode_format_version(bytes: &[u8]) -> Result<u16, ZipError> {
+    Ok(root_table(bytes)?.u16_field(0))
+}
+
+/// True when `version` is older than [`FORMAT_VERSION`] and should be rewritten.
+pub fn needs_update(version: u16) -> bool {
+    version < FORMAT_VERSION
 }
 
 /// Reads only `valid_laps` from a catalog buffer.
@@ -162,7 +203,8 @@ pub fn decode_valid_laps(bytes: &[u8]) -> Result<u32, ZipError> {
 
 /// Reads only the lap list from a catalog buffer. Does not unpack channels.
 pub fn decode_laps(bytes: &[u8]) -> Result<Vec<LapMetadata>, ZipError> {
-    Ok(unpack_laps(&root_table(bytes)?.u8s(3)))
+    let table = root_table(bytes)?;
+    Ok(unpack_laps(&table.u8s(3), table.u16_field(0)))
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
@@ -179,7 +221,8 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
             time: identity.string(6).unwrap_or_default(),
         })
         .unwrap_or_default();
-    let laps = unpack_laps(&table.u8s(3));
+    let format_version = table.u16_field(0);
+    let laps = unpack_laps(&table.u8s(3), format_version);
     let channels = unpack_channels(&table.u8s(4));
     let driver_stints = unpack_stints(&table.u8s(16));
     let clock = table.string(17).and_then(|name| {
@@ -195,6 +238,7 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         }
     });
     Ok(Catalog {
+        format_version,
         identity,
         laps,
         valid_laps: table.u32(13),
@@ -210,7 +254,8 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         comment: table.string(14).unwrap_or_default(),
         clock,
         driver_stints,
-        videos: unpack_videos(&table.u8s(20)),
+        videos: unpack_videos(&table.u8s(20), format_version),
+        presentation_offset_ns: (table.u32(21) != 0).then(|| i128::from(table.i64_field(22))),
     })
 }
 
@@ -297,11 +342,25 @@ impl<'a> Table<'a> {
         (rel != 0).then_some(self.loc + rel as usize)
     }
 
+    fn u16_field(&self, field: u16) -> u16 {
+        self.slot(field)
+            .and_then(|at| self.buf.get(at..at + 2))
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_le_bytes)
+            .unwrap_or(0)
+    }
     fn u32(&self, field: u16) -> u32 {
         self.slot(field)
             .and_then(|at| self.buf.get(at..at + 4))
             .and_then(|bytes| bytes.try_into().ok())
             .map(u32::from_le_bytes)
+            .unwrap_or(0)
+    }
+    fn i64_field(&self, field: u16) -> i64 {
+        self.slot(field)
+            .and_then(|at| self.buf.get(at..at + 8))
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i64::from_le_bytes)
             .unwrap_or(0)
     }
     fn u64(&self, field: u16) -> u64 {
@@ -348,7 +407,7 @@ impl<'a> Table<'a> {
     }
 }
 
-fn pack_videos(videos: &[VideoFileRef]) -> Vec<u8> {
+fn pack_videos(videos: &[VideoFileRef], format_version: u16) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(videos.len() as u32).to_le_bytes());
     for video in videos {
@@ -362,11 +421,20 @@ fn pack_videos(videos: &[VideoFileRef]) -> Vec<u8> {
             None => out.push(0),
         }
         out.extend_from_slice(&video.frame_count.to_le_bytes());
+        if format_version >= 3 {
+            match video.presentation_offset_ns {
+                Some(offset) => {
+                    out.push(1);
+                    out.extend_from_slice(&i64::try_from(offset).unwrap_or(i64::MAX).to_le_bytes());
+                }
+                None => out.push(0),
+            }
+        }
     }
     out
 }
 
-fn unpack_videos(bytes: &[u8]) -> Vec<VideoFileRef> {
+fn unpack_videos(bytes: &[u8], format_version: u16) -> Vec<VideoFileRef> {
     if bytes.len() < 4 {
         return Vec::new();
     }
@@ -398,17 +466,37 @@ fn unpack_videos(bytes: &[u8]) -> Vec<VideoFileRef> {
         }
         let frame_count = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
         cursor += 8;
+        let presentation_offset_ns = if format_version >= 3 {
+            if cursor >= bytes.len() {
+                break;
+            }
+            let present = bytes[cursor];
+            cursor += 1;
+            if present != 0 {
+                if cursor + 8 > bytes.len() {
+                    break;
+                }
+                let offset = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                cursor += 8;
+                Some(i128::from(offset))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         videos.push(VideoFileRef {
             filename,
             index,
             blake3,
             frame_count,
+            presentation_offset_ns,
         });
     }
     videos
 }
 
-fn pack_laps(laps: &[LapMetadata]) -> Vec<u8> {
+fn pack_laps(laps: &[LapMetadata], format_version: u16) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(laps.len() as u32).to_le_bytes());
     for lap in laps {
@@ -417,11 +505,20 @@ fn pack_laps(laps: &[LapMetadata]) -> Vec<u8> {
         out.extend_from_slice(&lap.end_ns.to_le_bytes());
         out.extend_from_slice(&lap.duration_ns.to_le_bytes());
         out.push(u8::from(lap.complete));
+        if format_version >= 3 {
+            match lap.first_video_frame {
+                Some(frame) => {
+                    out.push(1);
+                    out.extend_from_slice(&frame.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+        }
     }
     out
 }
 
-fn unpack_laps(bytes: &[u8]) -> Vec<LapMetadata> {
+fn unpack_laps(bytes: &[u8], format_version: u16) -> Vec<LapMetadata> {
     if bytes.len() < 4 {
         return Vec::new();
     }
@@ -432,14 +529,39 @@ fn unpack_laps(bytes: &[u8]) -> Vec<LapMetadata> {
         if cursor + 33 > bytes.len() {
             break;
         }
-        laps.push(LapMetadata {
-            number: i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()),
-            start_ns: u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap()),
-            end_ns: u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap()),
-            duration_ns: u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap()),
-            complete: bytes[cursor + 32] != 0,
-        });
+        let number = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let start_ns = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
+        let end_ns = u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap());
+        let duration_ns = u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap());
+        let complete = bytes[cursor + 32] != 0;
         cursor += 33;
+        let first_video_frame = if format_version >= 3 {
+            if cursor >= bytes.len() {
+                break;
+            }
+            let present = bytes[cursor];
+            cursor += 1;
+            if present != 0 {
+                if cursor + 8 > bytes.len() {
+                    break;
+                }
+                let frame = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                cursor += 8;
+                Some(frame)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        laps.push(LapMetadata {
+            number,
+            start_ns,
+            end_ns,
+            duration_ns,
+            complete,
+            first_video_frame,
+        });
     }
     laps
 }

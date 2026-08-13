@@ -477,6 +477,7 @@ fn discover_videos(
                 index,
                 blake3: None,
                 frame_count: 0,
+                presentation_offset_ns: None,
             }
         })
         .collect()

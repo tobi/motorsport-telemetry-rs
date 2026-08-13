@@ -64,6 +64,7 @@ impl LdxMetadata {
                     end_ns,
                     duration_ns: end_ns - start_ns,
                     complete,
+                    first_video_frame: None,
                 });
             }
         }
@@ -81,6 +82,7 @@ impl LdxMetadata {
                         end_ns,
                         duration_ns,
                         complete: true,
+                        first_video_frame: None,
                     })
                 });
         if let Some(fastest) = &fastest_lap {

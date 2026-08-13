@@ -63,6 +63,7 @@ table Identity {
 }
 
 table Recording {
+  // Catalog format version. Bump when clients must reconvert.
   schema_version:uint16;
   identity:Identity;
   drivers:[Driver];

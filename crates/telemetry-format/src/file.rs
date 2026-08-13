@@ -2,13 +2,14 @@
 
 use crate::catalog::{decode, Catalog};
 use crate::write::TelemetryFormatError;
-use crate::zip::{parse_members, read_first_member};
+use crate::zip::{parse_members, read_first_member, ZipWriter};
 use memmap2::Mmap;
 use motorsport_telemetry_core::{
     Channel, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata, TelemetrySource,
     VideoFileRef,
 };
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 /// An opened native `.telemetry` recording.
@@ -19,6 +20,7 @@ pub struct NativeRecording {
     channels: Vec<Channel>,
     affines: Vec<(f64, f64)>,
     times: Vec<Option<(usize, usize)>>,
+    video_times: Option<(usize, usize)>,
     data: Storage,
 }
 
@@ -40,12 +42,63 @@ impl std::ops::Deref for Storage {
 
 impl NativeRecording {
     /// Memory-maps a `.telemetry` file for sample access.
+    ///
+    /// Older writable files are migrated in place to [`crate::FORMAT_VERSION`].
+    /// Read-only files stay as they are; [`Self::needs_update`] reports them.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TelemetryFormatError> {
+        let path = path.as_ref();
+        let opened = Self::open_unchanged(path)?;
+        if !opened.needs_update() || !writable(path) {
+            return Ok(opened);
+        }
+        opened.rewrite_migrated(path)?;
+        Self::open_unchanged(path)
+    }
+
+    /// Maps the file without rewriting an older catalog.
+    pub fn open_unchanged(path: impl AsRef<Path>) -> Result<Self, TelemetryFormatError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
         let file = File::open(path)?;
         let mapped = unsafe { Mmap::map(&file)? };
         Self::from_storage(display, Storage::Mapped(mapped))
+    }
+
+    fn rewrite_migrated(&self, path: &Path) -> Result<(), TelemetryFormatError> {
+        let mut catalog = self.catalog.clone();
+        crate::migrate::apply(&mut catalog);
+        for lap in &mut catalog.laps {
+            if lap.first_video_frame.is_none() {
+                lap.first_video_frame = self.video_frame_at(lap.start_ns);
+            }
+        }
+        let members = parse_members(&self.data)?;
+        let tmp = path.with_extension("telemetry.tmp");
+        let result = (|| {
+            let file = File::create(&tmp)?;
+            let mut zip = ZipWriter::new(std::io::BufWriter::new(file));
+            zip.write_member("metadata.fb", &crate::catalog::encode(&catalog)?)?;
+            for member in &members {
+                if member.name == "metadata.fb" {
+                    continue;
+                }
+                let start = member.offset as usize;
+                let end = start + member.size as usize;
+                let bytes = self.data.get(start..end).ok_or_else(|| {
+                    TelemetryFormatError::Invalid(format!("{} is out of range", member.name))
+                })?;
+                zip.write_member(&member.name, bytes)?;
+            }
+            let mut writer = zip.finish()?;
+            writer.flush()?;
+            drop(writer);
+            fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// Parses an owned `.telemetry` buffer.
@@ -59,6 +112,18 @@ impl NativeRecording {
     /// Reads only `metadata.fb`. Cost is independent of channel payload size.
     pub fn read_header(path: impl AsRef<Path>) -> Result<Catalog, TelemetryFormatError> {
         Ok(decode(&Self::read_catalog_bytes(path)?)?)
+    }
+
+    /// Catalog format version from `metadata.fb` only.
+    pub fn read_format_version(path: impl AsRef<Path>) -> Result<u16, TelemetryFormatError> {
+        Ok(crate::catalog::decode_format_version(
+            &Self::read_catalog_bytes(path)?,
+        )?)
+    }
+
+    /// True when this recording was written by an older catalog.
+    pub fn needs_update(&self) -> bool {
+        crate::needs_update(self.catalog.format_version)
     }
 
     /// Header-only metadata. Does not map or checksum channel members.
@@ -149,16 +214,39 @@ impl NativeRecording {
             });
             affines.push((channel.scale, channel.bias));
         }
+        let video_times = by_name
+            .get("video_frames.bin")
+            .map(|member| (member.offset as usize, member.size as usize));
         let mut catalog = catalog;
         catalog.source_path = path.clone();
+        if let Some((_, size)) = video_times {
+            if let Some(video) = catalog.videos.first_mut() {
+                video.frame_count = (size / 8) as u64;
+            }
+        }
+        if let Some(offset) = catalog.presentation_offset_ns {
+            for video in &mut catalog.videos {
+                if video.presentation_offset_ns.is_none() {
+                    video.presentation_offset_ns = Some(offset);
+                }
+            }
+        }
         Ok(Self {
             path,
             catalog,
             channels,
             affines,
             times,
+            video_times,
             data,
         })
+    }
+
+    fn video_time_at(&self, index: usize) -> Option<u64> {
+        let (start, size) = self.video_times?;
+        let at = start + index * 8;
+        (at + 8 <= start + size)
+            .then(|| u64::from_le_bytes(self.data[at..at + 8].try_into().unwrap()))
     }
 }
 
@@ -283,6 +371,44 @@ impl TelemetrySource for NativeRecording {
         &self.catalog.videos
     }
 
+    fn video_presentation_times_ns(&self) -> Option<&[u64]> {
+        let (start, size) = self.video_times?;
+        let bytes = self.data.get(start..start + size)?;
+        if bytes.len() % 8 != 0 {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u64>(), bytes.len() / 8) })
+    }
+
+    fn video_frame_count(&self) -> Option<u64> {
+        self.video_times
+            .map(|(_, size)| (size / 8) as u64)
+            .filter(|count| *count > 0)
+    }
+
+    fn video_frame_at(&self, time_ns: u64) -> Option<u64> {
+        let (_, size) = self.video_times?;
+        let count = size / 8;
+        if count == 0 {
+            return None;
+        }
+        let time_ns = self.video_presentation_time_ns(time_ns)?;
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.video_time_at(mid) {
+                Some(stamp) if stamp <= time_ns => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        Some(lo.saturating_sub(1) as u64)
+    }
+
+    fn video_presentation_offset_ns(&self) -> Option<i128> {
+        self.catalog.presentation_offset_ns
+    }
+
     fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
         Some(SourceLapMetadata {
             laps: self.catalog.laps.clone(),
@@ -334,4 +460,8 @@ fn default_dense_sample_at(
     let fraction =
         time_ns.saturating_sub(chunk.time_base_ns + sample * interval) as f64 / interval as f64;
     Some(a + (source.decode(channel_index, chunk_index, sample + 1) - a) * fraction)
+}
+
+fn writable(path: &Path) -> bool {
+    OpenOptions::new().write(true).open(path).is_ok()
 }

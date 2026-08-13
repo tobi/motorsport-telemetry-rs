@@ -16,11 +16,23 @@ pub fn write_from_source(
 ) -> Result<(), TelemetryFormatError> {
     let dest = dest.as_ref();
     let file = File::create(dest).map_err(io_err)?;
-    write_to(source, BufWriter::new(file))
+    write_to(source, crate::FORMAT_VERSION, BufWriter::new(file))
+}
+
+/// Writes a `.telemetry` zip stamped with an explicit catalog version.
+pub fn write_from_source_version(
+    source: &dyn TelemetrySource,
+    dest: impl AsRef<Path>,
+    format_version: u16,
+) -> Result<(), TelemetryFormatError> {
+    let dest = dest.as_ref();
+    let file = File::create(dest).map_err(io_err)?;
+    write_to(source, format_version, BufWriter::new(file))
 }
 
 fn write_to(
     source: &dyn TelemetrySource,
+    format_version: u16,
     writer: impl Write + std::io::Seek,
 ) -> Result<(), TelemetryFormatError> {
     let metadata = read_source_metadata(source);
@@ -65,15 +77,22 @@ fn write_to(
         payloads.push((member, values, time_member, times));
     }
 
-    let valid_laps = metadata.laps.iter().filter(|lap| lap.complete).count() as u32;
+    let mut laps = metadata.laps.clone();
+    for lap in &mut laps {
+        if lap.first_video_frame.is_none() {
+            lap.first_video_frame = source.video_frame_at(lap.start_ns);
+        }
+    }
+    let valid_laps = laps.iter().filter(|lap| lap.complete).count() as u32;
     let session_hint = metadata
         .session_key
         .as_deref()
         .and_then(|key| key.rsplit_once(':').map(|(hint, _)| hint.to_owned()))
         .unwrap_or_default();
-    let catalog = Catalog {
+    let mut catalog = Catalog {
+        format_version,
         identity: metadata.identity.clone(),
-        laps: metadata.laps.clone(),
+        laps,
         valid_laps,
         channels: catalog_channels,
         source_format: source.format().to_owned(),
@@ -87,11 +106,43 @@ fn write_to(
         comment: String::new(),
         clock: source.absolute_time_range(),
         driver_stints: metadata.driver_stints.clone(),
-        videos: hash_videos(source),
+        videos: {
+            let mut videos = hash_videos(source);
+            if let Some(count) = source.video_frame_count() {
+                if let Some(video) = videos.first_mut() {
+                    video.frame_count = count;
+                } else if let Some(name) = Path::new(source.path()).file_name() {
+                    videos.push(motorsport_telemetry_core::VideoFileRef {
+                        filename: name.to_string_lossy().into_owned(),
+                        index: 1,
+                        blake3: hash_file(Path::new(source.path())),
+                        frame_count: count,
+                        presentation_offset_ns: source.video_presentation_offset_ns(),
+                    });
+                }
+            }
+            videos
+        },
+        presentation_offset_ns: source.video_presentation_offset_ns(),
     };
+    let offset = catalog.presentation_offset_ns;
+    for video in &mut catalog.videos {
+        if video.presentation_offset_ns.is_none() {
+            video.presentation_offset_ns = offset;
+        }
+    }
 
     let mut zip = ZipWriter::new(writer);
     zip.write_member("metadata.fb", &crate::catalog::encode(&catalog)?)?;
+    if let Some(times) = source.video_presentation_times_ns() {
+        if !times.is_empty() {
+            let mut bytes = Vec::with_capacity(times.len() * 8);
+            for time in times {
+                bytes.extend_from_slice(&time.to_le_bytes());
+            }
+            zip.write_member("video_frames.bin", &bytes)?;
+        }
+    }
     for (member, values, time_member, times) in payloads {
         if !values.is_empty() {
             zip.write_member(&member, &values)?;
@@ -173,6 +224,7 @@ fn is_event(source: &dyn TelemetrySource, index: usize, channel: &Channel) -> bo
     if source.chunk_bytes(index, 0).is_some() {
         return false;
     }
+    const JITTER_NS: u64 = 2_000_000;
     channel
         .chunks
         .iter()
@@ -180,8 +232,9 @@ fn is_event(source: &dyn TelemetrySource, index: usize, channel: &Channel) -> bo
         .any(|(chunk_index, chunk)| {
             chunk.sample_period_ns == 0
                 || (0..chunk.sample_count).any(|local| {
-                    source.sample_time_ns(index, chunk_index, local)
-                        != chunk.time_base_ns + local * chunk.sample_period_ns
+                    let actual = source.sample_time_ns(index, chunk_index, local);
+                    let expected = chunk.time_base_ns + local * chunk.sample_period_ns;
+                    actual.abs_diff(expected) > JITTER_NS
                 })
         })
 }

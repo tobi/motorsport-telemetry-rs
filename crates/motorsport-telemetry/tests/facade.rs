@@ -3,6 +3,7 @@ use motorsport_telemetry::{
     read_lap_metadata, TelemetryNormalizer,
 };
 use std::path::PathBuf;
+use telemetry_format::write_from_source;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -89,6 +90,56 @@ fn metadata_open_and_lap_api_cover_every_format() {
             file.metadata().laps,
             read_lap_metadata(&path).unwrap(),
             "{name}"
+        );
+    }
+}
+
+#[test]
+fn telemetry_round_trip_preserves_aimd_video_timeline() {
+    let source = open(fixture("synthetic_aimd.mp4")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("synthetic_aimd.telemetry");
+    write_from_source(&source, &dest).unwrap();
+    let opened = open(&dest).unwrap();
+
+    assert_eq!(opened.format(), "aimd");
+    assert_eq!(
+        opened.metadata().format_version,
+        Some(motorsport_telemetry::FORMAT_VERSION)
+    );
+    assert!(!motorsport_telemetry::telemetry_needs_update(&dest).unwrap());
+    assert_eq!(opened.video_frame_count(), source.video_frame_count());
+    assert_eq!(
+        opened.video_presentation_offset_ns(),
+        source.video_presentation_offset_ns()
+    );
+    assert_eq!(
+        opened.video_presentation_times_ns(),
+        source.video_presentation_times_ns()
+    );
+    assert_eq!(opened.video_frame_at(0), source.video_frame_at(0));
+    assert_eq!(opened.video_frame_at(0), Some(2));
+    assert_eq!(opened.video_presentation_time_ns(0), Some(104_000_000));
+    assert_eq!(opened.metadata().laps, source.metadata().laps);
+    assert_eq!(
+        opened.metadata().laps[0].first_video_frame,
+        source.video_frame_at(source.metadata().laps[0].start_ns)
+    );
+    assert_eq!(
+        opened.metadata().videos[0].presentation_offset_ns,
+        source.video_presentation_offset_ns()
+    );
+    for step in 0..=20 {
+        let t = step * 1_000_000;
+        assert_eq!(
+            opened.video_frame_at(t),
+            source.video_frame_at(t),
+            "frame at {t} ns"
+        );
+        assert_eq!(
+            opened.video_reference_at(t),
+            source.video_reference_at(t),
+            "video ref at {t} ns"
         );
     }
 }

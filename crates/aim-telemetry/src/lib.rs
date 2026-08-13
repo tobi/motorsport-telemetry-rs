@@ -603,6 +603,7 @@ pub struct AimFile {
     gps_samples: Vec<SampleRef>,
     video_frame_times_ns: Vec<u64>,
     presentation_offset_ns: Option<i128>,
+    videos: Vec<motorsport_telemetry_core::VideoFileRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -1231,6 +1232,18 @@ impl AimFile {
                 .map(|sample| sample.time_ns + channel.first_period_ns().unwrap_or(1))
                 .unwrap_or(0);
         }
+        let videos = std::path::Path::new(&display)
+            .file_name()
+            .map(|name| {
+                vec![motorsport_telemetry_core::VideoFileRef {
+                    filename: name.to_string_lossy().into_owned(),
+                    index: 1,
+                    blake3: None,
+                    frame_count: video_frame_times_ns.len() as u64,
+                    presentation_offset_ns: track.presentation_offset_ns,
+                }]
+            })
+            .unwrap_or_default();
         Ok(Self {
             path: display,
             channels,
@@ -1239,6 +1252,7 @@ impl AimFile {
             gps_samples,
             video_frame_times_ns,
             presentation_offset_ns: track.presentation_offset_ns,
+            videos,
         })
     }
 }
@@ -1316,6 +1330,20 @@ impl TelemetrySource for AimFile {
     fn channels(&self) -> &[Channel] {
         &self.channels
     }
+    fn sample_time_ns(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> u64 {
+        let raw = &self.aim_channels[channel_index];
+        let samples = if raw.representation.is_gps() {
+            &self.gps_samples
+        } else {
+            &raw.samples
+        };
+        let chunk = &self.channels[channel_index].chunks[chunk_index];
+        samples
+            .get((chunk.sample_base + local_index) as usize)
+            .map(|sample| sample.time_ns)
+            .unwrap_or_else(|| chunk.time_base_ns + local_index * chunk.sample_period_ns)
+    }
+
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
         let chunk = &self.channels[channel_index].chunks[chunk_index];
         let raw = &self.aim_channels[channel_index];
@@ -1359,6 +1387,14 @@ impl TelemetrySource for AimFile {
             Representation::GpsFixType => self.data[at + 14] as f64,
             Representation::GpsFixFlags => self.data[at + 15] as f64,
         }
+    }
+
+    fn video_files(&self) -> &[motorsport_telemetry_core::VideoFileRef] {
+        &self.videos
+    }
+
+    fn video_presentation_times_ns(&self) -> Option<&[u64]> {
+        (!self.video_frame_times_ns.is_empty()).then_some(self.video_frame_times_ns.as_slice())
     }
 
     fn video_frame_count(&self) -> Option<u64> {

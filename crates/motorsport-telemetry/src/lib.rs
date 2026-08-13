@@ -17,6 +17,8 @@ use thiserror::Error;
 
 pub use motorsport_telemetry_core;
 pub use motorsport_track_atlas;
+/// Current `.telemetry` catalog version written by this crate.
+pub use telemetry_format::FORMAT_VERSION;
 
 /// Errors returned while selecting or opening a supported telemetry format.
 #[derive(Debug, Error)]
@@ -63,7 +65,8 @@ pub enum TelemetryFile {
 ///
 /// Supported extensions are `.mp4`, `.pds`, `.ld`, `.vbo`, and `.telemetry`.
 /// This function selects a parser by extension; the selected parser still
-/// validates the file contents.
+/// validates the file contents. Opening a writable `.telemetry` file older
+/// than [`FORMAT_VERSION`] rewrites it in place.
 pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
     let path = path.as_ref();
     match path
@@ -145,6 +148,26 @@ pub fn read_metadata(
     Ok(open_metadata(path)?.metadata())
 }
 
+/// Catalog format version from `metadata.fb`. Header-only for `.telemetry`.
+pub fn read_format_version(path: impl AsRef<Path>) -> Result<u16, TelemetryError> {
+    if !is_telemetry(path.as_ref()) {
+        return Err(TelemetryError::Unsupported(
+            path.as_ref().display().to_string(),
+        ));
+    }
+    Ok(telemetry_format::read_format_version(path)?)
+}
+
+/// True when a `.telemetry` file is older than [`FORMAT_VERSION`] and should be rewritten.
+pub fn telemetry_needs_update(path: impl AsRef<Path>) -> Result<bool, TelemetryError> {
+    if !is_telemetry(path.as_ref()) {
+        return Err(TelemetryError::Unsupported(
+            path.as_ref().display().to_string(),
+        ));
+    }
+    Ok(telemetry_format::file_needs_update(path)?)
+}
+
 fn is_telemetry(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -209,6 +232,10 @@ impl TelemetrySource for TelemetryFile {
 
     fn video_files(&self) -> &[motorsport_telemetry_core::VideoFileRef] {
         delegate!(self, source => source.video_files())
+    }
+
+    fn video_presentation_times_ns(&self) -> Option<&[u64]> {
+        delegate!(self, source => source.video_presentation_times_ns())
     }
 
     fn video_frame_count(&self) -> Option<u64> {

@@ -277,9 +277,18 @@ pub trait TelemetrySource: Send + Sync {
         &[]
     }
 
+    /// Presentation-order movie-timeline timestamps for each video frame.
+    ///
+    /// Values are nanoseconds on the same timeline
+    /// [`Self::video_presentation_time_ns`] uses. Empty/`None` when unknown.
+    fn video_presentation_times_ns(&self) -> Option<&[u64]> {
+        None
+    }
+
     /// Returns the number of frames in linked or embedded video, when known.
     fn video_frame_count(&self) -> Option<u64> {
-        None
+        self.video_presentation_times_ns()
+            .map(|times| times.len() as u64)
     }
 
     /// Maps a file-relative telemetry timestamp to a video frame index.

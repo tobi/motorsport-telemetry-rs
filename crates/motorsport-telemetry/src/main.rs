@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use telemetry_format::needs_update;
 
 const USAGE: &str = "Usage: motorsport-telemetry [--json] <file>";
 const SUSPICIOUS_CLOCK_AGE_DAYS: i64 = 365 * 2;
@@ -14,6 +15,8 @@ const SUSPICIOUS_CLOCK_AGE_DAYS: i64 = 365 * 2;
 struct Inspection {
     file: String,
     format: String,
+    format_version: Option<u16>,
+    format_needs_update: Option<bool>,
     driver_ids: Vec<i64>,
     laps: usize,
     complete_laps: usize,
@@ -132,6 +135,8 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
     Ok(Inspection {
         file: path.to_string_lossy().into_owned(),
         format: metadata.format.clone(),
+        format_version: metadata.format_version,
+        format_needs_update: metadata.format_version.map(needs_update),
         driver_ids: metadata.driver_ids.clone(),
         laps: metadata.laps.len(),
         complete_laps: metadata.laps.iter().filter(|lap| lap.complete).count(),
@@ -557,6 +562,13 @@ fn nearby_video_filenames(path: &Path) -> Vec<String> {
 fn print_human(inspection: &Inspection) {
     println!("file: {}", inspection.file);
     println!("format: {}", inspection.format);
+    if let Some(version) = inspection.format_version {
+        println!("format_version: {version}");
+        println!(
+            "format_needs_update: {}",
+            inspection.format_needs_update.unwrap_or(false)
+        );
+    }
     println!(
         "event_date: {}",
         inspection.event_date.as_deref().unwrap_or("unknown")
@@ -656,6 +668,8 @@ fn print_json(inspection: &Inspection) {
         serde_json::to_string_pretty(&json!({
             "file": inspection.file,
             "format": inspection.format,
+            "format_version": inspection.format_version,
+            "format_needs_update": inspection.format_needs_update,
             "event_date": inspection.event_date,
             "event_date_source": inspection.event_date_source,
             "event_date_warning": inspection.event_date_warning,
