@@ -121,6 +121,8 @@ pub struct FileMetadata {
     pub driver_stints: Vec<DriverStint>,
     /// Lap intervals in file-relative time.
     pub laps: Vec<LapMetadata>,
+    /// Number of complete flying laps. Stored as a header scalar in `.telemetry`.
+    pub valid_laps: u32,
     /// Fastest complete or explicitly reported lap.
     pub fastest_lap: Option<LapMetadata>,
     /// Linked or embedded video frame count, when available.
@@ -227,6 +229,79 @@ fn counter_lap_number_at(
     })
 }
 
+const LAP_COUNTER_NAMES: &[&str] = &[
+    "lapnumber",
+    "lapnum",
+    "lapcount",
+    "lapcounter",
+    "currentlap",
+    "lap",
+    "beaconeventcount",
+    "beaconcount",
+    "lapbeaconcount",
+];
+
+fn lap_counter_rank(name: &str) -> Option<usize> {
+    LAP_COUNTER_NAMES
+        .iter()
+        .position(|wanted| normalized_eq(name, wanted))
+}
+
+/// Picks a lap-counter channel that actually increments.
+///
+/// File order must not win: Cosworth logs often have a `Lap Number` that only
+/// toggles 0/1 while `beaconEventCount` counts crossings. A counter is *strong*
+/// when it increments at least twice (high-water >= 2). Strong counters beat
+/// weak ones; more crossings beat fewer; name-list order is the tie-break.
+fn select_lap_counter(
+    source: &dyn TelemetrySource,
+    duration_ns: u64,
+) -> (Option<usize>, Vec<LapMetadata>, usize) {
+    let mut best_strong: Option<(usize, usize, usize, Vec<LapMetadata>)> = None;
+    let mut best_weak: Option<(usize, usize, usize, Vec<LapMetadata>)> = None;
+    let mut best_constant: Option<(usize, usize, usize, Vec<LapMetadata>)> = None;
+    for (index, channel) in source.channels().iter().enumerate() {
+        let Some(rank) = (channel.sample_count > 0)
+            .then(|| lap_counter_rank(&channel.name))
+            .flatten()
+        else {
+            continue;
+        };
+        let (laps, crossings) = increasing_counter_laps(source, index, duration_ns);
+        if laps.is_empty() {
+            continue;
+        }
+        let candidate = (rank, crossings, index, laps);
+        if crossings >= 2 {
+            if best_strong
+                .as_ref()
+                .is_none_or(|(rank0, crossings0, _, _)| {
+                    crossings > *crossings0 || (crossings == *crossings0 && rank < *rank0)
+                })
+            {
+                best_strong = Some(candidate);
+            }
+        } else if crossings == 1 {
+            if best_weak
+                .as_ref()
+                .is_none_or(|(rank0, _, _, _)| rank < *rank0)
+            {
+                best_weak = Some(candidate);
+            }
+        } else if best_constant
+            .as_ref()
+            .is_none_or(|(rank0, _, _, _)| rank < *rank0)
+        {
+            best_constant = Some(candidate);
+        }
+    }
+    let selected = best_strong.or(best_weak).or(best_constant);
+    match selected {
+        Some((_, crossings, index, laps)) => (Some(index), laps, crossings),
+        None => (None, Vec::new(), 0),
+    }
+}
+
 fn increasing_counter_laps(
     source: &dyn TelemetrySource,
     channel_index: usize,
@@ -293,7 +368,8 @@ fn increasing_counter_laps(
     (laps, crossings)
 }
 
-fn schema_hash(source: &dyn TelemetrySource) -> u64 {
+/// Stable FNV-1a of lowercased channel names, raw units, and sample-type codes.
+pub fn schema_hash(source: &dyn TelemetrySource) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for channel in source.channels() {
         for byte in channel.name.bytes().map(|byte| byte.to_ascii_lowercase()) {
@@ -391,33 +467,11 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         .collect::<Vec<_>>();
 
     let source_laps = source.source_lap_metadata();
-    let lap_channel_index = source_laps
-        .is_none()
-        .then(|| {
-            channel_index(
-                source,
-                &[
-                    "lapnumber",
-                    "lapnum",
-                    "lapcount",
-                    "lapcounter",
-                    "currentlap",
-                    "lap",
-                    "beaconeventcount",
-                    "beaconcount",
-                    "lapbeaconcount",
-                ],
-            )
-        })
-        .flatten();
-    let (counter_laps, counter_crossings) = source_laps
-        .is_none()
-        .then(|| {
-            lap_channel_index
-                .map(|index| increasing_counter_laps(source, index, duration_ns))
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let (lap_channel_index, counter_laps, counter_crossings) = if source_laps.is_some() {
+        (None, Vec::new(), 0)
+    } else {
+        select_lap_counter(source, duration_ns)
+    };
     let timer_resets = source_laps
         .is_none()
         .then(|| {
@@ -589,6 +643,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         identity: source.identity(),
         driver_ids,
         driver_stints,
+        valid_laps: laps.iter().filter(|lap| lap.complete).count() as u32,
         laps,
         fastest_lap,
         video_frame_count: source.video_frame_count(),
@@ -939,6 +994,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, false), (2, true), (3, true), (4, false)]
         );
+    }
+
+    #[test]
+    fn beacon_counter_wins_over_binary_lap_number_flag() {
+        let mut source = counter_source("Lap Number", vec![0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0]);
+        let count = source.channels[0].sample_count;
+        source.channels.push(Channel {
+            id: 1,
+            name: "beaconEventCount".into(),
+            unit: String::new(),
+            unit_source: UnitSource::Unknown,
+            sample_type: SampleType::F64,
+            chunks: vec![Chunk {
+                sample_period_ns: 10_000_000_000,
+                sample_count: count,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: 0,
+            }],
+            sample_count: count,
+            duration_ns: count * 10_000_000_000,
+        });
+        source.values.push(vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0]);
+
+        let metadata = read_source_metadata(&source);
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(|lap| (lap.number, lap.complete))
+                .collect::<Vec<_>>(),
+            [(1, false), (2, true), (3, true), (4, true), (5, false)]
+        );
+        assert_eq!(metadata.valid_laps, 3);
     }
 
     #[test]

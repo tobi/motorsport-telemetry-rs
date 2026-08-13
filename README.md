@@ -10,6 +10,7 @@ A format-neutral Rust workspace for reading, normalizing, and joining motorsport
 | Pi/Cosworth PDS | `.pds` | [`cosworth-telemetry`](crates/cosworth-telemetry) | Read |
 | MoTeC LD/LDX | `.ld` | [`motec-telemetry`](crates/motec-telemetry) | Read and write |
 | Racelogic VBOX | `.vbo` | [`racelogic-telemetry`](crates/racelogic-telemetry) | Read |
+| Native `.telemetry` | `.telemetry` | [`telemetry-format`](crates/telemetry-format) | Read and write; aligned STORE zip, FlatBuffers catalog first |
 
 [`motorsport-telemetry`](crates/motorsport-telemetry) is the unified facade.
 [`motorsport-telemetry-core`](crates/telemetry-core) defines the shared source,
@@ -22,6 +23,7 @@ does not decode video payloads:
 ```sh
 cargo run -p motorsport-telemetry -- recording.mp4
 cargo run -p motorsport-telemetry -- --json recording.mp4
+cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds
 ```
 
 ## Quick start
@@ -49,17 +51,51 @@ input, `Type::from_bytes(name, bytes)` for owned input, and `read_metadata` /
 signal roles and track context once, and lazily computes lap metadata at most
 once when lap progress needs that fallback.
 
-## Normalized model
+## Core channels
 
-The facade exposes source-exact values and explicit normalized roles:
+`TelemetryFile::normalizer().sample(time_ns)` is the stable way to read the
+driver-facing signals. Names are matched after stripping punctuation and case;
+units are converted only when the registry can do so honestly. Missing or
+incompatible inputs stay `None`.
 
-- speed in m/s
-- throttle and brake as fractions when the source unit supports truthful normalization
-- WGS84 longitude/latitude in degrees
-- lap number and lap progress
-- internal driver identity and stints
-- session-relative and file-relative clocks
-- source file, video file index, sync time, and MP4 presentation frame index when available
+| Role | `NormalizedSample` field | Unit | Typical source names |
+|---|---|---|---|
+| Speed | `speed_mps` | m/s | `Speed`, `Ground Speed`, `GPS Speed` |
+| Throttle | `throttle_fraction` | 0–1 | `Throttle Pos`, `Throttle Pedal` |
+| Brake | `brake_fraction` | 0–1 | `Brake Pedal Pos`, `Brake` |
+| Clutch | `clutch_fraction` | 0–1 | `Clutch Pos`, `Clutch Pedal` |
+| Steering | `steering_deg` | deg | `Steering Angle`, `SW Angle` |
+| Gear | `gear` | count | `Gear`, `Gear Pos` |
+| RPM | `rpm` | rpm | `RPM`, `Engine RPM` |
+| Lap number | `lap_number` | count | `Lap Number`, `Current Lap` |
+| Lap progress | `lap_progress` | 0–1 | see below |
+| Current lap time | `lap_time_s` | s | `Lap Time`, `Current Lap Time` |
+| Latitude | `latitude_deg` | deg | `GPS Latitude` |
+| Longitude | `longitude_deg` | deg | `GPS Longitude` |
+| Time of day | `time_of_day_ns` | ns since midnight | GPS/UTC clock, or VBOX time-of-day |
+| Absolute time | `absolute_time_ns` | ns on the source clock | same clock + file-relative time |
+
+Lap progress is the trickiest role. The normalizer tries, in order:
+
+1. A lap-distance or lap-progress channel (`Lap Distance Corrected`, `%` progress, …).
+2. GPS projected onto a matched track centerline.
+3. Time through the current derived lap (`(t - lap.start) / lap.duration`). That last step is what you get from speed and time when there is no GPS: first recover lap bounds, then treat the lap as a time interval.
+
+### How laps are recovered
+
+Vendor files almost never agree on lap identity. Readers feed the same
+heuristics in `read_source_metadata`:
+
+1. Authoritative source laps (MoTeC LDX, a `.telemetry` catalog).
+2. An incrementing counter. `Lap Number` is preferred when it actually counts
+   (high-water ≥ 2). A 0/1 flag loses to `beaconEventCount` / `lap_beacon`
+   counts. Shutdown resets are ignored.
+3. A running timer or progress channel that resets (`Current Lap Time`,
+   `Previous Lap Time` steps, `Lap Progression`).
+4. Otherwise no laps. We do not invent in/out from “first/last incomplete”.
+
+`.telemetry` stores the result in the header (`laps` plus the `valid_laps`
+scalar) so later `read_laps` / `read_valid_laps` do not scan samples.
 
 Unknown or incompatible inputs remain `None`; the library never guesses a unit or fabricates a frame.
 

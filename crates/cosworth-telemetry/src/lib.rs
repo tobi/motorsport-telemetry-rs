@@ -587,6 +587,17 @@ impl TelemetrySource for CosworthFile {
         &self.channels
     }
 
+    fn chunk_bytes(&self, channel_index: usize, chunk_index: usize) -> Option<&[u8]> {
+        let channel = self.channels.get(channel_index)?;
+        let chunk = channel.chunks.get(chunk_index)?;
+        let width = channel.sample_type.byte_width();
+        let start = usize::try_from(chunk.data_ptr).ok()?;
+        let len = usize::try_from(chunk.sample_count)
+            .ok()?
+            .checked_mul(width)?;
+        self.data.get(start..start.checked_add(len)?)
+    }
+
     #[inline]
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
         let channel = &self.channels[channel_index];

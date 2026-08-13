@@ -8,8 +8,9 @@ pub mod metadata;
 pub mod units;
 
 pub use metadata::{
-    driver_histogram, group_sessions, read_source_metadata, AbsoluteTimeRange, DriverStint,
-    FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, SourceLapMetadata, VideoReference,
+    driver_histogram, group_sessions, read_source_metadata, schema_hash, AbsoluteTimeRange,
+    DriverStint, FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, SourceLapMetadata,
+    VideoReference,
 };
 pub use units::{
     can_convert, convert, lookup as lookup_unit, normalize as normalize_unit, ConvertError,
@@ -233,6 +234,22 @@ pub trait TelemetrySource: Send + Sync {
     ///
     /// The three indexes must identify an existing channel, chunk, and sample.
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64;
+
+    /// Returns the packed native bytes of one chunk, when they are contiguous.
+    ///
+    /// The slice length must be `sample_count * sample_type.byte_width()`.
+    /// Sources that only expose decoded scalars return `None`.
+    fn chunk_bytes(&self, _channel_index: usize, _chunk_index: usize) -> Option<&[u8]> {
+        None
+    }
+
+    /// Returns the affine `(scale, bias)` applied after a native integer load.
+    ///
+    /// `decode ≈ raw * scale + bias`. Floating-point encodings and sources
+    /// that already store engineering values return `(1.0, 0.0)`.
+    fn sample_affine(&self, _channel_index: usize) -> (f64, f64) {
+        (1.0, 0.0)
+    }
 
     /// Returns the source's reliable absolute clock range, when available.
     fn absolute_time_range(&self) -> Option<AbsoluteTimeRange> {

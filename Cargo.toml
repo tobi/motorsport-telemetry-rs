@@ -8,6 +8,7 @@ members = [
     "crates/cosworth-telemetry",
     "crates/motec-telemetry",
     "crates/racelogic-telemetry",
+    "crates/telemetry-format",
 ]
 
 [workspace.package]
@@ -26,7 +27,9 @@ aim-telemetry = { version = "0.1.0", path = "crates/aim-telemetry" }
 cosworth-telemetry = { version = "0.1.0", path = "crates/cosworth-telemetry" }
 motec-telemetry = { version = "0.1.0", path = "crates/motec-telemetry" }
 racelogic-telemetry = { version = "0.1.0", path = "crates/racelogic-telemetry" }
+telemetry-format = { version = "0.1.0", path = "crates/telemetry-format" }
 memmap2 = "0.9"
+flatbuffers = "25.2.10"
 quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

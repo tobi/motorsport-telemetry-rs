@@ -59,6 +59,14 @@ fn matches_track_and_computes_gps_progress() {
 }
 
 #[test]
+fn vbo_sample_exposes_time_of_day() {
+    let file = open(fixture("synthetic_vbo.vbo")).unwrap();
+    let sample = file.normalizer().sample(0);
+    assert!(sample.time_of_day_ns.is_some());
+    assert!(sample.absolute_time_ns.is_some());
+}
+
+#[test]
 fn reusable_normalizer_uses_lap_metadata_fallback() {
     let file = open(fixture("synthetic_cosworth.pds")).unwrap();
     let normalizer = TelemetryNormalizer::new(&file, file.signal_roles(), None);

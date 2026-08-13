@@ -1,0 +1,84 @@
+// Catalog stored as the first zip member `metadata.fb`.
+// Channel samples are NOT in this buffer; they are zip members named
+// `channels/NNNN.bin` (and optional `channels/NNNN.time.bin` for event series).
+
+namespace telemetry;
+
+table Chunk {
+  sample_period_ns:uint64;
+  sample_count:uint64;
+  sample_base:uint64;
+  time_base_ns:uint64;
+}
+
+table Channel {
+  id:uint32;
+  name:string;
+  member:string;
+  time_member:string;
+  unit_raw:string;
+  unit_canonical:string;
+  unit_source:uint8;
+  dimension:uint8;
+  sample_type:uint8;
+  scale:float64 = 1.0;
+  bias:float64 = 0.0;
+  uses_step:bool;
+  sample_count:uint64;
+  duration_ns:uint64;
+  kind:uint8;
+  chunks:[Chunk];
+}
+
+table Lap {
+  number:int64;
+  start_ns:uint64;
+  end_ns:uint64;
+  duration_ns:uint64;
+  lap_type:uint8;
+  first_video_frame:uint64 = 0;
+}
+
+table Driver {
+  id:int64;
+  canonical_name:string;
+  name_override:string;
+}
+
+table VideoFile {
+  filename:string;
+  blake3:[ubyte];
+  frame_count:uint64;
+  presentation_offset_ns:int64;
+}
+
+table Identity {
+  driver:string;
+  vehicle:string;
+  venue:string;
+  event:string;
+  session:string;
+  date:string;
+  time:string;
+}
+
+table Recording {
+  schema_version:uint16;
+  identity:Identity;
+  drivers:[Driver];
+  laps:[Lap];
+  channels:[Channel];
+  videos:[VideoFile];
+  source_format:string;
+  source_path:string;
+  schema_hash:uint64;
+  duration_ns:uint64;
+  sample_count:uint64;
+  channel_count:uint32;
+  sampled_channel_count:uint32;
+  valid_laps:uint32;
+  comment:string;
+  session_hint:string;
+}
+
+root_type Recording;

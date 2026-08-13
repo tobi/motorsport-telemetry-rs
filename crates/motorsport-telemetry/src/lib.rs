@@ -12,6 +12,7 @@ use motorsport_track_atlas::{match_track, TrackMatch};
 use racelogic_telemetry::RacelogicFile;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use telemetry_format::NativeRecording;
 use thiserror::Error;
 
 pub use motorsport_telemetry_core;
@@ -35,6 +36,9 @@ pub enum TelemetryError {
     /// The Racelogic VBOX parser rejected the input.
     #[error(transparent)]
     Racelogic(#[from] racelogic_telemetry::RacelogicError),
+    /// The native `.telemetry` parser rejected the input.
+    #[error(transparent)]
+    Telemetry(#[from] telemetry_format::TelemetryFormatError),
 }
 
 /// An opened telemetry file backed by one of the supported format readers.
@@ -51,13 +55,15 @@ pub enum TelemetryFile {
     Motec(MotecFile),
     /// Racelogic VBOX VBO telemetry.
     Racelogic(RacelogicFile),
+    /// Native `.telemetry` recording.
+    Native(NativeRecording),
 }
 
 /// Opens a native telemetry file using its case-insensitive extension.
 ///
-/// Supported extensions are `.mp4`, `.pds`, `.ld`, and `.vbo`. This function
-/// selects a parser by extension; the selected parser still validates the file
-/// contents.
+/// Supported extensions are `.mp4`, `.pds`, `.ld`, `.vbo`, and `.telemetry`.
+/// This function selects a parser by extension; the selected parser still
+/// validates the file contents.
 pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
     let path = path.as_ref();
     match path
@@ -71,6 +77,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
         "pds" => Ok(TelemetryFile::Cosworth(CosworthFile::open(path)?)),
         "ld" => Ok(TelemetryFile::Motec(MotecFile::open(path)?)),
         "vbo" => Ok(TelemetryFile::Racelogic(RacelogicFile::open(path)?)),
+        "telemetry" => Ok(TelemetryFile::Native(NativeRecording::open(path)?)),
         _ => Err(TelemetryError::Unsupported(path.display().to_string())),
     }
 }
@@ -96,6 +103,7 @@ pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryE
         "vbo" => Ok(TelemetryFile::Racelogic(RacelogicFile::open_metadata(
             path,
         )?)),
+        "telemetry" => Ok(TelemetryFile::Native(NativeRecording::open(path)?)),
         _ => Err(TelemetryError::Unsupported(path.display().to_string())),
     }
 }
@@ -109,7 +117,38 @@ pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryE
 pub fn read_lap_metadata(
     path: impl AsRef<Path>,
 ) -> Result<Vec<motorsport_telemetry_core::LapMetadata>, TelemetryError> {
+    if is_telemetry(path.as_ref()) {
+        return Ok(telemetry_format::read_laps(path)?);
+    }
     Ok(open_metadata(path)?.metadata().laps)
+}
+
+/// Returns the number of complete flying laps.
+///
+/// For `.telemetry` this is a header scalar and does not scan samples.
+pub fn read_valid_laps(path: impl AsRef<Path>) -> Result<u32, TelemetryError> {
+    if is_telemetry(path.as_ref()) {
+        return Ok(telemetry_format::read_valid_laps(path)?);
+    }
+    Ok(open_metadata(path)?.metadata().valid_laps)
+}
+
+/// Format-neutral file summary.
+///
+/// For `.telemetry` this reads only `metadata.fb`.
+pub fn read_metadata(
+    path: impl AsRef<Path>,
+) -> Result<motorsport_telemetry_core::FileMetadata, TelemetryError> {
+    if is_telemetry(path.as_ref()) {
+        return Ok(telemetry_format::read_metadata(path)?);
+    }
+    Ok(open_metadata(path)?.metadata())
+}
+
+fn is_telemetry(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("telemetry"))
 }
 
 macro_rules! delegate {
@@ -119,6 +158,7 @@ macro_rules! delegate {
             TelemetryFile::Cosworth($source) => $body,
             TelemetryFile::Motec($source) => $body,
             TelemetryFile::Racelogic($source) => $body,
+            TelemetryFile::Native($source) => $body,
         }
     };
 }
@@ -137,6 +177,14 @@ impl TelemetrySource for TelemetryFile {
 
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
         delegate!(self, source => source.decode(channel_index, chunk_index, local_index))
+    }
+
+    fn chunk_bytes(&self, channel_index: usize, chunk_index: usize) -> Option<&[u8]> {
+        delegate!(self, source => source.chunk_bytes(channel_index, chunk_index))
+    }
+
+    fn sample_affine(&self, channel_index: usize) -> (f64, f64) {
+        delegate!(self, source => source.sample_affine(channel_index))
     }
 
     fn sample_time_ns(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> u64 {
@@ -184,14 +232,24 @@ impl TelemetrySource for TelemetryFile {
 pub struct SignalRoles {
     /// Vehicle or ground speed channel.
     pub speed: Option<usize>,
-    /// Driver throttle channel.
+    /// Driver throttle pedal channel.
     pub throttle: Option<usize>,
-    /// Driver brake channel.
+    /// Driver brake pedal channel.
     pub brake: Option<usize>,
+    /// Driver clutch pedal channel.
+    pub clutch: Option<usize>,
+    /// Handwheel / steering-angle channel.
+    pub steering: Option<usize>,
+    /// Selected gear channel.
+    pub gear: Option<usize>,
+    /// Engine speed channel.
+    pub rpm: Option<usize>,
     /// Distance or progress within the current lap.
     pub lap_distance: Option<usize>,
     /// Current lap counter.
     pub lap_number: Option<usize>,
+    /// Running or current lap-time channel.
+    pub lap_time: Option<usize>,
     /// WGS84 latitude channel.
     pub latitude: Option<usize>,
     /// WGS84 longitude channel.
@@ -206,24 +264,41 @@ pub struct SignalRoles {
 pub struct NormalizedSample {
     /// Speed in metres per second.
     pub speed_mps: Option<f64>,
-    /// Throttle position in the inclusive range `0.0..=1.0`.
+    /// Throttle pedal in the inclusive range `0.0..=1.0`.
     pub throttle_fraction: Option<f64>,
-    /// Brake position in the inclusive range `0.0..=1.0`.
+    /// Brake pedal in the inclusive range `0.0..=1.0`.
     pub brake_fraction: Option<f64>,
+    /// Clutch pedal in the inclusive range `0.0..=1.0`.
+    pub clutch_fraction: Option<f64>,
+    /// Steering wheel angle in degrees (positive as the source reports).
+    pub steering_deg: Option<f64>,
+    /// Selected gear as an integer.
+    pub gear: Option<i64>,
+    /// Engine speed in revolutions per minute.
+    pub rpm: Option<f64>,
     /// Source lap number rounded to an integer.
     pub lap_number: Option<i64>,
     /// Progress through the current lap in the range `0.0..=1.0`.
     pub lap_progress: Option<f64>,
+    /// Current lap time in seconds.
+    pub lap_time_s: Option<f64>,
     /// WGS84 latitude in degrees.
     pub latitude_deg: Option<f64>,
     /// WGS84 longitude in degrees.
     pub longitude_deg: Option<f64>,
+    /// Time of day in nanoseconds since local midnight, when a clock exists.
+    pub time_of_day_ns: Option<u64>,
+    /// Absolute clock nanoseconds (`file_relative + clock_offset`), when known.
+    pub absolute_time_ns: Option<u64>,
 }
 
 impl TelemetryFile {
     /// Derives the format-neutral metadata summary for this file.
     pub fn metadata(&self) -> FileMetadata {
-        read_source_metadata(self)
+        match self {
+            Self::Native(file) => file.metadata(),
+            _ => read_source_metadata(self),
+        }
     }
 
     /// Infers normalized roles from known source channel names.
@@ -284,6 +359,7 @@ pub struct TelemetryNormalizer<'a> {
     roles: SignalRoles,
     track: Option<TrackContext>,
     laps: OnceLock<Vec<motorsport_telemetry_core::LapMetadata>>,
+    clock: OnceLock<Option<(i128, String)>>,
 }
 
 impl<'a> TelemetryNormalizer<'a> {
@@ -294,6 +370,7 @@ impl<'a> TelemetryNormalizer<'a> {
             roles,
             track,
             laps: OnceLock::new(),
+            clock: OnceLock::new(),
         }
     }
 
@@ -315,11 +392,22 @@ impl<'a> TelemetryNormalizer<'a> {
             &self.roles,
             self.track.as_ref(),
             || {
-                let laps = self.laps.get_or_init(|| self.source.metadata().laps);
+                let laps = self
+                    .laps
+                    .get_or_init(|| self.source.metadata().laps.clone());
                 lap_progress_from_metadata(laps, time_ns)
             },
+            self.clock.get_or_init(|| file_clock(self.source)).as_ref(),
         )
     }
+}
+
+fn file_clock(source: &TelemetryFile) -> Option<(i128, String)> {
+    if let Some(range) = source.absolute_time_range() {
+        return Some((i128::from(range.start_ns), range.clock));
+    }
+    let metadata = source.metadata();
+    Some((metadata.clock_offset_ns?, metadata.absolute_clock?))
 }
 
 fn normalize_sample(
@@ -328,6 +416,7 @@ fn normalize_sample(
     roles: &SignalRoles,
     track: Option<&TrackContext>,
     lap_fallback: impl FnOnce() -> Option<f64>,
+    clock: Option<&(i128, String)>,
 ) -> NormalizedSample {
     let value = |index: Option<usize>, linear| {
         index
@@ -344,15 +433,26 @@ fn normalize_sample(
     let brake_fraction = roles.brake.and_then(|index| {
         normalize_fraction(value(Some(index), true)?, &source.channels()[index].unit)
     });
+    let clutch_fraction = roles.clutch.and_then(|index| {
+        normalize_fraction(value(Some(index), true)?, &source.channels()[index].unit)
+    });
+    let steering_deg = roles.steering.and_then(|index| {
+        normalize_angle_deg(value(Some(index), true)?, &source.channels()[index].unit)
+    });
+    let gear = value(roles.gear, false).map(|value| value.round() as i64);
+    let rpm = roles.rpm.and_then(|index| {
+        normalize_rpm(value(Some(index), false)?, &source.channels()[index].unit)
+    });
     let latitude_deg = roles.latitude.and_then(|index| {
         normalize_coordinate(value(Some(index), true)?, &source.channels()[index].unit)
     });
     let longitude_deg = roles.longitude.and_then(|index| {
         normalize_coordinate(value(Some(index), true)?, &source.channels()[index].unit)
     });
-    let lap_number = value(roles.lap_number, false)
-        .filter(|value| value.is_finite())
-        .map(|value| value.round() as i64);
+    let lap_number = value(roles.lap_number, false).map(|value| value.round() as i64);
+    let lap_time_s = roles.lap_time.and_then(|index| {
+        normalize_duration_s(value(Some(index), true)?, &source.channels()[index].unit)
+    });
     let lap_progress = roles
         .lap_distance
         .and_then(|index| {
@@ -365,14 +465,33 @@ fn normalize_sample(
                 .and_then(|(lat, lon)| track.and_then(|track| track.progress(lat, lon)))
         })
         .or_else(lap_fallback);
+    let (absolute_time_ns, time_of_day_ns) = match clock {
+        Some((offset, name)) => {
+            let absolute = u64::try_from(i128::from(time_ns) + *offset).ok();
+            let tod = if name == "time_of_day" {
+                absolute
+            } else {
+                absolute.map(|value| value % 86_400_000_000_000)
+            };
+            (absolute, tod)
+        }
+        None => (None, None),
+    };
     NormalizedSample {
         speed_mps,
         throttle_fraction,
         brake_fraction,
+        clutch_fraction,
+        steering_deg,
+        gear,
+        rpm,
         lap_number,
         lap_progress,
+        lap_time_s,
         latitude_deg,
         longitude_deg,
+        time_of_day_ns,
+        absolute_time_ns,
     }
 }
 
@@ -590,12 +709,30 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
             channels,
             &[
                 "brakepedalpos",
+                "brakepedal",
                 "driverbrakepressure",
                 "brakepressure",
                 "pbrakefront",
                 "brake",
             ],
         ),
+        clutch: find(
+            channels,
+            &["clutchpos", "clutchpedal", "clutchpedalpos", "clutch"],
+        ),
+        steering: find(
+            channels,
+            &[
+                "steeringangle",
+                "steerangle",
+                "steeringpos",
+                "handwheelangle",
+                "swangle",
+                "steering",
+            ],
+        ),
+        gear: find(channels, &["gearpos", "selectedgear", "ngear", "gear"]),
+        rpm: find(channels, &["enginerpm", "engspeed", "rpm", "nmot"]),
         lap_distance: find(
             channels,
             &[
@@ -619,6 +756,15 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
                 "lapcounter",
                 "currentlap",
                 "lap",
+            ],
+        ),
+        lap_time: find(
+            channels,
+            &[
+                "currentlaptime",
+                "lapcurrentlaptime",
+                "laptimerunning",
+                "laptime",
             ],
         ),
         latitude: find(channels, &["gpslatitude", "latitude", "gpslat", "lat"]),
@@ -674,6 +820,31 @@ fn normalize_coordinate(value: f64, unit: &str) -> Option<f64> {
         "min" | "arcmin" | "arcminute" => Some(value / 60.0),
         _ => None,
     }
+}
+
+fn normalize_angle_deg(value: f64, unit: &str) -> Option<f64> {
+    if unit.is_empty() {
+        return None;
+    }
+    motorsport_telemetry_core::convert(value, unit, "deg")
+        .ok()
+        .or_else(|| normalize_coordinate(value, unit))
+}
+
+fn normalize_rpm(value: f64, unit: &str) -> Option<f64> {
+    if unit.is_empty() {
+        return None;
+    }
+    motorsport_telemetry_core::convert(value, unit, "rpm")
+        .ok()
+        .or_else(|| motorsport_telemetry_core::convert(value, unit, "1/min").ok())
+}
+
+fn normalize_duration_s(value: f64, unit: &str) -> Option<f64> {
+    if unit.is_empty() {
+        return None;
+    }
+    motorsport_telemetry_core::convert(value, unit, "s").ok()
 }
 
 fn normalize_lap_distance(value: f64, unit: &str, track: Option<&TrackContext>) -> Option<f64> {

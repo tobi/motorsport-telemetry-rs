@@ -1,0 +1,27 @@
+[package]
+name = "telemetry-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native .telemetry zip format: FlatBuffers catalog and lossless channel columns"
+readme = "README.md"
+
+[dependencies]
+blake3.workspace = true
+flatbuffers.workspace = true
+memmap2.workspace = true
+motorsport-telemetry-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+cosworth-telemetry.workspace = true
+motec-telemetry.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "telemetry_format"

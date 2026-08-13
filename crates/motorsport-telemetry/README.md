@@ -1,6 +1,6 @@
 # motorsport-telemetry
 
-Unified facade over AiM MP4, Cosworth PDS, MoTeC LD, and Racelogic VBO.
+Unified facade over AiM MP4, Cosworth PDS, MoTeC LD, Racelogic VBO, and native `.telemetry`.
 
 It exposes format detection, source-exact channels, normalized signal roles,
 laps, driver stints, multi-file sessions, video references, WGS84 GPS, track
@@ -12,6 +12,7 @@ matching, and invariant lap progress.
 | `.pds` | Pi/Cosworth PDS |
 | `.ld` | MoTeC LD |
 | `.vbo` | Racelogic VBOX |
+| `.telemetry` | Native aligned STORE zip |
 
 Selection is case-insensitive and based on the extension. A recognized
 extension with invalid contents returns the underlying parser error.

@@ -413,6 +413,28 @@ impl TelemetrySource for MotecFile {
             .filter(|metadata| !metadata.laps.is_empty())
     }
 
+    fn chunk_bytes(&self, channel_index: usize, chunk_index: usize) -> Option<&[u8]> {
+        let channel = self.channels.get(channel_index)?;
+        let chunk = channel.chunks.get(chunk_index)?;
+        let width = self.encodings.get(channel_index)?.width;
+        let start = usize::try_from(chunk.data_ptr).ok()?;
+        let len = usize::try_from(chunk.sample_count)
+            .ok()?
+            .checked_mul(width)?;
+        self.data.get(start..start.checked_add(len)?)
+    }
+
+    fn sample_affine(&self, channel_index: usize) -> (f64, f64) {
+        let Some(encoding) = self.encodings.get(channel_index) else {
+            return (1.0, 0.0);
+        };
+        if encoding.datatype_a == 0x07 || encoding.datatype_a == 0x08 {
+            (1.0, 0.0)
+        } else {
+            (encoding.factor, encoding.offset)
+        }
+    }
+
     fn decode(&self, channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
         let channel = &self.channels[channel_index];
         let encoding = &self.encodings[channel_index];

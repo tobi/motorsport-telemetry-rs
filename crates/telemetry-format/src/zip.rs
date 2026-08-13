@@ -1,0 +1,303 @@
+//! Aligned STORE zip profile used by `.telemetry` files.
+
+use std::io::{Read, Seek, Write};
+
+const LOCAL_SIG: u32 = 0x0403_4b50;
+const CENTRAL_SIG: u32 = 0x0201_4b50;
+const EOCD_SIG: u32 = 0x0605_4b50;
+const ZIP64_EXTRA: u16 = 0x0001;
+const ALIGN: u64 = 64;
+
+#[derive(Debug)]
+pub(crate) struct ZipError(pub String);
+
+#[derive(Debug, Clone)]
+pub(crate) struct Member {
+    pub name: String,
+    pub offset: u64,
+    pub size: u64,
+}
+
+pub(crate) struct ZipWriter<W> {
+    inner: W,
+    entries: Vec<(String, u64, u64, u32)>,
+}
+
+impl<W: Write + Seek> ZipWriter<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            entries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn write_member(&mut self, name: &str, data: &[u8]) -> Result<u64, ZipError> {
+        let start = self.inner.stream_position().map_err(io)?;
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > u16::MAX as usize {
+            return Err(ZipError("member name too long".into()));
+        }
+        let zip64 = start > u32::MAX as u64 || data.len() as u64 > u32::MAX as u64;
+        let mut extra = Vec::new();
+        if zip64 {
+            extra.extend_from_slice(&ZIP64_EXTRA.to_le_bytes());
+            extra.extend_from_slice(&16u16.to_le_bytes());
+            extra.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            extra.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        }
+        let header = 30u64 + name_bytes.len() as u64;
+        let mut extra_len = extra.len() as u64;
+        let pad = (ALIGN - (start + header + extra_len) % ALIGN) % ALIGN;
+        if pad > 0 && pad < 4 {
+            extra_len += pad + ALIGN;
+        } else {
+            extra_len += pad;
+        }
+        extra.resize(extra_len as usize, 0);
+
+        let crc = crc32(data);
+        let version = if zip64 { 45u16 } else { 20 };
+        let stored32 = if zip64 { u32::MAX } else { data.len() as u32 };
+
+        self.inner.write_all(&LOCAL_SIG.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&version.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&crc.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&stored32.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&stored32.to_le_bytes()).map_err(io)?;
+        self.inner
+            .write_all(&(name_bytes.len() as u16).to_le_bytes())
+            .map_err(io)?;
+        self.inner
+            .write_all(&(extra.len() as u16).to_le_bytes())
+            .map_err(io)?;
+        self.inner.write_all(name_bytes).map_err(io)?;
+        self.inner.write_all(&extra).map_err(io)?;
+        let data_off = self.inner.stream_position().map_err(io)?;
+        if data_off % ALIGN != 0 {
+            return Err(ZipError(format!(
+                "payload for {name} is not {ALIGN}-byte aligned"
+            )));
+        }
+        self.inner.write_all(data).map_err(io)?;
+        self.entries
+            .push((name.to_owned(), start, data.len() as u64, crc));
+        Ok(data_off)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<W, ZipError> {
+        let cd_start = self.inner.stream_position().map_err(io)?;
+        for (name, offset, size, crc) in &self.entries {
+            let name_bytes = name.as_bytes();
+            let zip64 = *offset > u32::MAX as u64 || *size > u32::MAX as u64;
+            let mut extra = Vec::new();
+            if zip64 {
+                extra.extend_from_slice(&ZIP64_EXTRA.to_le_bytes());
+                extra.extend_from_slice(&24u16.to_le_bytes());
+                extra.extend_from_slice(&size.to_le_bytes());
+                extra.extend_from_slice(&size.to_le_bytes());
+                extra.extend_from_slice(&offset.to_le_bytes());
+            }
+            let version = if zip64 { 45u16 } else { 20 };
+            let size32 = if zip64 { u32::MAX } else { *size as u32 };
+            let off32 = if zip64 { u32::MAX } else { *offset as u32 };
+            self.inner
+                .write_all(&CENTRAL_SIG.to_le_bytes())
+                .map_err(io)?;
+            self.inner.write_all(&version.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&version.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&crc.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&size32.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&size32.to_le_bytes()).map_err(io)?;
+            self.inner
+                .write_all(&(name_bytes.len() as u16).to_le_bytes())
+                .map_err(io)?;
+            self.inner
+                .write_all(&(extra.len() as u16).to_le_bytes())
+                .map_err(io)?;
+            self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&0u32.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(&off32.to_le_bytes()).map_err(io)?;
+            self.inner.write_all(name_bytes).map_err(io)?;
+            self.inner.write_all(&extra).map_err(io)?;
+        }
+        let cd_size = self.inner.stream_position().map_err(io)? - cd_start;
+        let count = u16::try_from(self.entries.len()).unwrap_or(u16::MAX);
+        self.inner.write_all(&EOCD_SIG.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&count.to_le_bytes()).map_err(io)?;
+        self.inner.write_all(&count.to_le_bytes()).map_err(io)?;
+        self.inner
+            .write_all(&(cd_size as u32).to_le_bytes())
+            .map_err(io)?;
+        self.inner
+            .write_all(&(cd_start as u32).to_le_bytes())
+            .map_err(io)?;
+        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        Ok(self.inner)
+    }
+}
+
+pub(crate) fn parse_members(data: &[u8]) -> Result<Vec<Member>, ZipError> {
+    let mut members = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + 4 <= data.len() {
+        let sig = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+        if sig != LOCAL_SIG {
+            break;
+        }
+        let (member, next) = parse_local(data, cursor)?;
+        members.push(member);
+        cursor = next;
+    }
+    if members.is_empty() {
+        return Err(ZipError("no zip members".into()));
+    }
+    if members[0].name != "metadata.fb" {
+        return Err(ZipError("first member must be metadata.fb".into()));
+    }
+    Ok(members)
+}
+
+/// Reads only the first STORE member. Independent of archive length.
+pub(crate) fn read_first_member(reader: &mut impl Read) -> Result<(String, Vec<u8>), ZipError> {
+    let mut header = [0u8; 30];
+    reader.read_exact(&mut header).map_err(io)?;
+    let sig = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    if sig != LOCAL_SIG {
+        return Err(ZipError("not a zip local header".into()));
+    }
+    let method = u16::from_le_bytes(header[8..10].try_into().unwrap());
+    if method != 0 {
+        return Err(ZipError("only STORE zip members are allowed".into()));
+    }
+    let name_len = u16::from_le_bytes(header[26..28].try_into().unwrap()) as usize;
+    let extra_len = u16::from_le_bytes(header[28..30].try_into().unwrap()) as usize;
+    let mut name = vec![0u8; name_len];
+    reader.read_exact(&mut name).map_err(io)?;
+    let mut extra = vec![0u8; extra_len];
+    reader.read_exact(&mut extra).map_err(io)?;
+    let mut size = u32::from_le_bytes(header[22..26].try_into().unwrap()) as u64;
+    if size == u32::MAX as u64 {
+        size = zip64_size(&extra)?;
+    }
+    let mut data =
+        vec![0u8; usize::try_from(size).map_err(|_| ZipError("member too large".into()))?];
+    reader.read_exact(&mut data).map_err(io)?;
+    let name = String::from_utf8(name).map_err(|_| ZipError("member name is not utf-8".into()))?;
+    Ok((name, data))
+}
+
+fn parse_local(data: &[u8], at: usize) -> Result<(Member, usize), ZipError> {
+    if at + 30 > data.len() {
+        return Err(ZipError("truncated local header".into()));
+    }
+    let method = u16::from_le_bytes(data[at + 8..at + 10].try_into().unwrap());
+    if method != 0 {
+        return Err(ZipError("only STORE zip members are allowed".into()));
+    }
+    let name_len = u16::from_le_bytes(data[at + 26..at + 28].try_into().unwrap()) as usize;
+    let extra_len = u16::from_le_bytes(data[at + 28..at + 30].try_into().unwrap()) as usize;
+    let name_at = at + 30;
+    let extra_at = name_at + name_len;
+    let data_at = extra_at + extra_len;
+    if data_at > data.len() {
+        return Err(ZipError("truncated zip member header".into()));
+    }
+    let mut size = u32::from_le_bytes(data[at + 22..at + 26].try_into().unwrap()) as u64;
+    if size == u32::MAX as u64 {
+        size = zip64_size(&data[extra_at..data_at])?;
+    }
+    let end = data_at
+        .checked_add(usize::try_from(size).map_err(|_| ZipError("member too large".into()))?)
+        .ok_or_else(|| ZipError("member overflow".into()))?;
+    if end > data.len() {
+        return Err(ZipError("truncated zip member data".into()));
+    }
+    if data_at as u64 % ALIGN != 0 {
+        return Err(ZipError("zip payload is not 64-byte aligned".into()));
+    }
+    let name = std::str::from_utf8(&data[name_at..extra_at])
+        .map_err(|_| ZipError("member name is not utf-8".into()))?
+        .to_owned();
+    Ok((
+        Member {
+            name,
+            offset: data_at as u64,
+            size,
+        },
+        end,
+    ))
+}
+
+fn zip64_size(extra: &[u8]) -> Result<u64, ZipError> {
+    let mut cursor = 0;
+    while cursor + 4 <= extra.len() {
+        let tag = u16::from_le_bytes(extra[cursor..cursor + 2].try_into().unwrap());
+        let len = u16::from_le_bytes(extra[cursor + 2..cursor + 4].try_into().unwrap()) as usize;
+        let start = cursor + 4;
+        let end = start.saturating_add(len);
+        if end > extra.len() {
+            break;
+        }
+        if tag == ZIP64_EXTRA && len >= 8 {
+            return Ok(u64::from_le_bytes(
+                extra[start..start + 8].try_into().unwrap(),
+            ));
+        }
+        cursor = end;
+    }
+    Err(ZipError("missing zip64 size".into()))
+}
+
+fn io(err: std::io::Error) -> ZipError {
+    ZipError(err.to_string())
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn first_member_is_aligned_metadata() {
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(&mut cursor);
+        writer.write_member("metadata.fb", b"hello").unwrap();
+        writer
+            .write_member("channels/0000.bin", &[1, 2, 3, 4])
+            .unwrap();
+        writer.finish().unwrap();
+        let bytes = cursor.into_inner();
+        let members = parse_members(&bytes).unwrap();
+        assert_eq!(members[0].name, "metadata.fb");
+        assert_eq!(members[0].offset % 64, 0);
+        assert_eq!(members[1].offset % 64, 0);
+        let mut reader = Cursor::new(bytes);
+        let (name, data) = read_first_member(&mut reader).unwrap();
+        assert_eq!(name, "metadata.fb");
+        assert_eq!(data, b"hello");
+    }
+}
