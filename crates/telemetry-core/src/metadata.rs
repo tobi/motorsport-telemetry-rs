@@ -132,6 +132,17 @@ pub struct FileMetadata {
     pub absolute_end_ns: Option<u64>,
     /// Offset satisfying `absolute_ns = file_relative_ns + clock_offset_ns`.
     pub clock_offset_ns: Option<i128>,
+    /// Unix-epoch nanoseconds (UTC) at file `t = 0`.
+    ///
+    /// `utc_epoch_ns = file_relative_ns + utc_start_ns`. Absent when the
+    /// source never stored a UTC-based clock. Do not invent this from civil
+    /// `date`/`time` strings alone.
+    pub utc_start_ns: Option<u64>,
+    /// IANA timezone of the venue, e.g. `America/New_York`.
+    ///
+    /// Empty when unknown. Used to format a civil wall time from
+    /// [`Self::utc_start_ns`]. Never used as a join key.
+    pub timezone: String,
     /// Human-readable identity embedded in the source.
     pub identity: SourceIdentity,
     /// Distinct internal driver identifiers in ascending order.
@@ -673,6 +684,8 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         absolute_start_ns,
         absolute_end_ns,
         clock_offset_ns,
+        utc_start_ns: None,
+        timezone: String::new(),
         identity: source.identity(),
         driver_ids,
         driver_stints,

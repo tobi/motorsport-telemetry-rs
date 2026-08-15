@@ -425,6 +425,14 @@ impl TelemetrySource for NativeRecording {
     fn absolute_time_range(&self) -> Option<motorsport_telemetry_core::AbsoluteTimeRange> {
         self.catalog.clock.clone()
     }
+
+    fn utc_start_ns(&self) -> Option<u64> {
+        self.catalog.utc_start_ns
+    }
+
+    fn timezone(&self) -> String {
+        self.catalog.timezone.clone()
+    }
 }
 
 fn default_dense_sample_at(

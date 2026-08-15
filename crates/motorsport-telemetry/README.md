@@ -13,6 +13,8 @@ matching, and invariant lap progress.
 | `.ld` | MoTeC LD |
 | `.vbo` | Racelogic VBOX |
 | `.telemetry` | Native aligned STORE zip |
+| `.telemetry.jsonl` / `.jsonl` / `.mtj` | Time-aligned MTJ interchange ([JSONL.md](../telemetry-format/JSONL.md)) |
+| `.telemetry.jsonl.zstd` / `.zst` | Same document, one zstd frame |
 
 Selection is case-insensitive and based on the extension. A recognized
 extension with invalid contents returns the underlying parser error.

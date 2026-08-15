@@ -12,7 +12,8 @@ assert_eq!(matched.layout.length_m, Some(6514.0));
 
 Each layout exposes official length, direction, embedded centerline GeoJSON,
 point layers such as corners/start-finish/pit markers, and range layers such as
-timing sectors and complexes.
+timing sectors and complexes. Each facility also carries its IANA timezone
+(`timezone_for_venue("Sebring")` → `America/New_York`).
 
 The dataset is committed and generated before publication, so crate builds are
 offline and reproducible. Refresh it explicitly with:

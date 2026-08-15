@@ -89,6 +89,10 @@ fn write_to(
         .as_deref()
         .and_then(|key| key.rsplit_once(':').map(|(hint, _)| hint.to_owned()))
         .unwrap_or_default();
+    let timezone = crate::placement::resolve_timezone(source);
+    let utc_start_ns = source
+        .utc_start_ns()
+        .or_else(|| crate::placement::utc_from_metadata(&metadata, &timezone));
     let mut catalog = Catalog {
         format_version,
         identity: metadata.identity.clone(),
@@ -105,6 +109,8 @@ fn write_to(
         session_hint,
         comment: String::new(),
         clock: source.absolute_time_range(),
+        utc_start_ns,
+        timezone,
         driver_stints: metadata.driver_stints.clone(),
         videos: {
             let mut videos = hash_videos(source);

@@ -25,7 +25,8 @@ format-specific parser.
 
 `read_source_metadata(&source)` returns a format-neutral `FileMetadata`
 summary: counts, schema hash, internal driver IDs/stints, lap fragments,
-fastest complete lap, absolute clock range/session candidate key, and video
+fastest complete lap, absolute clock range/session candidate key, UTC
+start-of-file / IANA timezone when a later writer stamped them, and video
 frame count when available.
 
 `TelemetrySource::source_lap_metadata()` is only an optional native/sidecar

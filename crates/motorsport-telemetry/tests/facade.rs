@@ -3,7 +3,7 @@ use motorsport_telemetry::{
     read_lap_metadata, TelemetryNormalizer,
 };
 use std::path::PathBuf;
-use telemetry_format::write_from_source;
+use telemetry_format::{write_from_source, write_jsonl_from_source};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -142,4 +142,165 @@ fn telemetry_round_trip_preserves_aimd_video_timeline() {
             "video ref at {t} ns"
         );
     }
+}
+
+#[test]
+fn jsonl_round_trip_is_time_aligned() {
+    let source = open(fixture("synthetic_cosworth.pds")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("synthetic_cosworth.telemetry.jsonl");
+    write_jsonl_from_source(&source, &dest).unwrap();
+    let opened = open(&dest).unwrap();
+
+    assert_eq!(opened.format(), "pds");
+    assert_eq!(
+        motorsport_telemetry::JSONL_VERSION,
+        telemetry_format::JSONL_VERSION
+    );
+    assert!(!opened.channels().is_empty());
+    let metadata = opened.metadata();
+    assert_eq!(metadata.laps, source.metadata().laps);
+    for (index, channel) in opened.channels().iter().enumerate() {
+        let period = channel.first_period_ns().unwrap();
+        assert!(period > 0, "{}", channel.name);
+        assert_eq!(
+            opened.sample_time_ns(index, 0, 0),
+            channel.chunks[0].time_base_ns
+        );
+        if channel.sample_count > 1 {
+            assert_eq!(
+                opened.sample_time_ns(index, 0, 1),
+                channel.chunks[0].time_base_ns + period
+            );
+        }
+        let original = source
+            .channels()
+            .iter()
+            .position(|candidate| candidate.name == channel.name)
+            .unwrap();
+        assert_eq!(
+            opened.decode(index, 0, 0),
+            source.decode(original, 0, 0),
+            "{}",
+            channel.name
+        );
+    }
+
+    let zstd = dir.path().join("synthetic_cosworth.telemetry.jsonl.zstd");
+    write_jsonl_from_source(&source, &zstd).unwrap();
+    let compressed = open(&zstd).unwrap();
+    assert_eq!(
+        &std::fs::read(&zstd).unwrap()[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD]
+    );
+    assert_eq!(compressed.channels().len(), opened.channels().len());
+    for (index, channel) in opened.channels().iter().enumerate() {
+        assert_eq!(channel.name, compressed.channels()[index].name);
+        assert_eq!(
+            channel.sample_count,
+            compressed.channels()[index].sample_count
+        );
+        for local in 0..channel.sample_count {
+            assert_eq!(
+                opened.decode(index, 0, local).to_bits(),
+                compressed.decode(index, 0, local).to_bits(),
+                "{}[{local}]",
+                channel.name
+            );
+        }
+    }
+}
+
+#[test]
+fn jsonl_is_not_a_bit_copy_of_native_float32() {
+    let source = open(fixture("synthetic_motec.ld")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("synthetic_motec.telemetry.jsonl");
+    write_jsonl_from_source(&source, &dest).unwrap();
+    let jsonl = open(&dest).unwrap();
+
+    let index = source
+        .channels()
+        .iter()
+        .position(|channel| channel.name == "G_FORCE_LAT")
+        .unwrap();
+    let native = source.decode(index, 0, 1);
+    let stored = jsonl
+        .channels()
+        .iter()
+        .position(|channel| channel.name == "G_FORCE_LAT")
+        .map(|index| jsonl.decode(index, 0, 1))
+        .unwrap();
+    assert_eq!(native, f64::from(0.2f32));
+    assert_eq!(stored, 0.2);
+    assert_ne!(
+        native.to_bits(),
+        stored.to_bits(),
+        "JSON 0.2 is not the promoted f32 bit pattern"
+    );
+}
+
+#[test]
+fn jsonl_and_zstd_match_on_real_motec_when_present() {
+    let src = PathBuf::from(
+        "/home/tobi/.local/share/wineprefixes/motec-i2/drive_c/MoTeC/Logged Data/Samples/Circuit/Sample.ld",
+    );
+    if !src.is_file() {
+        return;
+    }
+    let source = open(&src).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("sample.telemetry.jsonl");
+    let zstd = dir.path().join("sample.telemetry.jsonl.zstd");
+    write_jsonl_from_source(&source, &plain).unwrap();
+    write_jsonl_from_source(&source, &zstd).unwrap();
+    let a = open(&plain).unwrap();
+    let b = open(&zstd).unwrap();
+    assert_eq!(a.channels().len(), b.channels().len());
+    let mut bit_mismatches = 0u64;
+    let mut compared = 0u64;
+    for (index, channel) in a.channels().iter().enumerate() {
+        for local in 0..channel.sample_count {
+            compared += 1;
+            if a.decode(index, 0, local).to_bits() != b.decode(index, 0, local).to_bits() {
+                bit_mismatches += 1;
+            }
+        }
+    }
+    assert_eq!(
+        bit_mismatches, 0,
+        "{bit_mismatches} of {compared} samples differ"
+    );
+
+    let mut dropped = 0usize;
+    let mut source_mismatches = 0u64;
+    let mut source_compared = 0u64;
+    for (source_index, channel) in source.channels().iter().enumerate() {
+        let Some(jsonl_index) = a
+            .channels()
+            .iter()
+            .position(|candidate| candidate.name == channel.name)
+        else {
+            dropped += 1;
+            continue;
+        };
+        let count = channel
+            .sample_count
+            .min(a.channels()[jsonl_index].sample_count);
+        for local in 0..count {
+            source_compared += 1;
+            if source.decode(source_index, 0, local).to_bits()
+                != a.decode(jsonl_index, 0, local).to_bits()
+            {
+                source_mismatches += 1;
+            }
+        }
+    }
+    eprintln!(
+        "motec sample: jsonl/zstd identical; vs source dropped={dropped} compared={source_compared} bit_mismatches={source_mismatches}"
+    );
+    assert!(
+        dropped > 0 || source_mismatches > 0,
+        "expected JSONL not to be a bit-copy of the Motec source"
+    );
 }

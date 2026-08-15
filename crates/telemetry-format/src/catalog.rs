@@ -13,10 +13,12 @@ const V: fn(u16) -> flatbuffers::VOffsetT = |field| 4 + field * 2;
 ///
 /// `1` was the original catalog. `2` adds `video_frames.bin` and
 /// `presentation_offset_ns`. `3` stores `first_video_frame` on each lap and
-/// the presentation offset on each video handle. Bump this when the on-disk
-/// layout changes and add a step in `migrate.rs`.
+/// the presentation offset on each video handle. `4` requires `utc_start_ns`
+/// (Unix epoch at file `t = 0`) and IANA `timezone` so recordings and
+/// sidecars can be placed on an absolute timeline. Bump this when the
+/// on-disk layout changes and add a step in `migrate.rs`.
 /// [`crate::NativeRecording::open`] rewrites writable older files.
-pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION: u16 = 4;
 
 /// Parsed FlatBuffers catalog from `metadata.fb`.
 #[derive(Debug, Clone)]
@@ -36,6 +38,10 @@ pub struct Catalog {
     pub session_hint: String,
     pub comment: String,
     pub clock: Option<AbsoluteTimeRange>,
+    /// Unix-epoch nanoseconds (UTC) at file `t = 0`.
+    pub utc_start_ns: Option<u64>,
+    /// IANA timezone of the venue. Empty when unknown.
+    pub timezone: String,
     pub driver_stints: Vec<DriverStint>,
     pub videos: Vec<VideoFileRef>,
     pub presentation_offset_ns: Option<i128>,
@@ -92,6 +98,8 @@ impl Catalog {
             absolute_start_ns: self.clock.as_ref().map(|clock| clock.start_ns),
             absolute_end_ns: self.clock.as_ref().map(|clock| clock.end_ns),
             clock_offset_ns: self.clock.as_ref().map(|clock| i128::from(clock.start_ns)),
+            utc_start_ns: self.utc_start_ns,
+            timezone: self.timezone.clone(),
             identity: self.identity.clone(),
             driver_ids,
             driver_stints: self.driver_stints.clone(),
@@ -154,6 +162,8 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
         .clock
         .as_ref()
         .map(|clock| builder.create_string(&clock.clock));
+    let timezone = (catalog.format_version >= 4 && !catalog.timezone.is_empty())
+        .then(|| builder.create_string(&catalog.timezone));
 
     let start = builder.start_table();
     builder.push_slot(V(0), catalog.format_version, 0);
@@ -180,6 +190,15 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
     if let Some(offset) = catalog.presentation_offset_ns {
         builder.push_slot(V(21), 1u32, 0);
         builder.push_slot(V(22), i64::try_from(offset).unwrap_or(i64::MAX), 0);
+    }
+    if catalog.format_version >= 4 {
+        if let Some(utc) = catalog.utc_start_ns {
+            builder.push_slot(V(23), 1u32, 0);
+            builder.push_slot(V(24), utc, 0);
+        }
+        if let Some(timezone) = timezone {
+            builder.push_slot_always::<WIPOffset<_>>(V(25), timezone);
+        }
     }
     let root = builder.end_table(start);
     builder.finish(root, None);
@@ -253,6 +272,8 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         session_hint: table.string(15).unwrap_or_default(),
         comment: table.string(14).unwrap_or_default(),
         clock,
+        utc_start_ns: (table.u32(23) != 0).then(|| table.u64(24)),
+        timezone: table.string(25).unwrap_or_default(),
         driver_stints,
         videos: unpack_videos(&table.u8s(20), format_version),
         presentation_offset_ns: (table.u32(21) != 0).then(|| i128::from(table.i64_field(22))),

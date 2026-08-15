@@ -80,6 +80,10 @@ table Recording {
   valid_laps:uint32;
   comment:string;
   session_hint:string;
+  // v4: Unix-epoch nanoseconds at file t=0. 0 / absent = unknown.
+  utc_start_ns:uint64;
+  // v4: IANA timezone of the venue. Empty = unknown.
+  timezone:string;
 }
 
 root_type Recording;

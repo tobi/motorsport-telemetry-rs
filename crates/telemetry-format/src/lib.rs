@@ -1,14 +1,27 @@
 //! Native `.telemetry` format: aligned STORE zip + FlatBuffers catalog.
+//! Time-aligned JSONL interchange is documented in `JSONL.md`.
 
 mod catalog;
 mod file;
+mod jsonl;
 mod migrate;
+mod placement;
 mod write;
 mod zip;
 
 pub use catalog::{needs_update, Catalog, FORMAT_VERSION};
 pub use file::NativeRecording;
+pub use jsonl::{
+    is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, period_ns_from_hz,
+    write_jsonl_extension_from_source, write_jsonl_extension_from_source_with,
+    write_jsonl_from_source, write_jsonl_from_source_with, write_jsonl_timeline,
+    write_jsonl_timeline_with, write_jsonl_to, HeaderChrome, JsonlRecording, SidecarHeader, Span,
+    SpanPrimary, JSONL_EXT_VERSION, JSONL_VERSION, JSONL_ZSTD_LEVEL,
+};
 pub use migrate::apply as apply_migrations;
+pub use placement::{
+    civil_ns_to_utc_ns, resolve_timezone, resolve_utc_start_ns, utc_from_metadata,
+};
 pub use write::{write_from_source, write_from_source_version, TelemetryFormatError};
 
 /// Reads the catalog format version from `metadata.fb` only.
@@ -102,6 +115,8 @@ mod tests {
             session_hint: String::new(),
             comment: String::new(),
             clock: None,
+            utc_start_ns: Some(1_700_000_000_000_000_000),
+            timezone: "America/Chicago".into(),
             driver_stints: Vec::new(),
             videos: Vec::new(),
             presentation_offset_ns: Some(104_000_000),
@@ -116,6 +131,8 @@ mod tests {
             decode(&encode(&stale).unwrap()).unwrap().format_version
         ));
         assert_eq!(decoded.presentation_offset_ns, Some(104_000_000));
+        assert_eq!(decoded.utc_start_ns, Some(1_700_000_000_000_000_000));
+        assert_eq!(decoded.timezone, "America/Chicago");
         assert_eq!(decoded.laps[0].first_video_frame, Some(4));
         assert_eq!(decoded.valid_laps, 1);
         assert_eq!(decoded.laps.len(), 1);
@@ -207,6 +224,29 @@ mod tests {
             }
             assert_eq!(opened.decode(index, 0, 0), source.decode(index, 0, 0));
             assert_eq!(opened.sample_affine(index), source.sample_affine(index));
+        }
+        let meta = opened.metadata();
+        let venue_tz = motorsport_track_atlas::timezone_for_venue(&source.identity().venue);
+        assert_eq!(
+            meta.timezone.as_str(),
+            venue_tz.unwrap_or(""),
+            "timezone should come from the venue atlas, never invented"
+        );
+        if source.absolute_time_range().is_some() {
+            // Motec stamps a civil "utc" clock; GPS clocks copy through.
+            // Either way, a known zone or a gps clock should produce utc.
+            if venue_tz.is_some()
+                || source
+                    .absolute_time_range()
+                    .is_some_and(|clock| clock.clock == "gps")
+            {
+                assert!(
+                    meta.utc_start_ns.is_some()
+                        || source
+                            .absolute_time_range()
+                            .is_some_and(|clock| clock.clock != "gps" && clock.clock != "utc")
+                );
+            }
         }
     }
 

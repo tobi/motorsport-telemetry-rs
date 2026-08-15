@@ -12,13 +12,17 @@ use motorsport_track_atlas::{match_track, TrackMatch};
 use racelogic_telemetry::RacelogicFile;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use telemetry_format::NativeRecording;
+use telemetry_format::{is_jsonl_path, JsonlRecording, NativeRecording};
 use thiserror::Error;
 
 pub use motorsport_telemetry_core;
 pub use motorsport_track_atlas;
 /// Current `.telemetry` catalog version written by this crate.
 pub use telemetry_format::FORMAT_VERSION;
+/// Current Motorsport Telemetry JSONL (MTJ) document version.
+pub use telemetry_format::JSONL_VERSION;
+/// Default zstd level for compressed MTJ documents.
+pub use telemetry_format::JSONL_ZSTD_LEVEL;
 
 /// Errors returned while selecting or opening a supported telemetry format.
 #[derive(Debug, Error)]
@@ -59,16 +63,23 @@ pub enum TelemetryFile {
     Racelogic(RacelogicFile),
     /// Native `.telemetry` recording.
     Native(NativeRecording),
+    /// Time-aligned Motorsport Telemetry JSONL (MTJ) document.
+    Jsonl(JsonlRecording),
 }
 
 /// Opens a native telemetry file using its case-insensitive extension.
 ///
-/// Supported extensions are `.mp4`, `.pds`, `.ld`, `.vbo`, and `.telemetry`.
+/// Supported extensions are `.mp4`, `.pds`, `.ld`, `.vbo`, `.telemetry`,
+/// `.telemetry.jsonl`, `.jsonl`, `.mtj`, `.telemetry.ext.jsonl`, and those
+/// names with a `.zstd` or `.zst` suffix.
 /// This function selects a parser by extension; the selected parser still
 /// validates the file contents. Opening a writable `.telemetry` file older
 /// than [`FORMAT_VERSION`] rewrites it in place.
 pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
     let path = path.as_ref();
+    if is_jsonl_path(path) {
+        return Ok(TelemetryFile::Jsonl(JsonlRecording::open(path)?));
+    }
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -93,6 +104,9 @@ pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
 /// complete signal arrays or exact video-frame indexing are required.
 pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
     let path = path.as_ref();
+    if is_jsonl_path(path) {
+        return Ok(TelemetryFile::Jsonl(JsonlRecording::open(path)?));
+    }
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -123,6 +137,9 @@ pub fn read_lap_metadata(
     if is_telemetry(path.as_ref()) {
         return Ok(telemetry_format::read_laps(path)?);
     }
+    if is_jsonl_path(path.as_ref()) {
+        return Ok(JsonlRecording::open(path)?.metadata().laps);
+    }
     Ok(open_metadata(path)?.metadata().laps)
 }
 
@@ -132,6 +149,9 @@ pub fn read_lap_metadata(
 pub fn read_valid_laps(path: impl AsRef<Path>) -> Result<u32, TelemetryError> {
     if is_telemetry(path.as_ref()) {
         return Ok(telemetry_format::read_valid_laps(path)?);
+    }
+    if is_jsonl_path(path.as_ref()) {
+        return Ok(JsonlRecording::open(path)?.metadata().valid_laps);
     }
     Ok(open_metadata(path)?.metadata().valid_laps)
 }
@@ -144,6 +164,9 @@ pub fn read_metadata(
 ) -> Result<motorsport_telemetry_core::FileMetadata, TelemetryError> {
     if is_telemetry(path.as_ref()) {
         return Ok(telemetry_format::read_metadata(path)?);
+    }
+    if is_jsonl_path(path.as_ref()) {
+        return Ok(JsonlRecording::open(path)?.metadata());
     }
     Ok(open_metadata(path)?.metadata())
 }
@@ -182,6 +205,7 @@ macro_rules! delegate {
             TelemetryFile::Motec($source) => $body,
             TelemetryFile::Racelogic($source) => $body,
             TelemetryFile::Native($source) => $body,
+            TelemetryFile::Jsonl($source) => $body,
         }
     };
 }
@@ -220,6 +244,14 @@ impl TelemetrySource for TelemetryFile {
 
     fn absolute_time_range(&self) -> Option<motorsport_telemetry_core::AbsoluteTimeRange> {
         delegate!(self, source => source.absolute_time_range())
+    }
+
+    fn utc_start_ns(&self) -> Option<u64> {
+        delegate!(self, source => TelemetrySource::utc_start_ns(source))
+    }
+
+    fn timezone(&self) -> String {
+        delegate!(self, source => TelemetrySource::timezone(source))
     }
 
     fn identity(&self) -> SourceIdentity {
@@ -328,7 +360,14 @@ impl TelemetryFile {
     pub fn metadata(&self) -> FileMetadata {
         match self {
             Self::Native(file) => file.metadata(),
-            _ => read_source_metadata(self),
+            Self::Jsonl(file) => file.metadata(),
+            _ => {
+                let mut metadata = read_source_metadata(self);
+                let timezone = telemetry_format::resolve_timezone(self);
+                metadata.utc_start_ns = telemetry_format::resolve_utc_start_ns(self, &timezone);
+                metadata.timezone = timezone;
+                metadata
+            }
         }
     }
 

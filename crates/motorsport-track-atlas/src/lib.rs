@@ -29,8 +29,12 @@ pub struct Track {
     pub slug: &'static str,
     /// Human-readable facility name.
     pub name: &'static str,
+    /// Alternate names from the upstream dataset.
+    pub aka: &'static [&'static str],
     /// ISO 3166-1 alpha-2 country code when available.
     pub country: &'static str,
+    /// IANA timezone of the facility, e.g. `America/New_York`.
+    pub timezone: &'static str,
     /// Facility reference latitude in WGS84 degrees.
     pub latitude: f64,
     /// Facility reference longitude in WGS84 degrees.
@@ -60,6 +64,53 @@ pub fn tracks() -> &'static [Track] {
 /// Finds a facility by its exact track-atlas slug.
 pub fn find_track(slug: &str) -> Option<&'static Track> {
     TRACKS.iter().find(|track| track.slug == slug)
+}
+
+/// IANA timezone for a venue name, slug, or alias.
+///
+/// Matching is conservative: exact name/slug/aka (ignoring case and
+/// punctuation) or a full-token prefix (`Sebring` → `Sebring International
+/// Raceway`). Returns `None` rather than guessing.
+pub fn timezone_for_venue(venue: &str) -> Option<&'static str> {
+    find_track_for_venue(venue)
+        .and_then(|track| (!track.timezone.is_empty()).then_some(track.timezone))
+}
+
+/// Facility match for a venue string. See [`timezone_for_venue`].
+pub fn find_track_for_venue(venue: &str) -> Option<&'static Track> {
+    let needle = normalize_name(venue);
+    if needle.is_empty() {
+        return None;
+    }
+    TRACKS.iter().find(|track| {
+        names_match(&needle, track.name)
+            || names_match(&needle, track.slug)
+            || track.aka.iter().any(|aka| names_match(&needle, aka))
+    })
+}
+
+fn normalize_name(value: &str) -> String {
+    let mut out = String::new();
+    let mut space = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if space && !out.is_empty() {
+                out.push(' ');
+            }
+            space = false;
+            out.extend(ch.to_lowercase());
+        } else if ch == '-' || ch == '_' || ch.is_whitespace() {
+            space = true;
+        }
+    }
+    out
+}
+
+fn names_match(venue: &str, candidate: &str) -> bool {
+    let candidate = normalize_name(candidate);
+    venue == candidate
+        || candidate.starts_with(&format!("{venue} "))
+        || venue.starts_with(&format!("{candidate} "))
 }
 
 /// Finds the nearest facility within `max_distance_m` of a WGS84 point.
@@ -104,5 +155,13 @@ mod tests {
         assert_eq!(matched.layout.length_m, Some(6514.0));
         assert!(matched.layout.point_layers_json.contains("corners"));
         assert!(matched.layout.range_layers_json.contains("timing_sectors"));
+    }
+
+    #[test]
+    fn timezone_lookup_matches_venue_names() {
+        assert_eq!(timezone_for_venue("Sebring"), Some("America/New_York"));
+        assert_eq!(timezone_for_venue("Road America"), Some("America/Chicago"));
+        assert_eq!(timezone_for_venue("unknown circuit"), None);
+        assert_eq!(timezone_for_venue(""), None);
     }
 }

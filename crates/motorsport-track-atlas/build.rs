@@ -21,6 +21,18 @@ fn main() {
         let lat = track["location"]["lat"].as_f64().expect("track latitude");
         let lon = track["location"]["lon"].as_f64().expect("track longitude");
         let country = track["country"].as_str().unwrap_or("");
+        let timezone = track["location"]["timezone"].as_str().unwrap_or("");
+        let aka = track["aka"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str())
+                    .map(q)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
         let layouts = track["layouts"].as_array().expect("track layouts");
         let mut layout_code = String::new();
         for layout in layouts {
@@ -58,8 +70,8 @@ fn main() {
             ));
         }
         tracks.push_str(&format!(
-            "Track {{ slug: {}, name: {}, country: {}, latitude: {lat}, longitude: {lon}, layouts: &[{layout_code}] }},",
-            q(slug), q(name), q(country)
+            "Track {{ slug: {}, name: {}, aka: &[{aka}], country: {}, timezone: {}, latitude: {lat}, longitude: {lon}, layouts: &[{layout_code}] }},",
+            q(slug), q(name), q(country), q(timezone)
         ));
     }
     let output = format!(

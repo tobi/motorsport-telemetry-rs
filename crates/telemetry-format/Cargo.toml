@@ -5,15 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Native .telemetry zip format: FlatBuffers catalog and lossless channel columns"
+description = "Native .telemetry zip and time-aligned JSONL (MTJ) interchange"
 readme = "README.md"
 
 [dependencies]
 blake3.workspace = true
 flatbuffers.workspace = true
+jiff.workspace = true
 memmap2.workspace = true
 motorsport-telemetry-core.workspace = true
+motorsport-track-atlas.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 cosworth-telemetry.workspace = true

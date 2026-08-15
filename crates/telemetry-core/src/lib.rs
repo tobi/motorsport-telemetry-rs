@@ -256,6 +256,19 @@ pub trait TelemetrySource: Send + Sync {
         None
     }
 
+    /// Unix-epoch nanoseconds (UTC) at file `t = 0`, when the source stored one.
+    ///
+    /// Default is `None`. Native `.telemetry` v4 and MTJ/MTX headers expose
+    /// the stamped value. Do not invent this from decorative `date`/`time`.
+    fn utc_start_ns(&self) -> Option<u64> {
+        None
+    }
+
+    /// IANA timezone of the venue, empty when unknown.
+    fn timezone(&self) -> String {
+        String::new()
+    }
+
     /// Returns identity fields embedded in the source.
     fn identity(&self) -> SourceIdentity {
         SourceIdentity::default()

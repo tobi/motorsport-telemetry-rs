@@ -11,6 +11,8 @@ A format-neutral Rust workspace for reading, normalizing, and joining motorsport
 | MoTeC LD/LDX | `.ld` | [`motec-telemetry`](crates/motec-telemetry) | Read and write |
 | Racelogic VBOX | `.vbo` | [`racelogic-telemetry`](crates/racelogic-telemetry) | Read |
 | Native `.telemetry` | `.telemetry` | [`telemetry-format`](crates/telemetry-format) | Read and write; aligned STORE zip, FlatBuffers catalog first |
+| MTJ JSONL | `.telemetry.jsonl` | [`telemetry-format`](crates/telemetry-format/JSONL.md) | Read and write; time-aligned header / laps / channels |
+| MTJ JSONL + zstd | `.telemetry.jsonl.zstd` | same | Same document, one zstd frame |
 
 [`motorsport-telemetry`](crates/motorsport-telemetry) is the unified facade.
 [`motorsport-telemetry-core`](crates/telemetry-core) defines the shared source,
@@ -24,6 +26,8 @@ does not decode video payloads:
 cargo run -p motorsport-telemetry -- recording.mp4
 cargo run -p motorsport-telemetry -- --json recording.mp4
 cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds
+cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds recording.telemetry.jsonl
+cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds recording.telemetry.jsonl.zstd
 ```
 
 ## Quick start
