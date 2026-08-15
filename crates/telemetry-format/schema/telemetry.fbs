@@ -28,6 +28,7 @@ table Channel {
   duration_ns:uint64;
   kind:uint8;
   chunks:[Chunk];
+  visible:bool = true;
 }
 
 table Lap {
@@ -84,6 +85,10 @@ table Recording {
   utc_start_ns:uint64;
   // v4: IANA timezone of the venue. Empty = unknown.
   timezone:string;
+  // v5: per-channel visibility (1 byte per channel, 1 = shown).
+  channel_visible:[ubyte];
+  // v5: packed span annotations (same model as JSONL k:"s").
+  spans:[ubyte];
 }
 
 root_type Recording;

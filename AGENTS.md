@@ -3,8 +3,8 @@
 ## `.telemetry` format version
 
 `FORMAT_VERSION` in `crates/telemetry-format/src/catalog.rs` is the on-disk
-catalog version (`4`: required `utc_start_ns` + IANA `timezone` so a file
-and its sidecars share one absolute axis). Clients compare
+catalog version (`5`: spans + per-channel visibility; v4 added
+`utc_start_ns` + IANA `timezone`). Clients compare
 `FileMetadata::format_version` (or `read_format_version`) against it.
 
 When the catalog layout or required zip members change:

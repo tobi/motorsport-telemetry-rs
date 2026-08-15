@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 /// Format-neutral file and session metadata derivation.
 pub mod metadata;
+/// Interval annotations on the file-relative timeline.
+pub mod span;
 pub mod units;
 
 pub use metadata::{
@@ -12,6 +14,7 @@ pub use metadata::{
     DriverStint, FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, SourceLapMetadata,
     VideoFileRef, VideoReference,
 };
+pub use span::{Span, SpanPrimary};
 pub use units::{
     can_convert, convert, lookup as lookup_unit, normalize as normalize_unit, ConvertError,
     Dimension, UnitDef, UNITS,
@@ -267,6 +270,19 @@ pub trait TelemetrySource: Send + Sync {
     /// IANA timezone of the venue, empty when unknown.
     fn timezone(&self) -> String {
         String::new()
+    }
+
+    /// Default visibility of each sample channel, aligned with [`Self::channels`].
+    ///
+    /// Empty means every channel is visible. A shorter slice treats the
+    /// remaining channels as visible.
+    fn channel_visible(&self) -> &[bool] {
+        &[]
+    }
+
+    /// Interval annotations on the file-relative timeline. Empty when none.
+    fn spans(&self) -> &[crate::Span] {
+        &[]
     }
 
     /// Returns identity fields embedded in the source.

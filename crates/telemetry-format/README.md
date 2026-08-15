@@ -13,7 +13,7 @@ The writer compresses with zstd level 11 by default. A destination ending in
 Sidecars join on integer nanoseconds; header `utc` is required.
 
 `FORMAT_VERSION` is stored in the catalog (`schema_version`). Current version is
-`4` (`utc_start_ns` + IANA `timezone`, plus the v3 video fields).
+`5` (spans + channel visibility; v4 added `utc_start_ns` + IANA `timezone`).
 `NativeRecording::open` rewrites a writable older file in place. Header-only
 reads do not. Clients can still call `file_needs_update` or `needs_update` for
 a read-only file.

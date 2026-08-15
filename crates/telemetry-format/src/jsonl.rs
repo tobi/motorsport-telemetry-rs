@@ -25,33 +25,7 @@ pub const JSONL_VERSION: u16 = 1;
 /// Extension (`mtx`) document version written and accepted by this module.
 pub const JSONL_EXT_VERSION: u16 = 1;
 
-/// One interval: `[start_ns, end_ns)` plus display metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Span {
-    /// Optional stable id (`443-stint-1`).
-    pub name: String,
-    /// Inclusive start, file-relative nanoseconds.
-    pub start_ns: u64,
-    /// Exclusive end, file-relative nanoseconds.
-    pub end_ns: u64,
-    /// Default visibility inside the sidecar group.
-    pub visible: bool,
-    /// `#RRGGBB`, empty if unset.
-    pub color: String,
-    /// On-span chrome (`primary.title` / `primary.subtitle`).
-    pub primary: SpanPrimary,
-    /// On-hover fields, in file order. Each pair is (name, value) strings.
-    pub meta: Vec<(String, String)>,
-}
-
-/// Labels drawn on the span itself.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SpanPrimary {
-    /// Main label, e.g. `#443`.
-    pub title: String,
-    /// Secondary label, e.g. `EL · 1:52.1`.
-    pub subtitle: String,
-}
+pub use motorsport_telemetry_core::{Span, SpanPrimary};
 
 /// MTX group chrome: the sidecar is the folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,6 +633,10 @@ fn write_jsonl_document(
         }
         laps
     };
+    let spans = snap_spans(source.spans(), quantum_ns);
+    for span in &spans {
+        duration_ns = duration_ns.max(span.end_ns);
+    }
     if duration_ns < origin_ns || (duration_ns - origin_ns) % quantum_ns != 0 {
         duration_ns = snap_up(duration_ns.max(origin_ns), quantum_ns);
     }
@@ -688,7 +666,18 @@ fn write_jsonl_document(
         writer.write_all(b"\n")?;
     }
     for series in &aligned {
-        write_channel(&mut writer, series, origin_ns, extension.then_some(true))?;
+        let vis = if extension {
+            Some(series.visible)
+        } else if !series.visible {
+            Some(false)
+        } else {
+            None
+        };
+        write_channel(&mut writer, series, origin_ns, vis)?;
+        writer.write_all(b"\n")?;
+    }
+    for span in &spans {
+        write_span(&mut writer, span)?;
         writer.write_all(b"\n")?;
     }
     writer.flush()?;
@@ -857,6 +846,14 @@ impl TelemetrySource for JsonlRecording {
     fn timezone(&self) -> String {
         self.timezone.clone()
     }
+
+    fn channel_visible(&self) -> &[bool] {
+        &self.channel_visible
+    }
+
+    fn spans(&self) -> &[Span] {
+        &self.spans
+    }
 }
 
 struct AlignedSeries {
@@ -865,6 +862,7 @@ struct AlignedSeries {
     t0_ns: u64,
     period_ns: u64,
     values: Vec<Option<f64>>,
+    visible: bool,
 }
 
 impl AlignedSeries {
@@ -932,7 +930,33 @@ fn collect_aligned(
         t0_ns,
         period_ns,
         values,
+        visible: source.channel_visible().get(index).copied().unwrap_or(true),
     })
+}
+
+fn snap_spans(spans: &[Span], quantum_ns: u64) -> Vec<Span> {
+    if quantum_ns == 0 {
+        return spans.to_vec();
+    }
+    spans
+        .iter()
+        .map(|span| {
+            let start_ns = snap_nearest(span.start_ns, quantum_ns);
+            let mut end_ns = snap_nearest(span.end_ns, quantum_ns);
+            if end_ns <= start_ns {
+                end_ns = start_ns.saturating_add(quantum_ns);
+            }
+            Span {
+                name: span.name.clone(),
+                start_ns,
+                end_ns,
+                visible: span.visible,
+                color: span.color.clone(),
+                primary: span.primary.clone(),
+                meta: span.meta.clone(),
+            }
+        })
+        .collect()
 }
 
 fn snap_laps(laps: &[LapMetadata], quantum_ns: u64) -> Vec<LapMetadata> {

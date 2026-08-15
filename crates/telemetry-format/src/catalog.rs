@@ -4,7 +4,7 @@ use crate::zip::ZipError;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use motorsport_telemetry_core::{
     lookup_unit, normalize_unit, AbsoluteTimeRange, Channel, Chunk, DriverStint, FileMetadata,
-    LapMetadata, SampleType, SourceIdentity, UnitSource, VideoFileRef,
+    LapMetadata, SampleType, SourceIdentity, Span, UnitSource, VideoFileRef,
 };
 
 const V: fn(u16) -> flatbuffers::VOffsetT = |field| 4 + field * 2;
@@ -14,11 +14,12 @@ const V: fn(u16) -> flatbuffers::VOffsetT = |field| 4 + field * 2;
 /// `1` was the original catalog. `2` adds `video_frames.bin` and
 /// `presentation_offset_ns`. `3` stores `first_video_frame` on each lap and
 /// the presentation offset on each video handle. `4` requires `utc_start_ns`
-/// (Unix epoch at file `t = 0`) and IANA `timezone` so recordings and
-/// sidecars can be placed on an absolute timeline. Bump this when the
-/// on-disk layout changes and add a step in `migrate.rs`.
+/// (Unix epoch at file `t = 0`) and IANA `timezone`. `5` stores spans
+/// (string-annotated intervals) and per-channel visibility so the native
+/// catalog matches JSONL channel capabilities. Bump this when the on-disk
+/// layout changes and add a step in `migrate.rs`.
 /// [`crate::NativeRecording::open`] rewrites writable older files.
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
 
 /// Parsed FlatBuffers catalog from `metadata.fb`.
 #[derive(Debug, Clone)]
@@ -45,6 +46,8 @@ pub struct Catalog {
     pub driver_stints: Vec<DriverStint>,
     pub videos: Vec<VideoFileRef>,
     pub presentation_offset_ns: Option<i128>,
+    /// Interval annotations. Same model as JSONL `k:"s"` records.
+    pub spans: Vec<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +68,8 @@ pub struct CatalogChannel {
     pub duration_ns: u64,
     pub kind: u8,
     pub chunks: Vec<Chunk>,
+    /// Default visibility. Absent on v1–v4 catalogs (treated as visible).
+    pub visible: bool,
 }
 
 impl Catalog {
@@ -153,6 +158,10 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
     let channels = builder.create_vector(&pack_channels(&catalog.channels));
     let stints = builder.create_vector(&pack_stints(&catalog.driver_stints));
     let videos = builder.create_vector(&pack_videos(&catalog.videos, catalog.format_version));
+    let visibility = (catalog.format_version >= 5)
+        .then(|| builder.create_vector(&pack_visibility(&catalog.channels)));
+    let spans =
+        (catalog.format_version >= 5).then(|| builder.create_vector(&pack_spans(&catalog.spans)));
 
     let source_format = builder.create_string(&catalog.source_format);
     let source_path = builder.create_string(&catalog.source_path);
@@ -200,6 +209,12 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
             builder.push_slot_always::<WIPOffset<_>>(V(25), timezone);
         }
     }
+    if let Some(visibility) = visibility {
+        builder.push_slot_always::<WIPOffset<_>>(V(26), visibility);
+    }
+    if let Some(spans) = spans {
+        builder.push_slot_always::<WIPOffset<_>>(V(27), spans);
+    }
     let root = builder.end_table(start);
     builder.finish(root, None);
     Ok(builder.finished_data().to_vec())
@@ -242,7 +257,10 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         .unwrap_or_default();
     let format_version = table.u16_field(0);
     let laps = unpack_laps(&table.u8s(3), format_version);
-    let channels = unpack_channels(&table.u8s(4));
+    let mut channels = unpack_channels(&table.u8s(4));
+    if format_version >= 5 {
+        apply_visibility(&mut channels, &table.u8s(26));
+    }
     let driver_stints = unpack_stints(&table.u8s(16));
     let clock = table.string(17).and_then(|name| {
         if name.is_empty() {
@@ -277,6 +295,11 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         driver_stints,
         videos: unpack_videos(&table.u8s(20), format_version),
         presentation_offset_ns: (table.u32(21) != 0).then(|| i128::from(table.i64_field(22))),
+        spans: if format_version >= 5 {
+            unpack_spans(&table.u8s(27))
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -742,9 +765,86 @@ fn unpack_channels(bytes: &[u8]) -> Vec<CatalogChannel> {
             duration_ns,
             kind,
             chunks,
+            visible: true,
         });
     }
     channels
+}
+
+fn pack_visibility(channels: &[CatalogChannel]) -> Vec<u8> {
+    channels
+        .iter()
+        .map(|channel| u8::from(channel.visible))
+        .collect()
+}
+
+fn apply_visibility(channels: &mut [CatalogChannel], bytes: &[u8]) {
+    for (channel, flag) in channels.iter_mut().zip(bytes) {
+        channel.visible = *flag != 0;
+    }
+}
+
+fn pack_spans(spans: &[Span]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(spans.len() as u32).to_le_bytes());
+    for span in spans {
+        pack_string(&mut out, &span.name);
+        out.extend_from_slice(&span.start_ns.to_le_bytes());
+        out.extend_from_slice(&span.end_ns.to_le_bytes());
+        out.push(u8::from(span.visible));
+        pack_string(&mut out, &span.color);
+        pack_string(&mut out, &span.primary.title);
+        pack_string(&mut out, &span.primary.subtitle);
+        out.extend_from_slice(&(span.meta.len() as u32).to_le_bytes());
+        for (key, value) in &span.meta {
+            pack_string(&mut out, key);
+            pack_string(&mut out, value);
+        }
+    }
+    out
+}
+
+fn unpack_spans(bytes: &[u8]) -> Vec<Span> {
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut cursor = 4;
+    let mut spans = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = unpack_string(bytes, &mut cursor);
+        if cursor + 16 + 1 > bytes.len() {
+            break;
+        }
+        let start_ns = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let end_ns = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
+        let visible = bytes[cursor + 16] != 0;
+        cursor += 17;
+        let color = unpack_string(bytes, &mut cursor);
+        let title = unpack_string(bytes, &mut cursor);
+        let subtitle = unpack_string(bytes, &mut cursor);
+        if cursor + 4 > bytes.len() {
+            break;
+        }
+        let meta_count = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        let mut meta = Vec::with_capacity(meta_count);
+        for _ in 0..meta_count {
+            let key = unpack_string(bytes, &mut cursor);
+            let value = unpack_string(bytes, &mut cursor);
+            meta.push((key, value));
+        }
+        spans.push(Span {
+            name,
+            start_ns,
+            end_ns,
+            visible,
+            color,
+            primary: motorsport_telemetry_core::SpanPrimary { title, subtitle },
+            meta,
+        });
+    }
+    spans
 }
 
 fn root_table(bytes: &[u8]) -> Result<Table<'_>, ZipError> {

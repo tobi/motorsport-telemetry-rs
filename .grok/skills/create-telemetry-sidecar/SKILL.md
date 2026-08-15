@@ -1,11 +1,12 @@
 ---
 name: create-telemetry-sidecar
 description: >
-  Author and validate Motorsport Telemetry JSONL sidecars (MTX): a named group
-  of extra sample channels and/or time spans joined onto a host recording by
-  integer nanoseconds (required header utc). Use when the user says sidecar,
-  MTX, .telemetry.ext.jsonl, span, stint overlay, LMP2 field, extra channels,
-  or runs /create-telemetry-sidecar.
+  Author and validate Motorsport Telemetry JSONL sidecars (MTX). Extra sample
+  channels and/or time spans joined onto a host recording by integer
+  nanoseconds. Header utc (Unix-epoch ns at t=0) is required. Use when the
+  user says sidecar, MTX, .telemetry.ext.jsonl, span, stint overlay, LMP2
+  field, extra channels, ride height overlay, or runs /create-telemetry-sidecar
+  or /telemetry-sidecar.
 ---
 
 # MTX sidecar

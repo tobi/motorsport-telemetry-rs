@@ -33,6 +33,9 @@ frame count when available.
 override. Consumers should read `FileMetadata::laps`, which also derives laps
 from conventional counters and timers when that hook is absent.
 
+`TelemetrySource::spans()` returns interval annotations (stints, yellows)
+with string labels. Native `.telemetry` v5 and MTJ/MTX store the same model.
+
 `group_sessions(&files, max_gap_ns)` orders files by internal clocks and groups
 only adjacent compatible candidates. It merges driver and lap fragments across
 file boundaries while preserving real gaps. Filenames are never part of the

@@ -254,6 +254,14 @@ impl TelemetrySource for TelemetryFile {
         delegate!(self, source => TelemetrySource::timezone(source))
     }
 
+    fn channel_visible(&self) -> &[bool] {
+        delegate!(self, source => TelemetrySource::channel_visible(source))
+    }
+
+    fn spans(&self) -> &[motorsport_telemetry_core::Span] {
+        delegate!(self, source => TelemetrySource::spans(source))
+    }
+
     fn identity(&self) -> SourceIdentity {
         delegate!(self, source => source.identity())
     }

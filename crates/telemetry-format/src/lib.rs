@@ -97,6 +97,7 @@ mod tests {
                 sample_count: 3,
                 duration_ns: 3,
                 kind: 0,
+                visible: true,
                 chunks: vec![Chunk {
                     sample_period_ns: 1_000_000,
                     sample_count: 3,
@@ -120,6 +121,18 @@ mod tests {
             driver_stints: Vec::new(),
             videos: Vec::new(),
             presentation_offset_ns: Some(104_000_000),
+            spans: vec![motorsport_telemetry_core::Span {
+                name: "443-1".into(),
+                start_ns: 0,
+                end_ns: 1_000_000,
+                visible: true,
+                color: "#e11d48".into(),
+                primary: motorsport_telemetry_core::SpanPrimary {
+                    title: "#443".into(),
+                    subtitle: "EL".into(),
+                },
+                meta: vec![("Laps".into(), "18".into())],
+            }],
         };
         let bytes = encode(&catalog).unwrap();
         let decoded = decode(&bytes).unwrap();
@@ -133,6 +146,10 @@ mod tests {
         assert_eq!(decoded.presentation_offset_ns, Some(104_000_000));
         assert_eq!(decoded.utc_start_ns, Some(1_700_000_000_000_000_000));
         assert_eq!(decoded.timezone, "America/Chicago");
+        assert_eq!(decoded.spans.len(), 1);
+        assert_eq!(decoded.spans[0].primary.title, "#443");
+        assert_eq!(decoded.spans[0].meta[0], ("Laps".into(), "18".into()));
+        assert!(decoded.channels[0].visible);
         assert_eq!(decoded.laps[0].first_video_frame, Some(4));
         assert_eq!(decoded.valid_laps, 1);
         assert_eq!(decoded.laps.len(), 1);
@@ -209,6 +226,39 @@ mod tests {
                 channel.name
             );
         }
+    }
+
+    #[test]
+    fn native_preserves_jsonl_spans_and_visibility() {
+        use motorsport_telemetry_core::TelemetrySource;
+        let host = JsonlRecording::from_bytes(
+            "host.jsonl",
+            concat!(
+                "{\"mtj\":1,\"q\":1000000000,\"dur\":2000000000,\"utc\":1000,\"tz\":\"UTC\"}\n",
+                "[]\n",
+                "{\"n\":\"Speed\",\"hz\":1,\"vis\":0,\"v\":[1,2]}\n",
+                "{\"k\":\"s\",\"n\":\"443-1\",\"s\":0,\"e\":1000000000,\"vis\":1,\"c\":\"#e11d48\",",
+                "\"p\":{\"title\":\"#443\",\"sub\":\"EL\"},\"m\":[[\"Laps\",\"18\"]]}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("run.telemetry");
+        write_from_source(&host, &dest).unwrap();
+        let opened = NativeRecording::open(&dest).unwrap();
+        assert_eq!(opened.channel_visible(), [false]);
+        assert_eq!(opened.spans().len(), 1);
+        assert_eq!(opened.spans()[0].name, "443-1");
+        assert_eq!(opened.spans()[0].primary.title, "#443");
+        assert_eq!(opened.spans()[0].meta, [("Laps".into(), "18".into())]);
+        assert_eq!(opened.decode(0, 0, 0), 1.0);
+
+        let back = dir.path().join("back.telemetry.jsonl");
+        write_jsonl_from_source_with(&opened, &back, false).unwrap();
+        let again = JsonlRecording::open(&back).unwrap();
+        assert_eq!(again.channel_visible(), [false]);
+        assert_eq!(again.spans(), opened.spans());
     }
 
     #[test]

@@ -259,6 +259,10 @@ from a `.telemetry` zip.
 - Driver-stint lists (derive from a driver-id channel when present)
 - Irregular / event streams that cannot sit on the lattice
 
+Spans (`k:"s"`) and per-channel `vis` **are** stored in a `.telemetry`
+catalog (v5). Converting MTJ ↔ native keeps them. An MTX sidecar file
+itself is still JSONL-only.
+
 ## 8. Compression
 
 The preferred on-disk names are `.telemetry.jsonl` (plain) and

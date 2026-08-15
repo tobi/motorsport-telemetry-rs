@@ -13,6 +13,7 @@ pub fn apply(catalog: &mut Catalog) {
             0 | 1 => v1_to_v2(catalog),
             2 => v2_to_v3(catalog),
             3 => v3_to_v4(catalog),
+            4 => v4_to_v5(catalog),
             _ => break,
         }
         if catalog.format_version <= before {
@@ -58,6 +59,16 @@ fn v3_to_v4(catalog: &mut Catalog) {
     catalog.format_version = 4;
 }
 
+fn v4_to_v5(catalog: &mut Catalog) {
+    // v5 adds spans and per-channel visibility. Older files have neither;
+    // do not invent annotations.
+    for channel in &mut catalog.channels {
+        channel.visible = true;
+    }
+    catalog.spans.clear();
+    catalog.format_version = 5;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,11 +96,13 @@ mod tests {
             driver_stints: Vec::new(),
             videos: Vec::new(),
             presentation_offset_ns: None,
+            spans: Vec::new(),
         };
         apply(&mut catalog);
         assert_eq!(catalog.format_version, FORMAT_VERSION);
         assert!(catalog.utc_start_ns.is_none());
         assert!(catalog.timezone.is_empty());
+        assert!(catalog.spans.is_empty());
     }
 
     #[test]
@@ -123,10 +136,12 @@ mod tests {
             driver_stints: Vec::new(),
             videos: Vec::new(),
             presentation_offset_ns: None,
+            spans: Vec::new(),
         };
         apply(&mut catalog);
-        assert_eq!(catalog.format_version, 4);
+        assert_eq!(catalog.format_version, FORMAT_VERSION);
         assert_eq!(catalog.utc_start_ns, Some(1_700_000_000_000_000_000));
         assert_eq!(catalog.timezone, "America/New_York");
+        assert!(catalog.spans.is_empty());
     }
 }

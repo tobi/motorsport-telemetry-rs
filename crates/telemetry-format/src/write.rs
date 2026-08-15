@@ -73,6 +73,7 @@ fn write_to(
             duration_ns: channel.duration_ns,
             kind: u8::from(event),
             chunks: channel.chunks.clone(),
+            visible: source.channel_visible().get(index).copied().unwrap_or(true),
         });
         payloads.push((member, values, time_member, times));
     }
@@ -130,6 +131,7 @@ fn write_to(
             videos
         },
         presentation_offset_ns: source.video_presentation_offset_ns(),
+        spans: source.spans().to_vec(),
     };
     let offset = catalog.presentation_offset_ns;
     for video in &mut catalog.videos {

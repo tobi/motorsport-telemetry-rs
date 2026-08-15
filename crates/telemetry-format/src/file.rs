@@ -5,7 +5,7 @@ use crate::write::TelemetryFormatError;
 use crate::zip::{parse_members, read_first_member, ZipWriter};
 use memmap2::Mmap;
 use motorsport_telemetry_core::{
-    Channel, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata, TelemetrySource,
+    Channel, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata, Span, TelemetrySource,
     VideoFileRef,
 };
 use std::fs::{self, File, OpenOptions};
@@ -18,6 +18,7 @@ pub struct NativeRecording {
     path: String,
     catalog: Catalog,
     channels: Vec<Channel>,
+    channel_visible: Vec<bool>,
     affines: Vec<(f64, f64)>,
     times: Vec<Option<(usize, usize)>>,
     video_times: Option<(usize, usize)>,
@@ -166,6 +167,16 @@ impl NativeRecording {
         self.catalog.to_file_metadata()
     }
 
+    /// Interval annotations stored in the catalog. Same model as JSONL spans.
+    pub fn spans(&self) -> &[Span] {
+        &self.catalog.spans
+    }
+
+    /// Default visibility of each sample channel, aligned with [`TelemetrySource::channels`].
+    pub fn channel_visible(&self) -> &[bool] {
+        &self.channel_visible
+    }
+
     fn from_storage(path: String, data: Storage) -> Result<Self, TelemetryFormatError> {
         let members = parse_members(&data)?;
         let meta = members
@@ -231,10 +242,12 @@ impl NativeRecording {
                 }
             }
         }
+        let channel_visible = catalog.channels.iter().map(|ch| ch.visible).collect();
         Ok(Self {
             path,
             catalog,
             channels,
+            channel_visible,
             affines,
             times,
             video_times,
@@ -432,6 +445,14 @@ impl TelemetrySource for NativeRecording {
 
     fn timezone(&self) -> String {
         self.catalog.timezone.clone()
+    }
+
+    fn channel_visible(&self) -> &[bool] {
+        &self.channel_visible
+    }
+
+    fn spans(&self) -> &[Span] {
+        &self.catalog.spans
     }
 }
 
