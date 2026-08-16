@@ -264,7 +264,7 @@ dream.
   lossless processing passes with machine-checked preconditions and persisted
   provenance (§5.5). Shipped: `gps.quality@1`, `gps.clean@1`,
   `speed.distance@1`, applied by default in `telemetry-convert`. Provenance
-  and origin identity survive `.telemetry` (format v6) and MTJ
+  and origin identity survive `.telemetry` (format v9) and MTJ
   (`passes`/`src`/`srcp` header keys) round trips;
   `telemetry-convert --strip-passes` recovers the raw conversion
   byte-for-byte (proven by test and on real PDS/MP4 files).
@@ -465,7 +465,7 @@ The contract, enforced by tests:
   (`GPS Position Sigma`, `Distance Odometer Sigma`) instead of false
   precision — §1.2's *Total* requirement, made concrete.
 - **Provenance travels.** `AppliedPass {name, version, params, inputs,
-  outputs}` lives in the `.telemetry` v6 catalog and the MTJ `passes` header
+  outputs}` lives in the `.telemetry` v9 catalog and the MTJ `passes` header
   key, alongside the original `source_format`/`source_path` (`src`/`srcp`) —
   a file converted and rewritten three times still knows it began life as
   `…_Run02_TL.MP4`, and the UI can show both.
@@ -516,7 +516,7 @@ the zero-dependency path.
 
 ### 6.2 Persistence: the missing index is `progress → time → frame`
 
-`.telemetry` already has `time → frame` (§3.1), and format v6 (shipped)
+`.telemetry` already has `time → frame` (§3.1), and format v9 (shipped)
 records pass provenance and preserves the original `source_format` /
 `source_path` across rewrites. Add, in format v7:
 
@@ -534,9 +534,9 @@ records pass provenance and preserves the original `source_format` /
   reference_hash}` in the catalog. Progress without this tuple is
   uninterpretable; comparisons across differing references must be refused
   loudly.
-- Per AGENTS.md: bump `FORMAT_VERSION`, add a `v6_to_v7` migration
+- Per AGENTS.md: bump `FORMAT_VERSION`, add a migration
   (progress/gates absent after migration — recompute from source, never
-  invent; the shipped `v5_to_v6` migration already follows this rule for
+  invent; the shipped `v8_to_v9` migration already follows this rule for
   pass provenance).
 
 MTX sidecars carry the same channels for hosts we can't rewrite (the
@@ -604,9 +604,9 @@ Positioning bugs are quiet; the harness must be loud.
 | Phase | Deliverable | Unblocks |
 |---|---|---|
 | **0. Clock chain** (§6.4) | Sidecar `utc` copy rule + hash check; MTJ dropped-channel warning or event-channel support; ~~VBOX facade sign fix~~ (done); frame-math audit | Kills the current sync variance without any new math |
-| **1. GPS honesty** | **Done as passes** (§5.5): `gps.quality@1` (sentinels, fix/accuracy/DOP gating, sigma) + `gps.clean@1` (masked, teleport-free coordinates preferred by role inference) + `speed.distance@1` odometer, with provenance in format v6 and MTJ. Still open: windowed *local* projection with continuity + wrap hysteresis replacing the global nearest-segment scan in `TrackContext::progress` | Immediately better S1; channel-level teleports gone |
+| **1. GPS honesty** | **Done as passes** (§5.5): `gps.quality@1` (sentinels, fix/accuracy/DOP gating, sigma) + `gps.clean@1` (masked, teleport-free coordinates preferred by role inference) + `speed.distance@1` odometer, with provenance in format v9 and MTJ. Still open: windowed *local* projection with continuity + wrap hysteresis replacing the global nearest-segment scan in `TrackContext::progress` | Immediately better S1; channel-level teleports gone |
 | **2. Odometry + smoother** | `progress.fuse` + `progress.time` passes: wheel-speed process model, beacon anchors, GPS updates, RTS smoother, three output channels | The workhorse; FP1-style zero-GPS files get honest odo+beacon progress |
-| **3. Persistence** | Format v7: progress channels, gate table, reference identity; MTX equivalents (v6 shipped: pass provenance + origin identity) | O(1) `progress → frame`; cross-video alignment product features |
+| **3. Persistence** | Future format bump: progress channels, gate table, reference identity; MTX equivalents (v9 shipped: pass provenance + origin identity) | O(1) `progress → frame`; cross-video alignment product features |
 | **4. Landmarks** | Distance-domain damper signature library + curvature DTW; atlas versioning + reference model | S3: PDS files and dead-GPS videos reach corner-level comparability |
 | **5. Fleet refinement** | Offline centerline/landmark refinement from accumulated fused sessions; layout selection fix | Reference quality compounds with every session ingested |
 

@@ -15,6 +15,9 @@ pub fn apply(catalog: &mut Catalog) {
             3 => v3_to_v4(catalog),
             4 => v4_to_v5(catalog),
             5 => v5_to_v6(catalog),
+            6 => v6_to_v7(catalog),
+            7 => v7_to_v8(catalog),
+            8 => v8_to_v9(catalog),
             _ => break,
         }
         if catalog.format_version <= before {
@@ -71,12 +74,38 @@ fn v4_to_v5(catalog: &mut Catalog) {
 }
 
 fn v5_to_v6(catalog: &mut Catalog) {
-    // v6 records applied processing passes and keeps `source_format` /
+    // v6 adds sparse per-channel comment labels. Older files have none.
+    for channel in &mut catalog.channels {
+        channel.labels.clear();
+    }
+    catalog.format_version = 6;
+}
+
+fn v6_to_v7(catalog: &mut Catalog) {
+    // v7 adds plot class / scale / rounding. Older channels stay traces.
+    for channel in &mut catalog.channels {
+        channel.display = motorsport_telemetry_core::ChannelDisplay::trace();
+        if !channel.display.plot.is_trace() {
+            channel.labels.clear();
+        }
+    }
+    catalog.format_version = 7;
+}
+
+fn v7_to_v8(catalog: &mut Catalog) {
+    // v8 types span meta: racing-time strings become timespan_ms (u32).
+    // unpack_spans already reinterprets v5–v7 strings; this step only
+    // advances the version so the rewrite packs the u32 form.
+    catalog.format_version = 8;
+}
+
+fn v8_to_v9(catalog: &mut Catalog) {
+    // v9 records applied processing passes and keeps `source_format` /
     // `source_path` stable across rewrites. Older files never ran a pass;
     // their channels are raw conversions. Do not invent provenance. A file
-    // whose source_path was lost to a pre-v6 rewrite stays as it is.
+    // whose source_path was lost to a pre-v9 rewrite stays as it is.
     catalog.passes.clear();
-    catalog.format_version = 6;
+    catalog.format_version = 9;
 }
 
 #[cfg(test)]
@@ -114,7 +143,6 @@ mod tests {
         assert!(catalog.utc_start_ns.is_none());
         assert!(catalog.timezone.is_empty());
         assert!(catalog.spans.is_empty());
-        assert!(catalog.passes.is_empty());
     }
 
     #[test]

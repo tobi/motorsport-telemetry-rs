@@ -24,8 +24,13 @@ driver metadata, event date, video linkage, vehicle identity, GPS, and the
 offline track match without decoding video payloads:
 
 ```sh
-motorsport-telemetry recording.mp4
-motorsport-telemetry --json recording.mp4
+motorsport-telemetry inspect recording.mp4
+motorsport-telemetry inspect --json recording.mp4
+motorsport-telemetry inspect ~/Documents/Telemetry --mask '**/*.pds'
+motorsport-telemetry help inspect
+motorsport-telemetry convert recording.pds
+motorsport-telemetry convert recording.pds recording.telemetry.jsonl
+motorsport-telemetry verify recording.telemetry recording.telemetry.jsonl recording.telemetry.jsonl.zstd
 ```
 
 For application indexes and lap filmstrips, use `open_metadata(path)` or the

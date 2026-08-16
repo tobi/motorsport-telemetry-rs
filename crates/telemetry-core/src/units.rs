@@ -235,7 +235,7 @@ pub static UNITS: &[UnitDef] = &[
         1.0 / 3.6,
         &["kph", "kmh", "kmph", "km/hr"],
     ),
-    u("mph", Dimension::Speed, 0.447_04, &["mi/h"]),
+    u("mph", Dimension::Speed, 0.447_04, &["mi/h", "mp/h"]),
     u(
         "kn",
         Dimension::Speed,
@@ -329,6 +329,14 @@ pub static UNITS: &[UnitDef] = &[
         &["sec", "secs", "second", "seconds"],
     ),
     u("ms", Dimension::Time, 0.001, &["millisecond", "msec"]),
+    // Integer milliseconds rendered as M:SS.FFF. Same scale as `ms`; the
+    // distinct name is the race-time format (max 100 h, see timespan.rs).
+    u(
+        "timespan_ms",
+        Dimension::Time,
+        0.001,
+        &["laptime_ms", "racetime_ms"],
+    ),
     u("us", Dimension::Time, 1e-6, &["microsecond", "usec", "µs"]),
     u("ns", Dimension::Time, 1e-9, &["nanosecond", "nsec"]),
     u("min", Dimension::Time, 60.0, &["minute", "minutes"]),
@@ -666,10 +674,12 @@ mod tests {
         let cases: &[(f64, &str, &str, f64)] = &[
             (74.75, "m/s", "km/h", 269.1),
             (100.0, "km/h", "mph", 62.137_119_223_733_39),
+            (100.0, "km/h", "mp/h", 62.137_119_223_733_39),
+            (110.332, "s", "timespan_ms", 110_332.0),
             (-29.8, "m/s^2", "g", -3.038_754_314_674_226_6),
             (1.0, "rad", "deg", 57.295_779_513_082_32),
             (7_515_500.0, "Pa", "bar", 75.155),
-            (1.0, "bar", "psi", 14.503_773_800_721_814),
+            (1.0, "bar", "psi", 14.503_773_773_020_923),
             (373.15, "K", "C", 100.0),
             (32.0, "F", "C", 0.0),
             (212.0, "F", "C", 100.0),
@@ -729,6 +739,8 @@ mod tests {
         assert_eq!(normalize("RPM"), Some("rpm"));
         assert_eq!(normalize("kph"), Some("km/h"));
         assert_eq!(normalize("KM/H"), Some("km/h"));
+        assert_eq!(normalize("mp/h"), Some("mph"));
+        assert_eq!(normalize("timespan_ms"), Some("timespan_ms"));
         assert_eq!(normalize("°C"), Some("C"));
         assert_eq!(normalize("m/s²"), Some("m/s^2"));
         assert_eq!(normalize("Lambda"), Some("ratio"));

@@ -3,9 +3,11 @@
 ## `.telemetry` format version
 
 `FORMAT_VERSION` in `crates/telemetry-format/src/catalog.rs` is the on-disk
-catalog version (`6`: pass provenance + preserved `source_format`/`source_path`
-across rewrites; v5 added spans + per-channel visibility; v4 added
-`utc_start_ns` + IANA `timezone`). Clients compare
+catalog version (`9`: pass provenance + preserved `source_format`/`source_path`
+across rewrites; v8 typed span meta `timespan_ms` as u32le; v7 plot
+class / display scale / rounding; v6 comment labels; v5 spans + visibility;
+v4 `utc_start_ns` + timezone).
+Clients compare
 `FileMetadata::format_version` (or `read_format_version`) against it.
 
 When the catalog layout or required zip members change:
@@ -20,8 +22,8 @@ When the catalog layout or required zip members change:
 
 Do not invent payload that was never stored. A v1 file without `video_frames.bin`
 becomes a current-version file still without video; recover frames by converting
-from the original vendor recording. Likewise the v5 -> v6 migration leaves
-`passes` empty and `source_path` as found: provenance that predates v6 is
+from the original vendor recording. Likewise the v8 -> v9 migration leaves
+`passes` empty and `source_path` as found: provenance that predates v9 is
 unknowable, not defaultable.
 
 ## Processing passes
@@ -30,7 +32,7 @@ unknowable, not defaultable.
 (`gps.quality`, `gps.clean`, `speed.distance`, ...). Passes only append
 derived channels; `write_from_source_stripped` recovers the raw conversion
 byte-for-byte. Provenance (`AppliedPass`: name, version, params, inputs,
-outputs) is stored in the v6 catalog and the MTJ `passes` header key. Rules
+outputs) is stored in the v9 catalog and the MTJ `passes` header key. Rules
 when touching a pass: any change to its output values bumps its `version`;
 new behavior with the same outputs is a new pass name; `check()` must give a
 user-facing reason for every skip; keep `derive()` deterministic (no clocks,
@@ -40,7 +42,9 @@ no randomness). The design rationale lives in
 ## JSONL (MTJ)
 
 `JSONL_VERSION` in `crates/telemetry-format/src/jsonl.rs` is independent of
-`FORMAT_VERSION`. The document rules are `crates/telemetry-format/JSONL.md`.
+`FORMAT_VERSION`. The user guide (layout + examples) is `TELEMETRY.md`. The writer-strict
+schema is `telemetry.schema.json`. The normative JSONL rules are
+`crates/telemetry-format/JSONL.md`.
 A valid file is time-aligned: no per-sample timestamps, every `t0` / sample
 instant / lap boundary / `dur` on the header lattice `q`. Irregular channels
 are omitted, not given `[t, v]` pairs. Preferred names are `.telemetry.jsonl`

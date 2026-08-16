@@ -92,6 +92,12 @@ fn write_to(
             kind: u8::from(event),
             chunks: channel.chunks.clone(),
             visible: source.channel_visible().get(index).copied().unwrap_or(true),
+            labels: if source.channel_display(index).plot.is_trace() {
+                source.channel_labels(index).to_vec()
+            } else {
+                Vec::new()
+            },
+            display: source.channel_display(index),
         });
         payloads.push((member, values, time_member, times));
     }

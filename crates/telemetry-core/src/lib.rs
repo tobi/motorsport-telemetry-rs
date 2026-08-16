@@ -3,21 +3,30 @@
 
 use std::sync::Arc;
 
+/// How a channel should be drawn.
+pub mod display;
 /// Format-neutral file and session metadata derivation.
 pub mod metadata;
 /// Provenance records for named, lossless processing passes.
 pub mod pass;
 /// Interval annotations on the file-relative timeline.
 pub mod span;
+/// Race-time durations stored as integer milliseconds.
+pub mod timespan;
 pub mod units;
 
+pub use display::{ChannelDisplay, ChannelPlot};
 pub use metadata::{
     driver_histogram, group_sessions, read_source_metadata, schema_hash, AbsoluteTimeRange,
     DriverStint, FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, SourceLapMetadata,
     VideoFileRef, VideoReference,
 };
 pub use pass::{AppliedPass, SourceOrigin};
-pub use span::{Span, SpanPrimary};
+pub use span::{Span, SpanMetaValue, SpanPrimary};
+pub use timespan::{
+    average_timespan_ms, format_timespan_ms, parse_timespan_ms, timespan_ms_in_range, TIMESPAN_MS,
+    TIMESPAN_MS_MAX,
+};
 pub use units::{
     can_convert, convert, lookup as lookup_unit, normalize as normalize_unit, ConvertError,
     Dimension, UnitDef, UNITS,
@@ -166,6 +175,19 @@ pub struct Channel {
     pub duration_ns: u64,
 }
 
+/// Sparse comment on a channel trace: file-relative nanoseconds plus text.
+///
+/// Drawn as a dot on that channel at `time_ns`. On hover the viewer expands
+/// a dotted vertical across the full trace height. Not a sample.
+/// Allowed only on [`ChannelPlot::Trace`] channels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelLabel {
+    /// File-relative nanoseconds.
+    pub time_ns: u64,
+    /// Comment text shown on hover.
+    pub text: String,
+}
+
 impl Channel {
     /// Returns the first chunk's sample period, if the channel has samples.
     pub fn first_period_ns(&self) -> Option<u64> {
@@ -286,6 +308,18 @@ pub trait TelemetrySource: Send + Sync {
     /// Interval annotations on the file-relative timeline. Empty when none.
     fn spans(&self) -> &[crate::Span] {
         &[]
+    }
+
+    /// Sparse comment labels on one sample channel, oldest first.
+    ///
+    /// Empty when the channel has none. Times are file-relative nanoseconds.
+    fn channel_labels(&self, _channel_index: usize) -> &[crate::ChannelLabel] {
+        &[]
+    }
+
+    /// Display class, optional scale, and rounding for one sample channel.
+    fn channel_display(&self, _channel_index: usize) -> crate::ChannelDisplay {
+        crate::ChannelDisplay::trace()
     }
 
     /// Processing passes recorded as applied to this source, in order.

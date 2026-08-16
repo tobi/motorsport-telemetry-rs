@@ -1,0 +1,2070 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://motorsport-telemetry.rs/telemetry.schema.json",
+  "title": "Motorsport Telemetry (MTJ / MTX)",
+  "description": "Writer-strict schema for every JSON object in an MTJ recording or MTX sidecar.\n\nA file is JSONL (one JSON value per LF line), not one JSON document. Validate each line:\n  MTJ (.telemetry.jsonl) — line 1 $defs.mtj_header, line 2 $defs.laps, then $defs.channel | $defs.span\n  MTX (.telemetry.ext.jsonl) — one or more groups of $defs.mtx_header then $defs.channel | $defs.span\n\nString lengths are Unicode code points (JSON Schema maxLength). Omit a key instead of writing \"\". Compact JSON, no insignificant whitespace, no BOM, trailing LF.\n\nLimits:\n  name (channel n, span n, MTX group n)     1–64     Speed, Ride Height FL, 443-1, Sebring 12H 2025\n  identity (drv veh ven evt ses)            1–80     Tobi, Sebring\n  unit u                                    1–24     km/h, °C, mm, bpm, %\n  fmt                                       1–16     0.0°C, 000, 000%, 0°   (no whitespace)\n  tz                                        3–64     America/New_York, UTC\n  label text                                1–80     brake lock, bottomed\n  chrome r[].t                              1–120    LMP2 stints during the race\n  chrome pill r[].p[]                       1–32     Avg lap, 1:52.1\n  span p.title                              1–32     #443\n  span p.sub                                1–48     EL · 1:52.1\n  span m name / value                       1–32 / 1–48\n  date / time                               1–32     decorative vendor text\n  clk                                       1–32     gps, utc, time_of_day\n  hint                                      1–64     FP1\n  hash                                      16       0123456789abcdef\n  color c                                   7        #e11d48\n  r items ≤ 8, m items ≤ 16, lbl items ≤ 256\n\nLattice, uniqueness, join (host = ext + ext.utc − host.utc), and MTX vis are enforced by crates/telemetry-format/scripts/validate-mtx.py, not by JSON Schema. Readers ignore unknown keys; this schema sets additionalProperties=false so writers cannot smuggle undefined fields.",
+  "$comment": "BINARY MAP: a .telemetry file is a STORE zip (method 0, payloads 64-byte aligned). First member is metadata.fb, a FlatBuffers table whose field index N is vtable slot V(N)=4+2N. Packed blobs (laps, channels, stints, videos, vis, spans, labels, display) are little-endian. pack_string = u32le byte-length + UTF-8. Native-only fields (scale, bias, sample_type, integer columns, video payloads) have no JSONL key. MTX has no zip member.",
+  "$defs": {
+    "vis": {
+      "title": "Visibility",
+      "description": "0 hidden, 1 shown. Writers emit the integers 0 and 1, never true/false. MTX: required on every header and record (1 = shown when the group is open). MTJ: omit to default 1.",
+      "$comment": "JSONL vis. BINARY: catalog v5+ V(26) is one u8 per channel, 1=shown. Span vis is packed in the v5 V(27) span blob.",
+      "enum": [
+        0,
+        1
+      ],
+      "examples": [
+        1,
+        0
+      ]
+    },
+    "ns": {
+      "title": "Nanoseconds",
+      "description": "Integer nanoseconds. File-relative on t0, s, e, dur, lbl times, and lap bounds. Never a string, never a float, never ISO-8601. 10_000_000 = 10 ms, 1_000_000_000 = 1 s.",
+      "$comment": "BINARY: u64le except presentation offsets which are i64le.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615,
+      "examples": [
+        0,
+        10000000,
+        5400000000000,
+        12600000000000
+      ]
+    },
+    "utcEpochNs": {
+      "title": "Unix-epoch nanoseconds at t=0",
+      "description": "Required join key. Unix-epoch nanoseconds (UTC) at this file or group's t=0. utc_epoch_ns = file_relative_ns + utc. Join: host_file_ns = ext_file_ns + ext.utc − host.utc. Copy the host utc when sidecar times are already host-relative.",
+      "$comment": "JSONL utc. BINARY catalog v4+ V(23)=1 present flag, V(24)=u64le.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615,
+      "examples": [
+        1742040000000000000
+      ]
+    },
+    "name": {
+      "title": "Channel, span, or group name",
+      "description": "Case-sensitive. Unique among channels in the file. 1–64 Unicode code points. Prefer the source spelling (Speed, Ride Height FL) or a short stint id (443-1). Not a sentence — put prose in r[].t or span m.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "examples": [
+        "Speed",
+        "Water Temp",
+        "Ride Height FL",
+        "443-1",
+        "Sebring 12H 2025"
+      ]
+    },
+    "identity": {
+      "title": "Recording identity string",
+      "description": "MTJ header only (drv veh ven evt ses). 1–80. Omit when unknown. Not present on MTX.",
+      "$comment": "BINARY identity table V(0)–V(4).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "examples": [
+        "Tobi",
+        "Oreca 07",
+        "Sebring",
+        "12 Hours of Sebring",
+        "Race"
+      ]
+    },
+    "unit": {
+      "title": "Declared unit",
+      "description": "Source unit string, 1–24. Prefer the canonical name. Aliases (kph, mp/h, °C, PSI) resolve through the shared registry. Two units convert iff they share a dimension that is not count or marker. value_si = value * factor + offset (offset only on C/F).\n\nConvertible canonical names:\n  length  m mm cm km in ft mile\n  speed   m/s km/h mph kn          (km/h↔mph; mp/h and mi/h = mph; kph/kmh/kmph/km/hr = km/h)\n  accel   m/s^2 g\n  angle   rad deg rev              (° = deg)\n  angvel  rad/s rpm deg/s\n  angacc  rad/s^2 deg/s^2\n  press   Pa kPa MPa bar mbar psi atm inHg\n  temp    K C F                    (°C = C, °F = F)\n  time    s ms timespan_ms us ns min h\n  freq    Hz kHz\n  force   N kN lbf\n  torque  Nm lbft\n  energy  J kJ MJ kWh\n  power   W kW hp PS\n  elec    V mV A mA ohm\n  mass    kg g_mass lb\n  volume  m^3 L mL gal\n  vflow   m^3/s L/s L/h\n  mflow   kg/s kg/h\n  ratio   ratio % %/s %/Period\n  log     dBm dB\n\nNot convertible (labels): count laps gear code; marker raw flag state pp1 Driver defined text.\n\ntimespan_ms is integer milliseconds 0..=360000000 (100 h), rendered M:SS.FFF. Same SI scale as ms; the name is the race-time format. Do not invent a unit from the channel name.",
+      "$comment": "JSONL u. BINARY unit_raw + unit_canonical + dimension u8. Registry: crates/telemetry-core/src/units.rs UNITS.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 24,
+      "examples": [
+        "km/h",
+        "mph",
+        "mp/h",
+        "m/s",
+        "kn",
+        "bar",
+        "psi",
+        "Pa",
+        "kPa",
+        "mbar",
+        "C",
+        "°C",
+        "F",
+        "K",
+        "timespan_ms",
+        "ms",
+        "s",
+        "mm",
+        "m",
+        "in",
+        "%",
+        "rpm",
+        "deg",
+        "L",
+        "N",
+        "V"
+      ]
+    },
+    "fmt": {
+      "title": "Format hint",
+      "description": "How to print a sample. 1–16 characters, NO whitespace. Glue the number mask to the unit: 0.0°C not \"0.0 °C\". 000 zero-pads an integer. 000% is saturation. 0° is a heading. timespan_ms renders integer milliseconds as M:SS.FFF (H:MM:SS.FFF from 1 h). Viewers MAY ignore fmt.",
+      "$comment": "JSONL fmt. BINARY catalog v7 V(29) display blob, flag bit 3 + pack_string.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16,
+      "pattern": "^\\S{1,16}$",
+      "examples": [
+        "0.0°C",
+        "000",
+        "000%",
+        "0°",
+        "0.00",
+        "timespan_ms"
+      ]
+    },
+    "timespanMs": {
+      "title": "timespan_ms storage",
+      "description": "Integer milliseconds. 0..=360000000 (100 hours). u32 on disk. Math (avg, delta, sum) is on this integer. Render with M:SS.FFF under one hour (1:50.332) and H:MM:SS.FFF from one hour (1:30:00.000). Never a float. Never a civil clock.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 360000000,
+      "examples": [
+        0,
+        32104,
+        110332,
+        112104,
+        5400000,
+        360000000
+      ]
+    },
+    "timespanValue": {
+      "title": "Typed timespan_ms meta value",
+      "description": "Writer-strict hover value for race times. v is integer ms. u is timespan_ms (laptime_ms / racetime_ms aliases). Display is M:SS.FFF. Average several Best fields with mean(v), then format.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "u"
+      ],
+      "properties": {
+        "v": {
+          "$ref": "#/$defs/timespanMs"
+        },
+        "u": {
+          "enum": [
+            "timespan_ms",
+            "laptime_ms",
+            "racetime_ms"
+          ],
+          "examples": [
+            "timespan_ms"
+          ]
+        }
+      },
+      "examples": [
+        {
+          "v": 110332,
+          "u": "timespan_ms"
+        },
+        {
+          "v": 5400000,
+          "u": "timespan_ms"
+        }
+      ]
+    },
+    "unitCatalog": {
+      "title": "Conversion registry (documentation)",
+      "description": "Every unit the Rust registry can convert. factor is value_si = value * si + off. off omitted when 0. aka are accepted spellings. Not a JSONL line shape.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "u",
+          "dim",
+          "si"
+        ],
+        "properties": {
+          "u": {
+            "type": "string"
+          },
+          "dim": {
+            "type": "string"
+          },
+          "si": {
+            "type": "number"
+          },
+          "off": {
+            "type": "number"
+          },
+          "aka": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "examples": [
+        [
+          {
+            "u": "m",
+            "dim": "length",
+            "si": 1,
+            "aka": [
+              "metre",
+              "meter",
+              "metres",
+              "meters"
+            ]
+          },
+          {
+            "u": "mm",
+            "dim": "length",
+            "si": 0.001,
+            "aka": [
+              "millimetre",
+              "millimeter"
+            ]
+          },
+          {
+            "u": "cm",
+            "dim": "length",
+            "si": 0.01
+          },
+          {
+            "u": "km",
+            "dim": "length",
+            "si": 1000
+          },
+          {
+            "u": "in",
+            "dim": "length",
+            "si": 0.0254,
+            "aka": [
+              "inch",
+              "inches"
+            ]
+          },
+          {
+            "u": "ft",
+            "dim": "length",
+            "si": 0.3048,
+            "aka": [
+              "feet",
+              "foot"
+            ]
+          },
+          {
+            "u": "mile",
+            "dim": "length",
+            "si": 1609.344,
+            "aka": [
+              "mi",
+              "miles"
+            ]
+          },
+          {
+            "u": "m/s",
+            "dim": "speed",
+            "si": 1,
+            "aka": [
+              "mps",
+              "ms-1",
+              "m.s^-1"
+            ]
+          },
+          {
+            "u": "km/h",
+            "dim": "speed",
+            "si": 0.2777777777777778,
+            "aka": [
+              "kph",
+              "kmh",
+              "kmph",
+              "km/hr"
+            ]
+          },
+          {
+            "u": "mph",
+            "dim": "speed",
+            "si": 0.44704,
+            "aka": [
+              "mi/h",
+              "mp/h"
+            ]
+          },
+          {
+            "u": "kn",
+            "dim": "speed",
+            "si": 0.5144444444444444,
+            "aka": [
+              "knot",
+              "knots"
+            ]
+          },
+          {
+            "u": "m/s^2",
+            "dim": "acceleration",
+            "si": 1,
+            "aka": [
+              "m/s2",
+              "mps2",
+              "m/s²"
+            ]
+          },
+          {
+            "u": "g",
+            "dim": "acceleration",
+            "si": 9.80665,
+            "aka": [
+              "G",
+              "g-force"
+            ]
+          },
+          {
+            "u": "rad",
+            "dim": "angle",
+            "si": 1,
+            "aka": [
+              "radian",
+              "radians"
+            ]
+          },
+          {
+            "u": "deg",
+            "dim": "angle",
+            "si": 0.017453292519943295,
+            "aka": [
+              "degree",
+              "degrees",
+              "°"
+            ]
+          },
+          {
+            "u": "rev",
+            "dim": "angle",
+            "si": 6.283185307179586,
+            "aka": [
+              "revolution"
+            ]
+          },
+          {
+            "u": "rad/s",
+            "dim": "angular_velocity",
+            "si": 1,
+            "aka": [
+              "rads",
+              "rad/sec"
+            ]
+          },
+          {
+            "u": "rpm",
+            "dim": "angular_velocity",
+            "si": 0.10471975511965977,
+            "aka": [
+              "RPM",
+              "rev/min",
+              "r/min"
+            ]
+          },
+          {
+            "u": "deg/s",
+            "dim": "angular_velocity",
+            "si": 0.017453292519943295,
+            "aka": [
+              "dps",
+              "deg/sec"
+            ]
+          },
+          {
+            "u": "rad/s^2",
+            "dim": "angular_acceleration",
+            "si": 1,
+            "aka": [
+              "rad/s2"
+            ]
+          },
+          {
+            "u": "deg/s^2",
+            "dim": "angular_acceleration",
+            "si": 0.017453292519943295,
+            "aka": [
+              "deg/s2"
+            ]
+          },
+          {
+            "u": "Pa",
+            "dim": "pressure",
+            "si": 1,
+            "aka": [
+              "pascal",
+              "pa"
+            ]
+          },
+          {
+            "u": "kPa",
+            "dim": "pressure",
+            "si": 1000,
+            "aka": [
+              "kpa"
+            ]
+          },
+          {
+            "u": "MPa",
+            "dim": "pressure",
+            "si": 1000000,
+            "aka": [
+              "mpa"
+            ]
+          },
+          {
+            "u": "bar",
+            "dim": "pressure",
+            "si": 100000,
+            "aka": [
+              "Bar"
+            ]
+          },
+          {
+            "u": "mbar",
+            "dim": "pressure",
+            "si": 100,
+            "aka": [
+              "millibar",
+              "hPa"
+            ]
+          },
+          {
+            "u": "psi",
+            "dim": "pressure",
+            "si": 6894.757293168361,
+            "aka": [
+              "PSI",
+              "lbf/in^2"
+            ]
+          },
+          {
+            "u": "atm",
+            "dim": "pressure",
+            "si": 101325
+          },
+          {
+            "u": "inHg",
+            "dim": "pressure",
+            "si": 3386.388640341,
+            "aka": [
+              "inhg"
+            ]
+          },
+          {
+            "u": "K",
+            "dim": "temperature",
+            "si": 1,
+            "aka": [
+              "kelvin"
+            ]
+          },
+          {
+            "u": "C",
+            "dim": "temperature",
+            "si": 1,
+            "off": 273.15,
+            "aka": [
+              "degC",
+              "°C",
+              "celsius",
+              "Celsius",
+              "deg C"
+            ]
+          },
+          {
+            "u": "F",
+            "dim": "temperature",
+            "si": 0.5555555555555556,
+            "off": 255.3722222222222,
+            "aka": [
+              "degF",
+              "°F",
+              "fahrenheit",
+              "Fahrenheit",
+              "deg F"
+            ]
+          },
+          {
+            "u": "s",
+            "dim": "time",
+            "si": 1,
+            "aka": [
+              "sec",
+              "secs",
+              "second",
+              "seconds"
+            ]
+          },
+          {
+            "u": "ms",
+            "dim": "time",
+            "si": 0.001,
+            "aka": [
+              "millisecond",
+              "msec"
+            ]
+          },
+          {
+            "u": "timespan_ms",
+            "dim": "time",
+            "si": 0.001,
+            "aka": [
+              "laptime_ms",
+              "racetime_ms"
+            ]
+          },
+          {
+            "u": "us",
+            "dim": "time",
+            "si": 1e-06,
+            "aka": [
+              "microsecond",
+              "usec",
+              "µs"
+            ]
+          },
+          {
+            "u": "ns",
+            "dim": "time",
+            "si": 1e-09,
+            "aka": [
+              "nanosecond",
+              "nsec"
+            ]
+          },
+          {
+            "u": "min",
+            "dim": "time",
+            "si": 60,
+            "aka": [
+              "minute",
+              "minutes"
+            ]
+          },
+          {
+            "u": "h",
+            "dim": "time",
+            "si": 3600,
+            "aka": [
+              "hr",
+              "hour",
+              "hours"
+            ]
+          },
+          {
+            "u": "Hz",
+            "dim": "frequency",
+            "si": 1,
+            "aka": [
+              "hz",
+              "hertz"
+            ]
+          },
+          {
+            "u": "kHz",
+            "dim": "frequency",
+            "si": 1000,
+            "aka": [
+              "khz"
+            ]
+          },
+          {
+            "u": "N",
+            "dim": "force",
+            "si": 1,
+            "aka": [
+              "newton"
+            ]
+          },
+          {
+            "u": "kN",
+            "dim": "force",
+            "si": 1000,
+            "aka": [
+              "kilonewton"
+            ]
+          },
+          {
+            "u": "lbf",
+            "dim": "force",
+            "si": 4.4482216152605
+          },
+          {
+            "u": "Nm",
+            "dim": "torque",
+            "si": 1,
+            "aka": [
+              "N.m",
+              "N*m",
+              "newton-metre"
+            ]
+          },
+          {
+            "u": "lbft",
+            "dim": "torque",
+            "si": 1.3558179483314003,
+            "aka": [
+              "lb-ft",
+              "ft-lb",
+              "ftlb"
+            ]
+          },
+          {
+            "u": "J",
+            "dim": "energy",
+            "si": 1,
+            "aka": [
+              "joule"
+            ]
+          },
+          {
+            "u": "kJ",
+            "dim": "energy",
+            "si": 1000,
+            "aka": [
+              "kilojoule"
+            ]
+          },
+          {
+            "u": "MJ",
+            "dim": "energy",
+            "si": 1000000,
+            "aka": [
+              "megajoule"
+            ]
+          },
+          {
+            "u": "kWh",
+            "dim": "energy",
+            "si": 3600000,
+            "aka": [
+              "kwh"
+            ]
+          },
+          {
+            "u": "W",
+            "dim": "power",
+            "si": 1,
+            "aka": [
+              "watt"
+            ]
+          },
+          {
+            "u": "kW",
+            "dim": "power",
+            "si": 1000,
+            "aka": [
+              "kw"
+            ]
+          },
+          {
+            "u": "hp",
+            "dim": "power",
+            "si": 745.6998715822702,
+            "aka": [
+              "HP",
+              "bhp"
+            ]
+          },
+          {
+            "u": "PS",
+            "dim": "power",
+            "si": 735.49875,
+            "aka": [
+              "ps"
+            ]
+          },
+          {
+            "u": "V",
+            "dim": "voltage",
+            "si": 1,
+            "aka": [
+              "volt",
+              "volts"
+            ]
+          },
+          {
+            "u": "mV",
+            "dim": "voltage",
+            "si": 0.001,
+            "aka": [
+              "millivolt"
+            ]
+          },
+          {
+            "u": "A",
+            "dim": "current",
+            "si": 1,
+            "aka": [
+              "amp",
+              "amps",
+              "ampere"
+            ]
+          },
+          {
+            "u": "mA",
+            "dim": "current",
+            "si": 0.001,
+            "aka": [
+              "milliamp"
+            ]
+          },
+          {
+            "u": "ohm",
+            "dim": "resistance",
+            "si": 1,
+            "aka": [
+              "Ohm",
+              "Ω"
+            ]
+          },
+          {
+            "u": "kg",
+            "dim": "mass",
+            "si": 1,
+            "aka": [
+              "kilogram",
+              "kilogramme"
+            ]
+          },
+          {
+            "u": "g_mass",
+            "dim": "mass",
+            "si": 0.001,
+            "aka": [
+              "gram",
+              "gramme"
+            ]
+          },
+          {
+            "u": "lb",
+            "dim": "mass",
+            "si": 0.45359237,
+            "aka": [
+              "lbs",
+              "pound"
+            ]
+          },
+          {
+            "u": "m^3",
+            "dim": "volume",
+            "si": 1,
+            "aka": [
+              "m3",
+              "cubic metre"
+            ]
+          },
+          {
+            "u": "L",
+            "dim": "volume",
+            "si": 0.001,
+            "aka": [
+              "l",
+              "litre",
+              "liter",
+              "litres",
+              "liters"
+            ]
+          },
+          {
+            "u": "mL",
+            "dim": "volume",
+            "si": 1e-06,
+            "aka": [
+              "ml",
+              "millilitre"
+            ]
+          },
+          {
+            "u": "gal",
+            "dim": "volume",
+            "si": 0.003785411784,
+            "aka": [
+              "gallon"
+            ]
+          },
+          {
+            "u": "m^3/s",
+            "dim": "volumetric_flow",
+            "si": 1,
+            "aka": [
+              "m3/s"
+            ]
+          },
+          {
+            "u": "L/s",
+            "dim": "volumetric_flow",
+            "si": 0.001,
+            "aka": [
+              "l/s"
+            ]
+          },
+          {
+            "u": "L/h",
+            "dim": "volumetric_flow",
+            "si": 2.777777777777778e-07,
+            "aka": [
+              "l/h",
+              "L/hr"
+            ]
+          },
+          {
+            "u": "kg/s",
+            "dim": "mass_flow",
+            "si": 1
+          },
+          {
+            "u": "kg/h",
+            "dim": "mass_flow",
+            "si": 0.0002777777777777778,
+            "aka": [
+              "kg/hr"
+            ]
+          },
+          {
+            "u": "ratio",
+            "dim": "ratio",
+            "si": 1,
+            "aka": [
+              "fraction",
+              "Lambda",
+              "lambda"
+            ]
+          },
+          {
+            "u": "%",
+            "dim": "ratio",
+            "si": 0.01,
+            "aka": [
+              "percent",
+              "pct"
+            ]
+          },
+          {
+            "u": "%/s",
+            "dim": "ratio",
+            "si": 0.01,
+            "aka": [
+              "pct/s"
+            ]
+          },
+          {
+            "u": "%/Period",
+            "dim": "ratio",
+            "si": 0.01,
+            "aka": [
+              "%/period",
+              "pct/period"
+            ]
+          },
+          {
+            "u": "dBm",
+            "dim": "logarithmic",
+            "si": 1,
+            "aka": [
+              "dbm"
+            ]
+          },
+          {
+            "u": "dB",
+            "dim": "logarithmic",
+            "si": 1,
+            "aka": [
+              "db"
+            ]
+          }
+        ]
+      ]
+    },
+    "ianaTimezone": {
+      "title": "IANA timezone",
+      "description": "Display only — never a join key. 3–64. Area/Location (America/New_York) or UTC. Not EDT, not EST, not -04:00, not a civil datetime.",
+      "$comment": "JSONL tz. BINARY catalog v4+ V(25) string.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 64,
+      "pattern": "^(UTC|[A-Za-z0-9_+.-]+/[A-Za-z0-9_+.-]+(/[A-Za-z0-9_+.-]+)?)$",
+      "examples": [
+        "UTC",
+        "America/New_York",
+        "America/Indiana/Indianapolis",
+        "Europe/Brussels",
+        "Australia/Melbourne"
+      ]
+    },
+    "hexColor": {
+      "title": "Span color",
+      "description": "Exactly # plus six hex digits. Required #. Not rgb(), not a name, not #RGB shorthand.",
+      "$comment": "JSONL span c. BINARY: packed string in V(27) span blob.",
+      "type": "string",
+      "minLength": 7,
+      "maxLength": 7,
+      "pattern": "^#[0-9A-Fa-f]{6}$",
+      "examples": [
+        "#e11d48",
+        "#2563eb",
+        "#16a34a"
+      ]
+    },
+    "hash": {
+      "title": "Schema hash",
+      "description": "Exactly 16 lowercase hex digits. MTX: hash of the host this sidecar was built for. MTJ: this recording's schema hash.",
+      "$comment": "JSONL hash. BINARY catalog V(8) u64le.",
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 16,
+      "pattern": "^[0-9a-f]{16}$",
+      "examples": [
+        "0123456789abcdef"
+      ]
+    },
+    "labelText": {
+      "title": "Trace comment",
+      "description": "1–80. Short note drawn as a dot on a trace; hover expands a full-height dotted vertical. Not a sample. Illegal on gauge/compass.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "examples": [
+        "brake lock",
+        "bottomed",
+        "shift",
+        "pit in"
+      ]
+    },
+    "chromeLine": {
+      "title": "Group chrome text",
+      "description": "1–120. A sentence on the right of an MTX group header. Use for descriptions. Use a pill for facts.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "examples": [
+        "LMP2 stints during the race",
+        "Ride-height overlay, host-relative"
+      ]
+    },
+    "pillPart": {
+      "title": "Chrome pill label or value",
+      "description": "1–32. First string is the label, second is the value. Both short: [\"Avg lap\",\"1:52.1\"].",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "examples": [
+        "Avg lap",
+        "1:52.1",
+        "Class",
+        "LMP2"
+      ]
+    },
+    "spanTitle": {
+      "title": "On-bar span title",
+      "description": "1–32. Drawn on the span. Car number or short name. Hover facts go in m, not here.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "examples": [
+        "#443",
+        "Yellow",
+        "Out"
+      ]
+    },
+    "spanSub": {
+      "title": "On-bar span subtitle",
+      "description": "1–48. Drawn on the span under the title. Driver initials and a lap time, not a paragraph.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 48,
+      "examples": [
+        "EL · 1:52.1",
+        "MB · 1:51.8"
+      ]
+    },
+    "metaName": {
+      "title": "Span hover field name",
+      "description": "1–32. Left side of a hover pair. Title case noun: Laps, Best, Avg, License.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "examples": [
+        "Laps",
+        "Best",
+        "Avg",
+        "Total drive time",
+        "Driver License"
+      ]
+    },
+    "metaValue": {
+      "title": "Span hover field value",
+      "description": "1–48. Always a string, even when it looks numeric: \"28\", \"1:50.332\". Not a JSON number.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 48,
+      "examples": [
+        "28",
+        "1:50.332",
+        "1:30:00",
+        "IMSA"
+      ]
+    },
+    "dateString": {
+      "title": "Decorative date",
+      "description": "1–32. Vendor date text, unchanged. Not the clock. Do not join with this.",
+      "$comment": "BINARY identity V(5).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "examples": [
+        "16/03/2025",
+        "2025-03-16"
+      ]
+    },
+    "timeString": {
+      "title": "Decorative time of day",
+      "description": "1–32. Vendor time text, unchanged. Not utc, not a join key.",
+      "$comment": "BINARY identity V(6).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "examples": [
+        "14:00:00",
+        "10:32:15.0"
+      ]
+    },
+    "clockName": {
+      "title": "Vendor clock name",
+      "description": "1–32. gps, utc, or time_of_day. Leftover vendor-scale metadata. Not a timezone and not a join key.",
+      "$comment": "BINARY V(17) string.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "examples": [
+        "gps",
+        "utc",
+        "time_of_day"
+      ]
+    },
+    "sessionHint": {
+      "title": "Session hint",
+      "description": "1–64. Native catalog session-hint component. Omit on MTX.",
+      "$comment": "BINARY V(15).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "examples": [
+        "FP1",
+        "Q",
+        "R"
+      ]
+    },
+    "src": {
+      "title": "Source format",
+      "description": "Where the recording came from. jsonl means this document was authored as JSONL, not converted.",
+      "$comment": "JSONL src. BINARY catalog V(6) source_format.",
+      "enum": [
+        "aimd",
+        "pds",
+        "motec",
+        "vbo",
+        "telemetry",
+        "jsonl"
+      ],
+      "examples": [
+        "pds",
+        "motec",
+        "jsonl"
+      ]
+    },
+    "plt": {
+      "title": "Plot class",
+      "description": "How to draw the channel. Omit for a normal Y-vs-time overlay (trace). Write the full word, not t/g/c.\n  trace   — Speed, throttle, brake, steering, RPM, ride height. May share an axis with the same unit. Labels (lbl) are legal only here.\n  gauge   — Temperature, BPM, SpO2, and other foreign scalars. Own pane. Do not overlay on Speed.\n  compass — Wind direction, heading. Domain wraps 0–360°. Do not plot as an unbounded Y axis.",
+      "$comment": "JSONL plt. BINARY catalog v7 V(29): u8 0=trace 1=gauge 2=compass.",
+      "enum": [
+        "trace",
+        "gauge",
+        "compass"
+      ],
+      "examples": [
+        "trace",
+        "gauge",
+        "compass"
+      ]
+    },
+    "label": {
+      "title": "Trace label pair",
+      "description": "[file-relative ns, text]. ns is a lattice point. Pairs strictly increasing in time. Drawn as a dot on this channel; hover = dotted vertical across the full trace view.",
+      "$comment": "JSONL lbl entry. BINARY catalog v6 V(28): per channel u32 count then (u64le ns, pack_string text)*.",
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/ns"
+        },
+        {
+          "$ref": "#/$defs/labelText"
+        }
+      ],
+      "examples": [
+        [
+          10000000,
+          "brake lock"
+        ],
+        [
+          0,
+          "bottomed"
+        ]
+      ]
+    },
+    "scale": {
+      "title": "Display scale",
+      "description": "[min, max] suggested window. Not a clip and not a unit conversion. Either bound may be null. Omit the key if you do not know an honest range. min must be < max when both are numbers.\n  temp     [60, 120] or [0, 150]\n  BPM      [40, 200]\n  SpO2     [80, 100]\n  heading  [0, 360]",
+      "$comment": "JSONL sc. BINARY v7 V(29) flag bits 0/1 + f64le each.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      ],
+      "examples": [
+        [
+          60,
+          120
+        ],
+        [
+          40,
+          200
+        ],
+        [
+          80,
+          100
+        ],
+        [
+          0,
+          360
+        ],
+        [
+          null,
+          150
+        ]
+      ]
+    },
+    "chromeText": {
+      "title": "Chrome text item",
+      "description": "One sentence on the right of the MTX group header. {\"t\":\"…\"}.",
+      "$comment": "JSONL mtx header r element {t}. No binary sidecar header; MTX is JSONL-only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "t"
+      ],
+      "properties": {
+        "t": {
+          "$ref": "#/$defs/chromeLine"
+        }
+      },
+      "examples": [
+        {
+          "t": "LMP2 stints during the race"
+        }
+      ]
+    },
+    "chromePill": {
+      "title": "Chrome pill item",
+      "description": "A fact on the right of the MTX group header. {\"p\":[label, value]}.",
+      "$comment": "JSONL mtx header r element {p:[label,value]}.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "p"
+      ],
+      "properties": {
+        "p": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/pillPart"
+            },
+            {
+              "$ref": "#/$defs/pillPart"
+            }
+          ]
+        }
+      },
+      "examples": [
+        {
+          "p": [
+            "Avg lap",
+            "1:52.1"
+          ]
+        }
+      ]
+    },
+    "spanPrimary": {
+      "title": "On-bar span chrome",
+      "description": "Drawn on the span bar. title = car number / name. sub = driver · lap. Hover facts belong in m.",
+      "$comment": "JSONL span p. BINARY V(27): pack_string title, pack_string subtitle.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/spanTitle"
+        },
+        "sub": {
+          "$ref": "#/$defs/spanSub"
+        }
+      },
+      "examples": [
+        {
+          "title": "#443",
+          "sub": "EL · 1:52.1"
+        }
+      ]
+    },
+    "metaPair": {
+      "title": "Span hover pair",
+      "description": "[\"Name\", value] — hover only. Name is a string. Value is text, a timespan_ms integer, or {\"v\":ms,\"u\":\"timespan_ms\"}. Race times MUST use timespan_ms so they can be averaged. Order is hover order. Do not put the title here.",
+      "$comment": "JSONL span m entry. BINARY v8 V(27): u32 count then (pack_string name, u8 kind, payload)*. kind 0 = pack_string text; kind 1 = u32le timespan_ms. v5–v7 were string/string; racing-time strings are reinterpreted as timespan_ms.",
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/metaName"
+        },
+        {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/metaValue"
+            },
+            {
+              "$ref": "#/$defs/timespanMs"
+            },
+            {
+              "$ref": "#/$defs/timespanValue"
+            }
+          ]
+        }
+      ],
+      "examples": [
+        [
+          "Laps",
+          "28"
+        ],
+        [
+          "Best",
+          {
+            "v": 110332,
+            "u": "timespan_ms"
+          }
+        ],
+        [
+          "Best",
+          110332
+        ],
+        [
+          "Avg",
+          {
+            "v": 112104,
+            "u": "timespan_ms"
+          }
+        ],
+        [
+          "Total drive time",
+          {
+            "v": 5400000,
+            "u": "timespan_ms"
+          }
+        ],
+        [
+          "Driver License",
+          "IMSA"
+        ]
+      ]
+    },
+    "lap": {
+      "title": "Lap tuple",
+      "description": "[number, start_ns, end_ns, complete] or with first_video_frame. complete is 0 or 1. end > start. Both lattice points. Duration is end-start and is not stored.",
+      "$comment": "JSONL laps line is an array of these. BINARY catalog V(3) packed: u32 count, then per lap i64le number, u64le start, u64le end, u64le duration, u8 complete, and if format>=3: u8 present + optional u64le first_video_frame. JSONL does not store duration (it is end-start).",
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 5,
+      "prefixItems": [
+        {
+          "type": "integer"
+        },
+        {
+          "$ref": "#/$defs/ns"
+        },
+        {
+          "$ref": "#/$defs/ns"
+        },
+        {
+          "enum": [
+            0,
+            1
+          ]
+        },
+        {
+          "$ref": "#/$defs/ns"
+        }
+      ],
+      "examples": [
+        [
+          1,
+          0,
+          40000000,
+          0
+        ],
+        [
+          2,
+          40000000,
+          80000000,
+          1,
+          12
+        ]
+      ]
+    },
+    "mtj_header": {
+      "title": "MTJ recording header (line 1)",
+      "description": "First line of a .telemetry.jsonl recording. mtj, q, dur required. Write utc and tz whenever known so the file can be placed on the absolute axis. Omit empty optional keys and omit o when it is 0.",
+      "$comment": "BINARY: identity V(1) strings; utc V(23-24); tz V(25); duration V(9); hash V(8); session_hint V(15); source_format V(6). q and o exist only in JSONL (native uses per-channel periods).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mtj",
+        "q",
+        "dur"
+      ],
+      "properties": {
+        "mtj": {
+          "description": "Recording document version. Independent of .telemetry FORMAT_VERSION and of mtx.",
+          "const": 1,
+          "examples": [
+            1
+          ]
+        },
+        "q": {
+          "description": "Lattice quantum in nanoseconds. Every t0, sample instant, lap bound, span bound, label ns, and dur is o + k·q. Typical: 10000000 (10 ms) when the slowest channel is 100 Hz.",
+          "$comment": "JSONL-only.",
+          "type": "integer",
+          "minimum": 1,
+          "examples": [
+            1000000,
+            10000000
+          ]
+        },
+        "dur": {
+          "description": "Exclusive file-relative end. A lattice point ≥ o. Last legal instant is just before dur.",
+          "$comment": "BINARY V(9) u64le.",
+          "$ref": "#/$defs/ns"
+        },
+        "o": {
+          "description": "Lattice origin. Default 0. Omit when 0.",
+          "$comment": "JSONL-only.",
+          "$ref": "#/$defs/ns"
+        },
+        "src": {
+          "$ref": "#/$defs/src"
+        },
+        "srcp": {
+          "$ref": "#/$defs/srcp"
+        },
+        "drv": {
+          "description": "Driver name.",
+          "$comment": "BINARY identity V(0) driver.",
+          "$ref": "#/$defs/identity"
+        },
+        "veh": {
+          "description": "Vehicle name or identifier.",
+          "$comment": "BINARY identity V(1) vehicle.",
+          "$ref": "#/$defs/identity"
+        },
+        "ven": {
+          "description": "Venue / circuit.",
+          "$comment": "BINARY identity V(2) venue.",
+          "$ref": "#/$defs/identity"
+        },
+        "evt": {
+          "description": "Event name.",
+          "$comment": "BINARY identity V(3) event.",
+          "$ref": "#/$defs/identity"
+        },
+        "ses": {
+          "description": "Session name (FP1, Qualifying, Race).",
+          "$comment": "BINARY identity V(4) session.",
+          "$ref": "#/$defs/identity"
+        },
+        "date": {
+          "$ref": "#/$defs/dateString"
+        },
+        "time": {
+          "$ref": "#/$defs/timeString"
+        },
+        "utc": {
+          "$ref": "#/$defs/utcEpochNs"
+        },
+        "tz": {
+          "$ref": "#/$defs/ianaTimezone"
+        },
+        "clk": {
+          "$ref": "#/$defs/clockName"
+        },
+        "abs": {
+          "description": "Vendor clock reading at t=0. Not a join key. Do not use this instead of utc.",
+          "$comment": "BINARY V(18) u64le.",
+          "type": "integer"
+        },
+        "abe": {
+          "description": "Vendor clock reading at dur. Not a join key.",
+          "$comment": "BINARY V(19) u64le.",
+          "type": "integer"
+        },
+        "hint": {
+          "$ref": "#/$defs/sessionHint"
+        },
+        "vo": {
+          "$ref": "#/$defs/videoOffsetNs"
+        },
+        "vf": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/videoFileRef"
+          }
+        },
+        "vpts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "Presentation timestamp of every video frame, ns, presentation order, non-decreasing. Same values as native video_frames.bin.",
+          "$comment": "Non-decreasing order and vpts-requires-vf are enforced by the reader, not JSON Schema (dependentRequired covers presence)."
+        },
+        "passes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/appliedPass"
+          }
+        },
+        "hash": {
+          "$ref": "#/$defs/hash"
+        }
+      },
+      "examples": [
+        {
+          "mtj": 1,
+          "q": 10000000,
+          "dur": 40000000,
+          "src": "pds",
+          "drv": "Tobi",
+          "ven": "Sebring",
+          "utc": 1742040000000000000,
+          "tz": "America/New_York"
+        }
+      ],
+      "dependentRequired": {
+        "vpts": [
+          "vf"
+        ]
+      }
+    },
+    "mtx_header": {
+      "title": "MTX group header",
+      "description": "Starts a sidecar folder. Records that follow belong to this group until the next mtx header or EOF. There is no .telemetry zip member and no k:\"f\" folder record. Required: mtx n q dur vis utc tz. Copy host utc and tz when times are host-relative so the join shift is zero.",
+      "$comment": "JSONL-only. A later mtx header is a new folder, not a second file.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mtx",
+        "n",
+        "q",
+        "dur",
+        "vis",
+        "utc",
+        "tz"
+      ],
+      "properties": {
+        "mtx": {
+          "description": "Extension document version. Independent of mtj and FORMAT_VERSION.",
+          "const": 1,
+          "examples": [
+            1
+          ]
+        },
+        "n": {
+          "description": "Folder title shown in the UI. The sidecar group is this name.",
+          "$ref": "#/$defs/name"
+        },
+        "q": {
+          "description": "This group's lattice quantum, nanoseconds. Need not equal the host q.",
+          "type": "integer",
+          "minimum": 1,
+          "examples": [
+            1000000,
+            10000000
+          ]
+        },
+        "dur": {
+          "description": "Exclusive end of this group's own timeline. Independent of the host dur.",
+          "$ref": "#/$defs/ns"
+        },
+        "vis": {
+          "description": "1 group starts expanded, 0 starts collapsed.",
+          "$ref": "#/$defs/vis"
+        },
+        "utc": {
+          "$ref": "#/$defs/utcEpochNs"
+        },
+        "tz": {
+          "$ref": "#/$defs/ianaTimezone"
+        },
+        "o": {
+          "$ref": "#/$defs/ns"
+        },
+        "r": {
+          "description": "Right-aligned chrome, left-to-right. Mix {\"t\":\"sentence\"} and {\"p\":[\"label\",\"value\"]}. Max 8 items.",
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/chromeText"
+              },
+              {
+                "$ref": "#/$defs/chromePill"
+              }
+            ]
+          },
+          "examples": [
+            [
+              {
+                "t": "LMP2 stints during the race"
+              },
+              {
+                "p": [
+                  "Avg lap",
+                  "1:52.1"
+                ]
+              }
+            ]
+          ]
+        },
+        "clk": {
+          "$ref": "#/$defs/clockName"
+        },
+        "abs": {
+          "description": "Vendor-clock reading. Not a join key.",
+          "type": "integer"
+        },
+        "abe": {
+          "description": "Vendor-clock end. Not a join key.",
+          "type": "integer"
+        },
+        "hash": {
+          "$ref": "#/$defs/hash"
+        }
+      },
+      "examples": [
+        {
+          "mtx": 1,
+          "n": "Sebring 12H 2025",
+          "q": 1000000,
+          "dur": 12600000000000,
+          "vis": 1,
+          "utc": 1742040000000000000,
+          "tz": "America/New_York",
+          "r": [
+            {
+              "t": "LMP2 stints during the race"
+            },
+            {
+              "p": [
+                "Avg lap",
+                "1:52.1"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "channel": {
+      "title": "Sample channel",
+      "description": "One sampled signal. Required: n hz v. MTX also requires vis. t[i] = t0 + i·period_ns(hz). null in v is a missing value at that instant, not a hole in time.\n\nForeign signals (do not overlay on Speed):\n  Water Temp   plt=gauge   sc=[60,120]  rnd=1  fmt=0.0°C\n  Heart Rate   plt=gauge   sc=[40,200]  rnd=0  fmt=000\n  SpO2         plt=gauge   sc=[80,100]  rnd=0  fmt=000%\n  Wind Dir     plt=compass sc=[0,360]   rnd=0  fmt=0°\n\nlbl is legal only when plt is omitted or trace.",
+      "$comment": "JSONL record (k omitted or c). BINARY: catalog V(4) packed channel metadata + zip member channels/NNNN.bin (native column). Optional channels/NNNN.time.bin if kind=1 (event). JSONL v is already in engineering units; native may store integers with scale/bias (no JSONL key). kind u8: 0 regular, 1 event. unit_source u8: 0 unknown, 1 declared, 2 spec-default. sample_type u8: 1 u8, 2 i16, 3 u16, 4 i32, 5 u32, 6 f32, 7 f64.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "n",
+        "hz",
+        "v"
+      ],
+      "properties": {
+        "k": {
+          "description": "Omit or c. Never s (that is a span).",
+          "const": "c",
+          "examples": [
+            "c"
+          ]
+        },
+        "n": {
+          "description": "Channel name. Unique in the file. Case-sensitive.",
+          "$comment": "BINARY packed channel name.",
+          "$ref": "#/$defs/name"
+        },
+        "hz": {
+          "description": "Sample rate in hertz. Prefer a JSON integer when it divides 1e9 (100, 50, 25, 10, 1). period_ns must be a multiple of header q.",
+          "$comment": "BINARY: chunk.sample_period_ns = 1e9/hz when it divides exactly.",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "examples": [
+            100,
+            25,
+            1
+          ]
+        },
+        "u": {
+          "$ref": "#/$defs/unit"
+        },
+        "v": {
+          "description": "Engineering values, oldest first. At least one element. null = missing at that lattice instant. Integers as JSON integers (12 not 12.0).",
+          "$comment": "BINARY: typed column in channels/NNNN.bin, decode ≈ raw*scale+bias.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "examples": [
+            [
+              10,
+              11,
+              12,
+              13
+            ],
+            [
+              88.4
+            ],
+            [
+              42,
+              null,
+              41
+            ]
+          ]
+        },
+        "t0": {
+          "description": "First-sample file-relative ns. Default o. Lattice point. A sidecar covering only lap 3 uses that lap's start_ns, not 0.",
+          "$comment": "BINARY: first chunk.time_base_ns.",
+          "$ref": "#/$defs/ns"
+        },
+        "vis": {
+          "$ref": "#/$defs/vis"
+        },
+        "plt": {
+          "$ref": "#/$defs/plt"
+        },
+        "sc": {
+          "$ref": "#/$defs/scale"
+        },
+        "rnd": {
+          "description": "Decimal places to show, 0–15. 0 with fmt=000 prints an integer BPM. 1 with fmt=0.0°C prints one decimal.",
+          "$comment": "BINARY v7 V(29) flag bit 2 + u8.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15,
+          "examples": [
+            0,
+            1,
+            2
+          ]
+        },
+        "fmt": {
+          "$ref": "#/$defs/fmt"
+        },
+        "lbl": {
+          "description": "Trace-only comments. Forbidden when plt is gauge or compass. Max 256 pairs, strictly increasing ns.",
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/label"
+          },
+          "examples": [
+            [
+              [
+                10000000,
+                "brake lock"
+              ]
+            ]
+          ]
+        }
+      },
+      "examples": [
+        {
+          "n": "Speed",
+          "hz": 100,
+          "u": "km/h",
+          "v": [
+            10,
+            11,
+            12,
+            13
+          ],
+          "lbl": [
+            [
+              10000000,
+              "brake lock"
+            ]
+          ]
+        },
+        {
+          "n": "Water Temp",
+          "hz": 1,
+          "u": "°C",
+          "plt": "gauge",
+          "sc": [
+            60,
+            120
+          ],
+          "rnd": 1,
+          "fmt": "0.0°C",
+          "v": [
+            88.4
+          ]
+        },
+        {
+          "n": "Heart Rate",
+          "hz": 1,
+          "u": "bpm",
+          "plt": "gauge",
+          "sc": [
+            40,
+            200
+          ],
+          "rnd": 0,
+          "fmt": "000",
+          "v": [
+            142
+          ]
+        },
+        {
+          "n": "SpO2",
+          "hz": 1,
+          "u": "%",
+          "plt": "gauge",
+          "sc": [
+            80,
+            100
+          ],
+          "rnd": 0,
+          "fmt": "000%",
+          "v": [
+            98
+          ]
+        },
+        {
+          "n": "Wind Dir",
+          "hz": 1,
+          "u": "°",
+          "plt": "compass",
+          "sc": [
+            0,
+            360
+          ],
+          "rnd": 0,
+          "fmt": "0°",
+          "v": [
+            247
+          ]
+        },
+        {
+          "n": "Ride Height FL",
+          "hz": 100,
+          "u": "mm",
+          "vis": 1,
+          "t0": 10000000,
+          "v": [
+            42,
+            41
+          ],
+          "lbl": [
+            [
+              10000000,
+              "bottomed"
+            ]
+          ]
+        }
+      ]
+    },
+    "span": {
+      "title": "Span interval",
+      "description": "An interval [s,e) on the file-relative timeline — a stint, a yellow, a pit — not a sampled signal. k must be s. e > s. Both lattice points. p is drawn on the bar; m is hover-only string pairs.",
+      "$comment": "JSONL record k=s. BINARY catalog v5+ V(27) packed: u32 count, then name, u64 start, u64 end, u8 vis, color, title, subtitle, u32 meta_count, meta pairs.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "k",
+        "s",
+        "e"
+      ],
+      "properties": {
+        "k": {
+          "description": "Must be s. f is invalid (there is no folder record).",
+          "const": "s",
+          "examples": [
+            "s"
+          ]
+        },
+        "n": {
+          "description": "Stable id. Not shown if p.title is set. Unique among spans is recommended (443-1).",
+          "$ref": "#/$defs/name"
+        },
+        "s": {
+          "description": "Inclusive start, file-relative ns. A stint in lap 3 uses that lap's start_ns.",
+          "$ref": "#/$defs/ns"
+        },
+        "e": {
+          "description": "Exclusive end, file-relative ns. Must be > s.",
+          "$ref": "#/$defs/ns"
+        },
+        "vis": {
+          "$ref": "#/$defs/vis"
+        },
+        "c": {
+          "$ref": "#/$defs/hexColor"
+        },
+        "p": {
+          "$ref": "#/$defs/spanPrimary"
+        },
+        "m": {
+          "description": "Hover-only fields, max 16. Each [\"Name\",\"value\"] both strings.",
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/metaPair"
+          }
+        }
+      },
+      "examples": [
+        {
+          "k": "s",
+          "n": "443-1",
+          "s": 0,
+          "e": 5400000000000,
+          "vis": 1,
+          "c": "#e11d48",
+          "p": {
+            "title": "#443",
+            "sub": "EL · 1:52.1"
+          },
+          "m": [
+            [
+              "Laps",
+              "28"
+            ],
+            [
+              "Best",
+              {
+                "v": 110332,
+                "u": "timespan_ms"
+              }
+            ]
+          ]
+        },
+        {
+          "k": "s",
+          "n": "out-lap",
+          "s": 0,
+          "e": 40000000,
+          "p": {
+            "title": "Out"
+          },
+          "m": [
+            [
+              "Note",
+              "install lap"
+            ]
+          ]
+        }
+      ]
+    },
+    "laps": {
+      "title": "MTJ laps line",
+      "description": "Line 2 of an MTJ recording. MTX has no laps line. Empty recording writes []. Laps in non-decreasing start_ns order.",
+      "$comment": "BINARY V(3).",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/lap"
+      },
+      "examples": [
+        [
+          [
+            1,
+            0,
+            40000000,
+            0
+          ]
+        ],
+        []
+      ]
+    },
+    "mtj_line": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/mtj_header"
+        },
+        {
+          "$ref": "#/$defs/laps"
+        },
+        {
+          "$ref": "#/$defs/channel"
+        },
+        {
+          "$ref": "#/$defs/span"
+        }
+      ]
+    },
+    "mtx_line": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/mtx_header"
+        },
+        {
+          "$ref": "#/$defs/channel"
+        },
+        {
+          "$ref": "#/$defs/span"
+        }
+      ]
+    },
+    "srcp": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Path of the original recording as seen at first conversion. Carried through rewrites like src.",
+      "examples": [
+        "~/Documents/Telemetry/26R05_RAM/quali.mp4"
+      ],
+      "$comment": "MTJ key srcp; native catalog source_path (V(7))"
+    },
+    "appliedPass": {
+      "type": "object",
+      "description": "Provenance of one applied processing pass: registry name, version, params, input and output channel names.",
+      "required": [
+        "n",
+        "v"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "n": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "examples": [
+            "gps.quality",
+            "speed.distance"
+          ]
+        },
+        "v": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "p": {
+          "type": "object",
+          "maxProperties": 16,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "in": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/name"
+          }
+        },
+        "out": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/name"
+          }
+        }
+      },
+      "$comment": "MTJ key passes[]; native catalog packed passes (V(30), v9)"
+    },
+    "videoOffsetNs": {
+      "type": "integer",
+      "description": "Recording-level telemetry→player presentation shift in nanoseconds (player_ns = t + vo). Signed; MP4 edit lists make it per-file and non-zero.",
+      "examples": [
+        101333333
+      ],
+      "$comment": "MTJ key vo; native video_presentation_offset_ns"
+    },
+    "videoFileRef": {
+      "type": "object",
+      "description": "One linked video file: basename, 1-based index, frame count, BLAKE3, per-file presentation offset ns.",
+      "required": [
+        "n",
+        "i"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "n": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "examples": [
+            "1602_Driver02_lap0-15_SCHD0060.MP4"
+          ]
+        },
+        "i": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "fc": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "b3": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "po": {
+          "type": "integer"
+        }
+      },
+      "$comment": "MTJ key vf[]; native packed video handles (V(20))"
+    }
+  }
+}

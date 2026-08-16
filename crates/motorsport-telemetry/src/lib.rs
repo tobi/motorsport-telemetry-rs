@@ -262,6 +262,14 @@ impl TelemetrySource for TelemetryFile {
         delegate!(self, source => TelemetrySource::spans(source))
     }
 
+    fn channel_labels(&self, channel_index: usize) -> &[motorsport_telemetry_core::ChannelLabel] {
+        delegate!(self, source => TelemetrySource::channel_labels(source, channel_index))
+    }
+
+    fn channel_display(&self, channel_index: usize) -> motorsport_telemetry_core::ChannelDisplay {
+        delegate!(self, source => TelemetrySource::channel_display(source, channel_index))
+    }
+
     fn identity(&self) -> SourceIdentity {
         delegate!(self, source => source.identity())
     }

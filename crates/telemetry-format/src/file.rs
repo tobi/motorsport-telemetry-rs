@@ -462,6 +462,22 @@ impl TelemetrySource for NativeRecording {
         &self.catalog.spans
     }
 
+    fn channel_labels(&self, channel_index: usize) -> &[motorsport_telemetry_core::ChannelLabel] {
+        self.catalog
+            .channels
+            .get(channel_index)
+            .map(|channel| channel.labels.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn channel_display(&self, channel_index: usize) -> motorsport_telemetry_core::ChannelDisplay {
+        self.catalog
+            .channels
+            .get(channel_index)
+            .map(|channel| channel.display.clone())
+            .unwrap_or_default()
+    }
+
     fn applied_passes(&self) -> &[AppliedPass] {
         &self.catalog.passes
     }

@@ -13,14 +13,10 @@ categories = ["parser-implementations", "science"]
 [dependencies]
 motorsport-telemetry-core.workspace = true
 motorsport-track-atlas.workspace = true
-memmap2.workspace = true
 aim-telemetry.workspace = true
-blake3.workspace = true
 cosworth-telemetry.workspace = true
 motec-telemetry.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
 racelogic-telemetry.workspace = true
 telemetry-format.workspace = true
 telemetry-passes.workspace = true

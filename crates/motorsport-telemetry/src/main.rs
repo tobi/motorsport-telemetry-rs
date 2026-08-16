@@ -1,14 +1,139 @@
 use motorsport_telemetry::motorsport_telemetry_core::{FileMetadata, TelemetrySource};
-use motorsport_telemetry::{open, TelemetryFile};
+use motorsport_telemetry::{open, TelemetryError, TelemetryFile};
 use racelogic_telemetry::RacelogicFile;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use telemetry_format::needs_update;
+use telemetry_format::{
+    is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, needs_update, write_from_source,
+    write_from_source_stripped, write_jsonl_extension_from_source_with,
+    write_jsonl_from_source_with, JsonlRecording, NativeRecording, FORMAT_VERSION,
+};
+use telemetry_passes::{apply_registry, PassOutcome};
 
-const USAGE: &str = "Usage: motorsport-telemetry [--json] <file>";
+const USAGE: &str = "\
+Usage: motorsport-telemetry <command> [options]
+
+Inspect recordings, convert them to .telemetry or JSONL, and verify
+the on-disk formats this crate writes.
+
+Commands:
+  inspect    Print laps, track, video, and identity for a file
+             or every matching recording under a folder
+  convert    Write native .telemetry (default) or JSONL by suffix
+  verify     Check .telemetry / .telemetry.jsonl / .zstd
+
+Run motorsport-telemetry <command> --help for that command.
+Run motorsport-telemetry help <command> for the same text.
+
+Options:
+  -h, --help       Show this help
+  -V, --version    Show version
+";
+
+const INSPECT_HELP: &str = "\
+Usage: motorsport-telemetry inspect [options] <path>
+
+Print laps, track, video, and identity. <path> may be one recording or a
+folder. A folder is walked recursively; only recognized telemetry names
+are considered, then --mask (if any) filters that set.
+
+Arguments:
+  <path>               A telemetry file, or a directory to scan
+
+Options:
+  --json               Machine-readable JSON
+  -m, --mask <glob>    Keep files whose relative path or file name matches
+                       this glob. Repeatable; a file matches if any mask
+                       matches. Matching is case-insensitive. Use / in globs.
+  -h, --help           Show this help
+
+Globs:
+  *                    Any characters except /
+  **                   Any directories, including none
+  ?                    One character except /
+  {ld,pds}             Either alternative
+
+Default folder filter (no --mask):
+  .mp4  .pds  .ld  .vbo  .telemetry
+  .telemetry.jsonl  .jsonl  .mtj  .telemetry.ext.jsonl
+  and those names with .zstd / .zst
+
+A single file still prints one report. A folder prints one report per
+match; --json then wraps them:
+
+  {\"root\",\"mask\",\"ok\",\"failed\",\"files\":[...],\"errors\":[...]}
+
+Examples:
+  motorsport-telemetry inspect run.ld
+  motorsport-telemetry inspect --json run.mp4
+  motorsport-telemetry inspect ~/Documents/Telemetry
+  motorsport-telemetry inspect ~/Documents/Telemetry --mask '**/*.pds'
+  motorsport-telemetry inspect ~/Documents --mask '**/sebring-2026/**' --mask '*.telemetry'
+";
+
+const CONVERT_HELP: &str = "\
+Usage: motorsport-telemetry convert [options] <input> [output]
+
+Convert a recording to native .telemetry, or to JSONL when the output
+name says so. By default the standard processing-pass registry runs and
+appends its derived channels; every pass is lossless, and --strip-passes
+recovers a byte-identical raw conversion.
+
+Arguments:
+  <input>              Any supported source: .mp4 .pds .ld .vbo
+                       .telemetry .telemetry.jsonl and .zstd / .zst variants
+  [output]             Destination. Default: <input-file-name>.telemetry
+                       next to the input file
+
+Options:
+  --no-passes          Convert the source as-is; run no passes
+  --strip-passes       Drop previously applied pass outputs (native
+                       .telemetry output only)
+
+Output suffix:
+  .telemetry                    Native STORE zip (the default)
+  .telemetry.jsonl              MTJ, uncompressed UTF-8
+  .telemetry.jsonl.zstd         MTJ, one zstd frame (level 11)
+  .telemetry.ext.jsonl[.zstd]   MTX sidecar
+
+The printed line is the destination path.
+
+Examples:
+  motorsport-telemetry convert run.pds
+  motorsport-telemetry convert run.pds weekend.telemetry
+  motorsport-telemetry convert run.pds weekend.telemetry.jsonl
+  motorsport-telemetry convert run.pds weekend.telemetry.jsonl.zstd
+  motorsport-telemetry convert run.pds overlay.telemetry.ext.jsonl
+";
+
+const VERIFY_HELP: &str = "\
+Usage: motorsport-telemetry verify <file>...
+
+Check that each file is a valid native .telemetry archive or an MTJ/MTX
+JSONL document (plain or zstd). Opens a native file without rewriting an
+older catalog. Decodes one sample from every channel.
+
+Accepted names:
+  .telemetry
+  .telemetry.jsonl  .jsonl  .mtj
+  .telemetry.ext.jsonl
+  those names with .zstd / .zst
+
+A compressed frame still verifies under a .telemetry.jsonl name (zstd
+magic is sniffed). Vendor files (.pds .ld .mp4 .vbo) are rejected.
+
+Exit status is 1 if any file fails, 2 on usage errors.
+
+Examples:
+  motorsport-telemetry verify run.telemetry
+  motorsport-telemetry verify run.telemetry.jsonl run.telemetry.jsonl.zstd
+";
+
 const SUSPICIOUS_CLOCK_AGE_DAYS: i64 = 365 * 2;
 
 #[derive(Debug)]
@@ -44,51 +169,639 @@ struct Inspection {
 
 fn main() {
     match arguments(std::env::args_os().skip(1)) {
-        Ok(Command::Help) => println!("{USAGE}"),
+        Ok(Command::Help { topic }) => print!("{}", help_text(topic)),
         Ok(Command::Version) => println!("motorsport-telemetry {}", env!("CARGO_PKG_VERSION")),
-        Ok(Command::Inspect { path, json }) => match inspect(&path) {
-            Ok(inspection) if json => print_json(&inspection),
-            Ok(inspection) => print_human(&inspection),
+        Ok(Command::Inspect { path, json, masks }) => {
+            if let Err(error) = run_inspect(&path, json, &masks) {
+                eprintln!("motorsport-telemetry: {error}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Command::Convert {
+            input,
+            output,
+            passes,
+        }) => match convert(&input, output.as_deref(), passes) {
+            Ok(dest) => println!("{}", dest.display()),
             Err(error) => {
                 eprintln!("motorsport-telemetry: {error}");
                 std::process::exit(1);
             }
         },
+        Ok(Command::Verify { paths }) => {
+            let mut failed = 0usize;
+            for path in &paths {
+                match verify(path) {
+                    Ok(report) => println!("{report}"),
+                    Err(error) => {
+                        failed += 1;
+                        eprintln!("{}: FAIL  {error}", path.display());
+                    }
+                }
+            }
+            if failed > 0 {
+                std::process::exit(1);
+            }
+        }
         Err(message) => {
-            eprintln!("motorsport-telemetry: {message}\n{USAGE}");
+            eprintln!("motorsport-telemetry: {message}");
+            eprintln!();
+            eprint!("{USAGE}");
             std::process::exit(2);
         }
     }
 }
 
+fn help_text(topic: HelpTopic) -> &'static str {
+    match topic {
+        HelpTopic::Root => USAGE,
+        HelpTopic::Inspect => INSPECT_HELP,
+        HelpTopic::Convert => CONVERT_HELP,
+        HelpTopic::Verify => VERIFY_HELP,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpTopic {
+    Root,
+    Inspect,
+    Convert,
+    Verify,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Help,
+    Help {
+        topic: HelpTopic,
+    },
     Version,
-    Inspect { path: PathBuf, json: bool },
+    Inspect {
+        path: PathBuf,
+        json: bool,
+        masks: Vec<String>,
+    },
+    Convert {
+        input: PathBuf,
+        output: Option<PathBuf>,
+        passes: PassMode,
+    },
+    Verify {
+        paths: Vec<PathBuf>,
+    },
+}
+
+/// What `convert` does with the processing-pass registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassMode {
+    /// Run every applicable registered pass and append its channels.
+    Apply,
+    /// Convert the source as-is, applying nothing.
+    Skip,
+    /// Drop previously applied pass outputs, recovering the raw conversion.
+    Strip,
 }
 
 fn arguments(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
+    let mut args = args.into_iter().peekable();
+    let Some(first) = args.next() else {
+        return Err("missing command".into());
+    };
+    if first == "-h" || first == "--help" {
+        return Ok(Command::Help {
+            topic: HelpTopic::Root,
+        });
+    }
+    if first == "-V" || first == "--version" {
+        return Ok(Command::Version);
+    }
+    match first.to_string_lossy().as_ref() {
+        "help" => parse_help_topic(args),
+        "inspect" => parse_inspect(args),
+        "convert" => parse_convert(args),
+        "verify" => parse_verify(args),
+        other if other.starts_with('-') => Err(format!("unknown option {other}")),
+        other => Err(format!(
+            "unknown command {other} (try inspect, convert, or verify)"
+        )),
+    }
+}
+
+fn parse_help_topic(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
+    let mut topic = HelpTopic::Root;
+    for argument in args {
+        let name = argument.to_string_lossy();
+        if name == "-h" || name == "--help" {
+            return Ok(Command::Help {
+                topic: HelpTopic::Root,
+            });
+        }
+        topic = match name.as_ref() {
+            "inspect" => HelpTopic::Inspect,
+            "convert" => HelpTopic::Convert,
+            "verify" => HelpTopic::Verify,
+            other => return Err(format!("no help topic {other}")),
+        };
+    }
+    Ok(Command::Help { topic })
+}
+
+fn parse_inspect(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut path = None;
     let mut json = false;
-    let mut positional_only = false;
-    for argument in args {
-        if !positional_only && argument == "--" {
-            positional_only = true;
-        } else if !positional_only && (argument == "-h" || argument == "--help") {
-            return Ok(Command::Help);
-        } else if !positional_only && (argument == "-V" || argument == "--version") {
-            return Ok(Command::Version);
-        } else if !positional_only && argument == "--json" {
+    let mut masks = Vec::new();
+    let mut args = args.into_iter().peekable();
+    while let Some(argument) = args.next() {
+        if argument == "-h" || argument == "--help" {
+            return Ok(Command::Help {
+                topic: HelpTopic::Inspect,
+            });
+        }
+        if argument == "--json" {
             json = true;
-        } else if !positional_only && argument.to_string_lossy().starts_with('-') {
-            return Err(format!("unknown option {}", argument.to_string_lossy()));
-        } else if path.replace(PathBuf::from(&argument)).is_some() {
-            return Err("expected exactly one telemetry file".into());
+            continue;
+        }
+        let text = argument.to_string_lossy();
+        if text == "-m" || text == "--mask" {
+            let value = args
+                .next()
+                .ok_or_else(|| "inspect --mask needs a glob".to_string())?;
+            masks.push(value.to_string_lossy().into_owned());
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--mask=") {
+            if value.is_empty() {
+                return Err("inspect --mask needs a glob".into());
+            }
+            masks.push(value.to_owned());
+            continue;
+        }
+        if text.starts_with('-') {
+            return Err(format!("unknown option {text}"));
+        }
+        if path.replace(PathBuf::from(&argument)).is_some() {
+            return Err("inspect expects one file or folder".into());
         }
     }
-    path.map(|path| Command::Inspect { path, json })
-        .ok_or_else(|| "missing telemetry file".into())
+    path.map(|path| Command::Inspect { path, json, masks })
+        .ok_or_else(|| "inspect is missing a file or folder".into())
+}
+
+fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
+    let mut positional = Vec::new();
+    let mut passes = PassMode::Apply;
+    for argument in args {
+        if argument == "-h" || argument == "--help" {
+            return Ok(Command::Help {
+                topic: HelpTopic::Convert,
+            });
+        }
+        if argument == "--no-passes" {
+            passes = PassMode::Skip;
+            continue;
+        }
+        if argument == "--strip-passes" {
+            passes = PassMode::Strip;
+            continue;
+        }
+        if argument.to_string_lossy().starts_with('-') {
+            return Err(format!("unknown option {}", argument.to_string_lossy()));
+        }
+        positional.push(PathBuf::from(argument));
+    }
+    match positional.as_slice() {
+        [input] => Ok(Command::Convert {
+            input: input.clone(),
+            output: None,
+            passes,
+        }),
+        [input, output] => Ok(Command::Convert {
+            input: input.clone(),
+            output: Some(output.clone()),
+            passes,
+        }),
+        [] => Err("convert is missing an input file".into()),
+        _ => Err("convert expects <input> [output]".into()),
+    }
+}
+
+fn parse_verify(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
+    let mut paths = Vec::new();
+    for argument in args {
+        if argument == "-h" || argument == "--help" {
+            return Ok(Command::Help {
+                topic: HelpTopic::Verify,
+            });
+        }
+        if argument.to_string_lossy().starts_with('-') {
+            return Err(format!("unknown option {}", argument.to_string_lossy()));
+        }
+        paths.push(PathBuf::from(argument));
+    }
+    if paths.is_empty() {
+        return Err("verify is missing a telemetry file".into());
+    }
+    Ok(Command::Verify { paths })
+}
+
+fn run_inspect(path: &Path, json: bool, masks: &[String]) -> Result<(), String> {
+    let targets = collect_inspect_targets(path, masks)?;
+    if targets.is_empty() {
+        return Err(if masks.is_empty() {
+            format!("no telemetry files under {}", path.display())
+        } else {
+            format!(
+                "no telemetry files under {} matching {}",
+                path.display(),
+                masks.join(", ")
+            )
+        });
+    }
+    if targets.len() == 1 && path.is_file() {
+        let inspection = inspect(&targets[0]).map_err(|error| error.to_string())?;
+        if json {
+            print_json(&inspection);
+        } else {
+            print_human(&inspection);
+        }
+        return Ok(());
+    }
+
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    for (index, target) in targets.iter().enumerate() {
+        match inspect(target) {
+            Ok(inspection) => {
+                if !json {
+                    if index > 0 {
+                        println!("---");
+                    }
+                    println!("# {}/{}  {}", index + 1, targets.len(), target.display());
+                    print_human(&inspection);
+                }
+                files.push(inspection);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if json {
+                    errors.push((target.display().to_string(), message));
+                } else {
+                    println!("# {}/{}  {}", index + 1, targets.len(), target.display());
+                    println!("error: {message}");
+                    errors.push((target.display().to_string(), message));
+                }
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "root": path.display().to_string(),
+                "mask": masks,
+                "ok": files.len(),
+                "failed": errors.len(),
+                "files": files.iter().map(inspection_json).collect::<Vec<_>>(),
+                "errors": errors.iter().map(|(file, error)| json!({
+                    "file": file,
+                    "error": error,
+                })).collect::<Vec<_>>(),
+            }))
+            .expect("scan JSON is serializable")
+        );
+    } else {
+        println!(
+            "---\nscanned {} file{}, {} error{}",
+            files.len() + errors.len(),
+            if files.len() + errors.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            errors.len(),
+            if errors.len() == 1 { "" } else { "s" }
+        );
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} file(s) failed to inspect", errors.len()))
+    }
+}
+
+fn collect_inspect_targets(root: &Path, masks: &[String]) -> Result<Vec<PathBuf>, String> {
+    if root.is_file() {
+        if !masks.is_empty() && !matches_any_mask(root, root, masks) {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![root.to_path_buf()]);
+    }
+    if !root.is_dir() {
+        return Err(format!("not a file or directory: {}", root.display()));
+    }
+    let mut out = Vec::new();
+    walk_inspect(root, root, masks, &mut out).map_err(|error| error.to_string())?;
+    out.sort();
+    Ok(out)
+}
+
+fn walk_inspect(
+    root: &Path,
+    dir: &Path,
+    masks: &[String],
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(Result::ok).collect();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let metadata = match entry.file_type() {
+            Ok(file_type) if file_type.is_symlink() => match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            },
+            Ok(_) => match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            if path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                continue;
+            }
+            walk_inspect(root, &path, masks, out)?;
+        } else if metadata.is_file()
+            && is_known_telemetry_path(&path)
+            && (masks.is_empty() || matches_any_mask(root, &path, masks))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_known_telemetry_path(path: &Path) -> bool {
+    if is_jsonl_path(path) || is_native_telemetry(path) {
+        return true;
+    }
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4" | "pds" | "ld" | "vbo")
+    )
+}
+
+fn matches_any_mask(root: &Path, path: &Path, masks: &[String]) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    masks.iter().any(|mask| {
+        expand_braces(mask)
+            .into_iter()
+            .any(|pattern| glob_match(&pattern, &relative) || glob_match(&pattern, &name))
+    })
+}
+
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let Some(start) = pattern.find('{') else {
+        return vec![pattern.to_owned()];
+    };
+    let Some(end) = pattern[start + 1..]
+        .find('}')
+        .map(|index| start + 1 + index)
+    else {
+        return vec![pattern.to_owned()];
+    };
+    if pattern[start + 1..end].contains('{') {
+        return vec![pattern.to_owned()];
+    }
+    let prefix = &pattern[..start];
+    let suffix = &pattern[end + 1..];
+    let mut out = Vec::new();
+    for alt in pattern[start + 1..end].split(',') {
+        for expanded in expand_braces(&format!("{prefix}{alt}{suffix}")) {
+            out.push(expanded);
+        }
+    }
+    if out.is_empty() {
+        vec![pattern.to_owned()]
+    } else {
+        out
+    }
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.trim_start_matches("./").to_ascii_lowercase();
+    let text = text.trim_start_matches("./").to_ascii_lowercase();
+    glob_match_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    if pattern == b"**" {
+        return true;
+    }
+    if pattern.starts_with(b"**/") {
+        return glob_match_bytes(&pattern[3..], text)
+            || text
+                .iter()
+                .position(|&byte| byte == b'/')
+                .is_some_and(|slash| glob_match_bytes(pattern, &text[slash + 1..]));
+    }
+    if pattern.starts_with(b"**") {
+        return glob_match_bytes(&pattern[2..], text)
+            || (!text.is_empty() && glob_match_bytes(pattern, &text[1..]));
+    }
+    if pattern[0] == b'*' {
+        if glob_match_bytes(&pattern[1..], text) {
+            return true;
+        }
+        return !text.is_empty() && text[0] != b'/' && glob_match_bytes(pattern, &text[1..]);
+    }
+    if pattern[0] == b'?' {
+        return !text.is_empty() && text[0] != b'/' && glob_match_bytes(&pattern[1..], &text[1..]);
+    }
+    !text.is_empty() && pattern[0] == text[0] && glob_match_bytes(&pattern[1..], &text[1..])
+}
+
+fn convert(
+    input: &Path,
+    output: Option<&Path>,
+    passes: PassMode,
+) -> Result<PathBuf, TelemetryError> {
+    let dest = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_telemetry_dest(input));
+    let file = open(input)?;
+    match passes {
+        PassMode::Apply => {
+            let (passed, reports) = apply_registry(&file)
+                .map_err(|error| TelemetryError::Unsupported(error.to_string()))?;
+            for report in &reports {
+                match &report.outcome {
+                    PassOutcome::Applied { outputs } => {
+                        eprintln!("{} applied \u{2192} {}", report.label(), outputs.join(", "));
+                    }
+                    PassOutcome::Skipped { reason } => {
+                        eprintln!("{} skipped \u{2014} {reason}", report.label());
+                    }
+                }
+            }
+            write_converted(&passed, &dest)?;
+        }
+        PassMode::Skip => write_converted(&file, &dest)?,
+        PassMode::Strip => {
+            if is_jsonl_path(&dest) {
+                return Err(TelemetryError::Unsupported(
+                    "--strip-passes writes .telemetry output only".into(),
+                ));
+            }
+            if dest == input {
+                // In-place strip: write next to the destination, then swap.
+                let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+                let name = dest
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("recording");
+                let temp = dir.join(format!(".{name}.strip-tmp"));
+                write_from_source_stripped(&file, &temp)?;
+                drop(file);
+                fs::rename(&temp, &dest)
+                    .map_err(telemetry_format::TelemetryFormatError::Io)
+                    .map_err(TelemetryError::Telemetry)?;
+            } else {
+                write_from_source_stripped(&file, &dest)?;
+            }
+        }
+    }
+    Ok(dest)
+}
+
+fn write_converted(source: &dyn TelemetrySource, dest: &Path) -> Result<(), TelemetryError> {
+    if is_jsonl_path(dest) {
+        let compress = is_jsonl_zstd_path(dest);
+        if is_jsonl_ext_path(dest) {
+            write_jsonl_extension_from_source_with(source, dest, compress)?;
+        } else {
+            write_jsonl_from_source_with(source, dest, compress)?;
+        }
+    } else {
+        write_from_source(source, dest)?;
+    }
+    Ok(())
+}
+
+fn default_telemetry_dest(src: &Path) -> PathBuf {
+    let mut dest = src.to_path_buf();
+    let name = src
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("recording");
+    dest.set_file_name(format!("{name}.telemetry"));
+    dest
+}
+
+fn is_native_telemetry(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("telemetry"))
+}
+
+fn starts_with_zstd(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && magic == [0x28, 0xB5, 0x2F, 0xFD]
+}
+
+fn verify(path: &Path) -> Result<String, String> {
+    if is_jsonl_path(path) {
+        verify_jsonl(path)
+    } else if is_native_telemetry(path) {
+        verify_native(path)
+    } else {
+        Err(
+            "verify accepts .telemetry, .telemetry.jsonl, and .zstd (not vendor source files)"
+                .into(),
+        )
+    }
+}
+
+fn verify_native(path: &Path) -> Result<String, String> {
+    let opened = NativeRecording::open_unchanged(path).map_err(|error| error.to_string())?;
+    let metadata = opened.metadata();
+    probe_samples(&opened)?;
+    let stale = needs_update(metadata.format_version.unwrap_or(0));
+    Ok(format!(
+        "{}: ok  native v{}  channels={} laps={} utc={}{}",
+        path.display(),
+        metadata.format_version.unwrap_or(0),
+        metadata.channel_count,
+        metadata.laps.len(),
+        metadata
+            .utc_start_ns
+            .map(|utc| utc.to_string())
+            .unwrap_or_else(|| "none".into()),
+        if stale {
+            format!("  needs_update (current v{FORMAT_VERSION})")
+        } else {
+            String::new()
+        }
+    ))
+}
+
+fn verify_jsonl(path: &Path) -> Result<String, String> {
+    let opened = JsonlRecording::open(path).map_err(|error| error.to_string())?;
+    probe_samples(&opened)?;
+    let compressed = is_jsonl_zstd_path(path) || starts_with_zstd(path);
+    let kind = if opened.is_extension() { "mtx" } else { "mtj" };
+    let extra = if opened.is_extension() {
+        format!("  groups={}", opened.sidecar_groups().len())
+    } else {
+        format!("  laps={}", opened.metadata().laps.len())
+    };
+    Ok(format!(
+        "{}: ok  {kind}:{}{}  channels={} spans={} utc={} q={}{extra}",
+        path.display(),
+        if opened.is_extension() {
+            telemetry_format::JSONL_EXT_VERSION
+        } else {
+            telemetry_format::JSONL_VERSION
+        },
+        if compressed { "  zstd" } else { "" },
+        opened.channels().len(),
+        opened.spans().len(),
+        opened
+            .utc_start_ns()
+            .map(|utc| utc.to_string())
+            .unwrap_or_else(|| "none".into()),
+        opened.quantum_ns(),
+    ))
+}
+
+fn probe_samples(source: &impl TelemetrySource) -> Result<(), String> {
+    for (index, channel) in source.channels().iter().enumerate() {
+        if channel.sample_count == 0 || channel.chunks.is_empty() {
+            continue;
+        }
+        let _ = source.decode(index, 0, 0);
+    }
+    Ok(())
 }
 
 fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryError> {
@@ -687,49 +1400,53 @@ fn print_human(inspection: &Inspection) {
 }
 
 fn print_json(inspection: &Inspection) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&inspection_json(inspection))
+            .expect("inspection JSON is serializable")
+    );
+}
+
+fn inspection_json(inspection: &Inspection) -> serde_json::Value {
     let video_filenames = inspection
         .video_included
         .then_some(&inspection.video_filenames)
         .filter(|filenames| !filenames.is_empty());
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "file": inspection.file,
-            "format": inspection.format,
-            "format_version": inspection.format_version,
-            "format_needs_update": inspection.format_needs_update,
-            "source_format": inspection.source_format,
-            "source_path": inspection.source_path,
-            "passes": inspection.passes,
-            "event_date": inspection.event_date,
-            "event_date_source": inspection.event_date_source,
-            "event_date_warning": inspection.event_date_warning,
-            "driver_id": inspection.driver_ids.first(),
-            "driver_ids": inspection.driver_ids,
-            "laps": inspection.laps,
-            "complete_laps": inspection.complete_laps,
-            "fastest_lap_ns": inspection.fastest_lap_ns,
-            "fastest_lap": inspection.fastest_lap_ns.map(format_duration),
-            "fastest_lap_number": inspection.fastest_lap_number,
-            "video_included": inspection.video_included,
-            "video_filenames": video_filenames,
-            "video_file_indices": inspection.video_file_indices,
-            "video_presentation_offset_ns": inspection.video_presentation_offset_ns,
-            "part_of_larger_session": null,
-            "session_key": inspection.session_key,
-            "car_type": inspection.car_type,
-            "car_number": inspection.car_number,
-            "car_class": inspection.car_class,
-            "track_gps": inspection.track_gps.map(|(latitude, longitude)| json!({
-                "latitude": latitude,
-                "longitude": longitude,
-            })),
-            "track_name": inspection.track_name,
-            "layout": inspection.layout,
-            "track_length_m": inspection.track_length_m,
-        }))
-        .expect("inspection JSON is serializable")
-    );
+    json!({
+        "file": inspection.file,
+        "format": inspection.format,
+        "format_version": inspection.format_version,
+        "format_needs_update": inspection.format_needs_update,
+        "source_format": inspection.source_format,
+        "source_path": inspection.source_path,
+        "passes": inspection.passes,
+        "event_date": inspection.event_date,
+        "event_date_source": inspection.event_date_source,
+        "event_date_warning": inspection.event_date_warning,
+        "driver_id": inspection.driver_ids.first(),
+        "driver_ids": inspection.driver_ids,
+        "laps": inspection.laps,
+        "complete_laps": inspection.complete_laps,
+        "fastest_lap_ns": inspection.fastest_lap_ns,
+        "fastest_lap": inspection.fastest_lap_ns.map(format_duration),
+        "fastest_lap_number": inspection.fastest_lap_number,
+        "video_included": inspection.video_included,
+        "video_filenames": video_filenames,
+        "video_file_indices": inspection.video_file_indices,
+        "video_presentation_offset_ns": inspection.video_presentation_offset_ns,
+        "part_of_larger_session": null,
+        "session_key": inspection.session_key,
+        "car_type": inspection.car_type,
+        "car_number": inspection.car_number,
+        "car_class": inspection.car_class,
+        "track_gps": inspection.track_gps.map(|(latitude, longitude)| json!({
+            "latitude": latitude,
+            "longitude": longitude,
+        })),
+        "track_name": inspection.track_name,
+        "layout": inspection.layout,
+        "track_length_m": inspection.track_length_m,
+    })
 }
 
 fn display_ids(values: &[i64]) -> String {
@@ -771,14 +1488,111 @@ mod tests {
     #[test]
     fn parses_cli_arguments() {
         assert_eq!(
-            arguments(["--json".into(), "run.ld".into()]),
+            arguments(["inspect".into(), "--json".into(), "run.ld".into()]),
             Ok(Command::Inspect {
                 path: PathBuf::from("run.ld"),
                 json: true,
+                masks: Vec::new(),
+            })
+        );
+        assert_eq!(
+            arguments([
+                "inspect".into(),
+                "--mask".into(),
+                "**/*.pds".into(),
+                "-m".into(),
+                "*.telemetry".into(),
+                "logs".into(),
+            ]),
+            Ok(Command::Inspect {
+                path: PathBuf::from("logs"),
+                json: false,
+                masks: vec!["**/*.pds".into(), "*.telemetry".into()],
+            })
+        );
+        assert_eq!(
+            arguments(["inspect".into(), "--help".into()]),
+            Ok(Command::Help {
+                topic: HelpTopic::Inspect
+            })
+        );
+        assert_eq!(
+            arguments(["help".into(), "convert".into()]),
+            Ok(Command::Help {
+                topic: HelpTopic::Convert
+            })
+        );
+        assert_eq!(
+            arguments(["convert".into(), "run.pds".into()]),
+            Ok(Command::Convert {
+                input: PathBuf::from("run.pds"),
+                output: None,
+                passes: PassMode::Apply,
+            })
+        );
+        assert_eq!(
+            arguments(["convert".into(), "--no-passes".into(), "run.pds".into()]),
+            Ok(Command::Convert {
+                input: PathBuf::from("run.pds"),
+                output: None,
+                passes: PassMode::Skip,
+            })
+        );
+        assert_eq!(
+            arguments([
+                "convert".into(),
+                "--strip-passes".into(),
+                "run.telemetry".into()
+            ]),
+            Ok(Command::Convert {
+                input: PathBuf::from("run.telemetry"),
+                output: None,
+                passes: PassMode::Strip,
+            })
+        );
+        assert_eq!(
+            arguments([
+                "verify".into(),
+                "a.telemetry".into(),
+                "b.telemetry.jsonl".into()
+            ]),
+            Ok(Command::Verify {
+                paths: vec![
+                    PathBuf::from("a.telemetry"),
+                    PathBuf::from("b.telemetry.jsonl"),
+                ],
             })
         );
         assert!(arguments(Vec::<OsString>::new()).is_err());
-        assert!(arguments(["one.ld".into(), "two.ld".into()]).is_err());
+        assert!(arguments(["inspect".into(), "one.ld".into(), "two.ld".into()]).is_err());
+        assert!(arguments(["unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn glob_masks_match_relative_paths() {
+        assert!(glob_match("**/*.pds", "sebring/a.pds"));
+        assert!(glob_match("*.pds", "a.pds"));
+        assert!(!glob_match("*.pds", "sebring/a.pds"));
+        assert!(glob_match("sebring-2026/**", "sebring-2026/CT5/run.pds"));
+        assert!(expand_braces("**/*.{ld,pds}")
+            .iter()
+            .any(|pattern| glob_match(pattern, "x.LD")));
+        assert!(matches_any_mask(
+            Path::new("/data"),
+            Path::new("/data/sebring/run.pds"),
+            &["*.pds".into()]
+        ));
+        assert!(!matches_any_mask(
+            Path::new("/data"),
+            Path::new("/data/sebring/run.pds"),
+            &["**/*.ld".into()]
+        ));
+    }
+
+    #[test]
+    fn default_convert_target_is_native_telemetry() {
+        let dest = default_telemetry_dest(Path::new("run.pds"));
+        assert_eq!(dest, PathBuf::from("run.pds.telemetry"));
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 A format-neutral Rust workspace for reading, normalizing, and joining motorsport telemetry.
 
+The format, memory layout, and examples are in [TELEMETRY.md](TELEMETRY.md).
+The writer-strict schema is [telemetry.schema.json](telemetry.schema.json).
+
 ## Supported formats
 
 | Format | Extension | Crate | Support |
@@ -21,17 +24,20 @@ provides offline circuit metadata and GPS-to-track matching.
 [`telemetry-passes`](crates/telemetry-passes) is the registry of named,
 versioned, lossless processing passes applied at conversion time.
 
-The facade crate includes a metadata CLI. It memory-maps native recordings and
+The facade crate includes a CLI. It memory-maps native recordings and
 does not decode video payloads:
 
 ```sh
-cargo run -p motorsport-telemetry -- recording.mp4
-cargo run -p motorsport-telemetry -- --json recording.mp4
-cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds
-cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds recording.telemetry.jsonl
-cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds recording.telemetry.jsonl.zstd
-cargo run -p motorsport-telemetry --bin telemetry-convert -- --no-passes recording.pds
-cargo run -p motorsport-telemetry --bin telemetry-convert -- --strip-passes recording.pds.telemetry
+cargo run -p motorsport-telemetry -- inspect recording.mp4
+cargo run -p motorsport-telemetry -- inspect --json recording.mp4
+cargo run -p motorsport-telemetry -- inspect ~/Documents/Telemetry --mask '**/*.pds'
+cargo run -p motorsport-telemetry -- help inspect
+cargo run -p motorsport-telemetry -- convert recording.pds
+cargo run -p motorsport-telemetry -- convert recording.pds recording.telemetry.jsonl
+cargo run -p motorsport-telemetry -- convert recording.pds recording.telemetry.jsonl.zstd
+cargo run -p motorsport-telemetry -- convert --no-passes recording.pds
+cargo run -p motorsport-telemetry -- convert --strip-passes recording.pds.telemetry
+cargo run -p motorsport-telemetry -- verify recording.telemetry recording.telemetry.jsonl recording.telemetry.jsonl.zstd
 ```
 
 ## Processing passes
