@@ -68,7 +68,7 @@ No per-sample timestamps. Unaligned streams are omitted, not stored as
 
 ## Shared channel model
 
-These capabilities exist in **both** MTJ and `.telemetry` catalog v8:
+These capabilities exist in **both** MTJ and `.telemetry` catalog v9:
 
 | Feature | JSONL | Native catalog |
 |---|---|---|
@@ -80,9 +80,11 @@ These capabilities exist in **both** MTJ and `.telemetry` catalog v8:
 | Trace comments | `lbl` | V(28) (v6). Trace only. |
 | Spans + string / `timespan_ms` meta | `k:"s"` | V(27) (v5 strings, v8 typed ms) |
 | `utc` + IANA `tz` | header | V(23–25) (v4) |
+| Video linkage (offset, file refs + BLAKE3, frame table) | `vo` `vf` `vpts` | V(20–22) + `video_frames.bin` |
+| Pass provenance + origin | `passes` `src` `srcp` | V(6, 7, 30) (v9) |
 
 Native-only (not in JSONL): integer encodings, scale/bias, event time
-columns, video payloads / `video_frames.bin`, driver-stint lists.
+columns, driver-stint lists.
 
 JSONL-only: MTX sidecar files, lattice `q`/`o`, group chrome `r`, attach.
 
@@ -112,8 +114,13 @@ Three sections, no blanks:
 ### MTJ header
 
 `mtj` `q` `dur` required. `utc` `tz` required on write when known. Optional:
-`o` `src` `drv` `veh` `ven` `evt` `ses` `date` `time` `clk` `abs` `abe`
-`hint` `hash`. `src` is `aimd` `pds` `motec` `vbo` `telemetry`.
+`o` `src` `srcp` `drv` `veh` `ven` `evt` `ses` `date` `time` `clk` `abs`
+`abe` `hint` `vo` `vf` `vpts` `passes` `hash`. `src` is `aimd` `pds`
+`motec` `vbo` `telemetry`. Video linkage (`vo` recording presentation
+offset ns, `vf` file refs with BLAKE3, `vpts` per-frame presentation
+times) and pass provenance are normative in
+[`JSONL.md`](crates/telemetry-format/JSONL.md) §4.2; `vpts` requires `vf`,
+and MTX sidecars must not carry any of the three.
 
 ### Laps
 
