@@ -1,0 +1,20 @@
+[package]
+name = "telemetry-passes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Named, versioned, lossless processing passes over telemetry sources"
+readme = "README.md"
+
+[dependencies]
+motorsport-telemetry-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+telemetry-format.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

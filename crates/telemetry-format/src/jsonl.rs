@@ -5,8 +5,9 @@
 
 use crate::write::TelemetryFormatError;
 use motorsport_telemetry_core::{
-    read_source_metadata, schema_hash, AbsoluteTimeRange, Channel, Chunk, FileMetadata,
-    LapMetadata, SampleType, SourceIdentity, SourceLapMetadata, TelemetrySource, UnitSource,
+    read_source_metadata, schema_hash, AbsoluteTimeRange, AppliedPass, Channel, Chunk,
+    FileMetadata, LapMetadata, SampleType, SourceIdentity, SourceLapMetadata, SourceOrigin,
+    TelemetrySource, UnitSource, VideoFileRef,
 };
 use serde_json::{Map, Number, Value};
 use std::fs::File;
@@ -67,6 +68,7 @@ const ALIGN_JITTER_NS: u64 = 2_000_000;
 pub struct JsonlRecording {
     path: String,
     source_format: String,
+    source_path: String,
     identity: SourceIdentity,
     clock: Option<AbsoluteTimeRange>,
     utc_start_ns: Option<u64>,
@@ -82,6 +84,10 @@ pub struct JsonlRecording {
     sidecar: Option<SidecarHeader>,
     channel_visible: Vec<bool>,
     spans: Vec<Span>,
+    passes: Vec<AppliedPass>,
+    videos: Vec<VideoFileRef>,
+    video_times: Vec<u64>,
+    video_offset_ns: Option<i128>,
 }
 
 impl JsonlRecording {
@@ -347,6 +353,9 @@ impl JsonlRecording {
             None
         };
         let source_format = string_field(header, "src");
+        let source_path = string_field(header, "srcp");
+        let passes = parse_passes(header)?;
+        let (videos, video_times, video_offset_ns) = parse_videos(header, extension)?;
         let schema_hash = match string_field(header, "hash") {
             hash if hash.is_empty() => None,
             hash => u64::from_str_radix(&hash, 16)
@@ -406,6 +415,7 @@ impl JsonlRecording {
         Ok(Self {
             path,
             source_format,
+            source_path,
             identity,
             clock,
             utc_start_ns,
@@ -418,9 +428,13 @@ impl JsonlRecording {
             duration_ns,
             schema_hash,
             extension,
+            passes,
             sidecar,
             channel_visible,
             spans,
+            videos,
+            video_times,
+            video_offset_ns,
         })
     }
 }
@@ -775,6 +789,17 @@ impl TelemetrySource for JsonlRecording {
         &self.channels
     }
 
+    fn applied_passes(&self) -> &[AppliedPass] {
+        &self.passes
+    }
+
+    fn source_origin(&self) -> Option<SourceOrigin> {
+        (!self.source_format.is_empty() || !self.source_path.is_empty()).then(|| SourceOrigin {
+            format: self.source_format.clone(),
+            path: self.source_path.clone(),
+        })
+    }
+
     fn decode(&self, channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
         self.values[channel_index][local_index as usize]
     }
@@ -853,6 +878,31 @@ impl TelemetrySource for JsonlRecording {
 
     fn spans(&self) -> &[Span] {
         &self.spans
+    }
+
+    fn video_files(&self) -> &[VideoFileRef] {
+        &self.videos
+    }
+
+    fn video_presentation_times_ns(&self) -> Option<&[u64]> {
+        (!self.video_times.is_empty()).then_some(self.video_times.as_slice())
+    }
+
+    fn video_frame_count(&self) -> Option<u64> {
+        (!self.video_times.is_empty()).then_some(self.video_times.len() as u64)
+    }
+
+    fn video_frame_at(&self, time_ns: u64) -> Option<u64> {
+        if self.video_times.is_empty() {
+            return None;
+        }
+        let stamp = self.video_presentation_time_ns(time_ns)?;
+        let index = self.video_times.partition_point(|time| *time <= stamp);
+        Some(index.saturating_sub(1) as u64)
+    }
+
+    fn video_presentation_offset_ns(&self) -> Option<i128> {
+        self.video_offset_ns
     }
 }
 
@@ -998,10 +1048,25 @@ fn write_header(
     if origin_ns != 0 {
         write!(writer, ",\"o\":{origin_ns}")?;
     }
-    let src = source.format();
+    // The original vendor identity: for converted artifacts this is what
+    // the chain started from, not the immediate input.
+    let src = metadata.source_format.as_str();
     if !src.is_empty() && src != "jsonl" {
         writer.write_all(b",\"src\":")?;
         write_json_string(writer, src)?;
+    }
+    let origin_path = source
+        .source_origin()
+        .map(|origin| origin.path)
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| match source.format() {
+            // These are containers of conversions, never origins themselves.
+            "jsonl" | "telemetry" => String::new(),
+            _ => source.path().to_owned(),
+        });
+    if !origin_path.is_empty() {
+        writer.write_all(b",\"srcp\":")?;
+        write_json_string(writer, &origin_path)?;
     }
     write_opt_string(writer, "drv", &metadata.identity.driver)?;
     write_opt_string(writer, "veh", &metadata.identity.vehicle)?;
@@ -1021,8 +1086,297 @@ fn write_header(
             write_opt_string(writer, "hint", hint)?;
         }
     }
+    write_videos(writer, source)?;
+    write_passes(writer, &metadata.passes)?;
     write!(writer, ",\"hash\":\"{:016x}\"}}", schema_hash(source))?;
     Ok(())
+}
+
+/// Writes the applied-pass provenance into an MTJ header:
+/// `"passes":[{"n":name,"v":version,"p":{key:value},"in":[..],"out":[..]}]`.
+fn write_passes(
+    writer: &mut impl Write,
+    passes: &[AppliedPass],
+) -> Result<(), TelemetryFormatError> {
+    if passes.is_empty() {
+        return Ok(());
+    }
+    writer.write_all(b",\"passes\":[")?;
+    for (index, pass) in passes.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(b"{\"n\":")?;
+        write_json_string(writer, &pass.name)?;
+        write!(writer, ",\"v\":{}", pass.version)?;
+        if !pass.params.is_empty() {
+            writer.write_all(b",\"p\":{")?;
+            for (position, (key, value)) in pass.params.iter().enumerate() {
+                if position > 0 {
+                    writer.write_all(b",")?;
+                }
+                write_json_string(writer, key)?;
+                writer.write_all(b":")?;
+                write_json_string(writer, value)?;
+            }
+            writer.write_all(b"}")?;
+        }
+        for (key, names) in [("in", &pass.inputs), ("out", &pass.outputs)] {
+            if names.is_empty() {
+                continue;
+            }
+            write!(writer, ",\"{key}\":[")?;
+            for (position, name) in names.iter().enumerate() {
+                if position > 0 {
+                    writer.write_all(b",")?;
+                }
+                write_json_string(writer, name)?;
+            }
+            writer.write_all(b"]")?;
+        }
+        writer.write_all(b"}")?;
+    }
+    writer.write_all(b"]")?;
+    Ok(())
+}
+
+/// Writes the optional video-linkage header keys: `vo` (recording-level
+/// presentation offset), `vf` (linked video files), and `vpts` (the
+/// presentation-order frame timestamp table). Uses the same
+/// [`crate::write::linked_videos`] collection as the native catalog so both
+/// formats stamp identical linkage. Sidecar documents never call this: video
+/// belongs to the host recording.
+fn write_videos(
+    writer: &mut impl Write,
+    source: &dyn TelemetrySource,
+) -> Result<(), TelemetryFormatError> {
+    if let Some(offset) = source.video_presentation_offset_ns() {
+        write!(writer, ",\"vo\":{offset}")?;
+    }
+    let videos = crate::write::linked_videos(source);
+    if videos.is_empty() {
+        return Ok(());
+    }
+    writer.write_all(b",\"vf\":[")?;
+    for (position, video) in videos.iter().enumerate() {
+        if position > 0 {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(b"{\"n\":")?;
+        write_json_string(writer, &video.filename)?;
+        write!(
+            writer,
+            ",\"i\":{},\"fc\":{}",
+            video.index, video.frame_count
+        )?;
+        if let Some(hash) = &video.blake3 {
+            writer.write_all(b",\"b3\":\"")?;
+            for byte in hash {
+                write!(writer, "{byte:02x}")?;
+            }
+            writer.write_all(b"\"")?;
+        }
+        if let Some(offset) = video.presentation_offset_ns {
+            write!(writer, ",\"po\":{offset}")?;
+        }
+        writer.write_all(b"}")?;
+    }
+    writer.write_all(b"]")?;
+    if let Some(times) = source.video_presentation_times_ns() {
+        if !times.is_empty() {
+            writer.write_all(b",\"vpts\":[")?;
+            for (position, time) in times.iter().enumerate() {
+                if position > 0 {
+                    writer.write_all(b",")?;
+                }
+                write!(writer, "{time}")?;
+            }
+            writer.write_all(b"]")?;
+        }
+    }
+    Ok(())
+}
+
+/// Parsed video-linkage header keys: file references, the frame timestamp
+/// table, and the recording-level presentation offset.
+type ParsedVideos = (Vec<VideoFileRef>, Vec<u64>, Option<i128>);
+
+/// Parses the optional video-linkage header keys back into file references,
+/// the frame timestamp table, and the recording-level presentation offset.
+///
+/// Sidecar (`mtx`) documents reject all three keys, `vpts` requires `vf`
+/// (otherwise a native rewrite would have to invent a file reference), and
+/// the timestamp table must be non-decreasing because readers binary-search
+/// it in presentation order.
+fn parse_videos(
+    header: &Map<String, Value>,
+    extension: bool,
+) -> Result<ParsedVideos, TelemetryFormatError> {
+    if extension {
+        for key in ["vo", "vf", "vpts"] {
+            if header.contains_key(key) {
+                return Err(invalid(format!(
+                    "mtx sidecars cannot carry video linkage ({key}); video belongs to the host recording"
+                )));
+            }
+        }
+        return Ok((Vec::new(), Vec::new(), None));
+    }
+    let video_offset_ns = match header.get("vo") {
+        None => None,
+        Some(value) => Some(i128::from(
+            json_i64(value).ok_or_else(|| invalid("vo must be an integer"))?,
+        )),
+    };
+    let videos = match header.get("vf") {
+        None => Vec::new(),
+        Some(value) => {
+            let entries = value
+                .as_array()
+                .ok_or_else(|| invalid("vf must be an array"))?;
+            if entries.is_empty() {
+                return Err(invalid("vf must not be empty"));
+            }
+            let mut videos = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let object = entry
+                    .as_object()
+                    .ok_or_else(|| invalid("vf entries must be objects"))?;
+                let filename = object.get("n").and_then(Value::as_str).unwrap_or_default();
+                if filename.is_empty() {
+                    return Err(invalid("vf entry is missing n"));
+                }
+                let index = int_field(object, "i")?
+                    .ok_or_else(|| invalid("vf entry is missing i"))
+                    .and_then(|index| {
+                        u32::try_from(index).map_err(|_| invalid("vf entry i does not fit u32"))
+                    })?;
+                let frame_count = int_field(object, "fc")?.unwrap_or(0);
+                let blake3 = match object.get("b3").and_then(Value::as_str) {
+                    None => None,
+                    Some(hex) => Some(decode_blake3_hex(hex)?),
+                };
+                let presentation_offset_ns = match object.get("po") {
+                    None => None,
+                    Some(value) => Some(i128::from(
+                        json_i64(value).ok_or_else(|| invalid("vf entry po must be an integer"))?,
+                    )),
+                };
+                videos.push(VideoFileRef {
+                    filename: filename.to_owned(),
+                    index,
+                    blake3,
+                    frame_count,
+                    presentation_offset_ns,
+                });
+            }
+            videos
+        }
+    };
+    let video_times = match header.get("vpts") {
+        None => Vec::new(),
+        Some(value) => {
+            if videos.is_empty() {
+                return Err(invalid("vpts requires vf"));
+            }
+            let entries = value
+                .as_array()
+                .ok_or_else(|| invalid("vpts must be an array"))?;
+            if entries.is_empty() {
+                return Err(invalid("vpts must not be empty"));
+            }
+            let mut times = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let stamp = json_u64(entry)?
+                    .ok_or_else(|| invalid("vpts entries must be non-negative integers"))?;
+                if times.last().is_some_and(|last| stamp < *last) {
+                    return Err(invalid("vpts must be non-decreasing"));
+                }
+                times.push(stamp);
+            }
+            times
+        }
+    };
+    Ok((videos, video_times, video_offset_ns))
+}
+
+/// Decodes a 64-digit hex string into a BLAKE3-256 digest.
+fn decode_blake3_hex(hex: &str) -> Result<[u8; 32], TelemetryFormatError> {
+    if hex.len() != 64 {
+        return Err(invalid("vf entry b3 must be 64 hex digits"));
+    }
+    let mut digest = [0u8; 32];
+    for (index, slot) in digest.iter_mut().enumerate() {
+        let pair = hex
+            .get(index * 2..index * 2 + 2)
+            .ok_or_else(|| invalid("vf entry b3 must be 64 hex digits"))?;
+        *slot = u8::from_str_radix(pair, 16)
+            .map_err(|_| invalid("vf entry b3 must be 64 hex digits"))?;
+    }
+    Ok(digest)
+}
+
+/// Parses the optional `passes` header key back into provenance records.
+fn parse_passes(
+    header: &serde_json::Map<String, Value>,
+) -> Result<Vec<AppliedPass>, TelemetryFormatError> {
+    let Some(value) = header.get("passes") else {
+        return Ok(Vec::new());
+    };
+    let list = value
+        .as_array()
+        .ok_or_else(|| invalid("passes must be an array"))?;
+    let mut passes = Vec::with_capacity(list.len());
+    for entry in list {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| invalid("passes entries must be objects"))?;
+        let name = object
+            .get("n")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid("pass entry is missing n"))?;
+        let version = object
+            .get("v")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid("pass entry is missing v"))?;
+        let mut params = Vec::new();
+        if let Some(map) = object.get("p") {
+            let map = map
+                .as_object()
+                .ok_or_else(|| invalid("pass p must be an object"))?;
+            for (key, value) in map {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| invalid("pass p values must be strings"))?;
+                params.push((key.clone(), value.to_owned()));
+            }
+        }
+        let names = |key: &str| -> Result<Vec<String>, TelemetryFormatError> {
+            match object.get(key) {
+                None => Ok(Vec::new()),
+                Some(value) => value
+                    .as_array()
+                    .ok_or_else(|| invalid(format!("pass {key} must be an array")))?
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| invalid(format!("pass {key} entries must be strings")))
+                    })
+                    .collect(),
+            }
+        };
+        passes.push(AppliedPass {
+            name: name.to_owned(),
+            version: version as u32,
+            params,
+            inputs: names("in")?,
+            outputs: names("out")?,
+        });
+    }
+    Ok(passes)
 }
 
 fn sidecar_header_from_source(
@@ -1802,6 +2156,7 @@ fn invalid(message: impl Into<String>) -> TelemetryFormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NativeRecording;
     use motorsport_telemetry_core::UnitSource;
 
     struct TinySource {
@@ -1811,6 +2166,9 @@ mod tests {
         laps: Vec<LapMetadata>,
         utc_start_ns: Option<u64>,
         timezone: String,
+        videos: Vec<VideoFileRef>,
+        video_times: Vec<u64>,
+        video_offset_ns: Option<i128>,
     }
 
     impl TelemetrySource for TinySource {
@@ -1841,6 +2199,26 @@ mod tests {
                 laps: self.laps.clone(),
                 fastest_lap: None,
             })
+        }
+        fn video_files(&self) -> &[VideoFileRef] {
+            &self.videos
+        }
+        fn video_presentation_times_ns(&self) -> Option<&[u64]> {
+            (!self.video_times.is_empty()).then_some(self.video_times.as_slice())
+        }
+        fn video_frame_count(&self) -> Option<u64> {
+            (!self.video_times.is_empty()).then_some(self.video_times.len() as u64)
+        }
+        fn video_frame_at(&self, time_ns: u64) -> Option<u64> {
+            if self.video_times.is_empty() {
+                return None;
+            }
+            let stamp = self.video_presentation_time_ns(time_ns)?;
+            let index = self.video_times.partition_point(|time| *time <= stamp);
+            Some(index.saturating_sub(1) as u64)
+        }
+        fn video_presentation_offset_ns(&self) -> Option<i128> {
+            self.video_offset_ns
         }
     }
 
@@ -1881,6 +2259,9 @@ mod tests {
             values: vec![vec![10.0, 11.0, 12.5, 13.0], vec![2.8]],
             utc_start_ns: None,
             timezone: String::new(),
+            videos: Vec::new(),
+            video_times: Vec::new(),
+            video_offset_ns: None,
             laps: vec![LapMetadata {
                 number: 1,
                 start_ns: 0,
@@ -1962,6 +2343,97 @@ mod tests {
         );
         let err = JsonlRecording::from_bytes("bad.jsonl", text.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("not a multiple of q"));
+    }
+
+    #[test]
+    fn video_linkage_round_trips() {
+        let mut source = tiny();
+        source.videos = vec![VideoFileRef {
+            filename: "SCHD0060.MP4".into(),
+            index: 1,
+            blake3: Some([0xab; 32]),
+            frame_count: 4,
+            presentation_offset_ns: Some(101_333_333),
+        }];
+        source.video_times = vec![101_333_333, 134_700_000, 168_066_666, 201_433_333];
+        source.video_offset_ns = Some(101_333_333);
+
+        let mut bytes = Vec::new();
+        write_jsonl_to(&source, &mut bytes).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        let header = text.lines().next().unwrap();
+        assert!(header.contains(",\"vo\":101333333,"));
+        assert!(header.contains(&format!(
+            ",\"vf\":[{{\"n\":\"SCHD0060.MP4\",\"i\":1,\"fc\":4,\"b3\":\"{}\",\"po\":101333333}}]",
+            "ab".repeat(32)
+        )));
+        assert!(header.contains(",\"vpts\":[101333333,134700000,168066666,201433333]"));
+        assert!(header.ends_with('}'));
+        assert!(
+            header.rfind("\"hash\":").unwrap() > header.rfind("\"vpts\":").unwrap(),
+            "hash must stay the last header key"
+        );
+        // The lap line picks up the first video frame (5th element).
+        assert_eq!(text.lines().nth(1).unwrap(), "[[1,0,40000000,0,0]]");
+
+        let opened = JsonlRecording::from_bytes("tiny.mtj", &bytes).unwrap();
+        assert_eq!(opened.video_files(), source.videos.as_slice());
+        assert_eq!(
+            opened.video_presentation_times_ns().unwrap(),
+            source.video_times.as_slice()
+        );
+        assert_eq!(opened.video_presentation_offset_ns(), Some(101_333_333));
+        assert_eq!(opened.video_frame_count(), Some(4));
+        // Same binary-search semantics as the native reader.
+        assert_eq!(opened.video_frame_at(0), Some(0));
+        assert_eq!(opened.video_frame_at(40_000_000), Some(1));
+        assert_eq!(opened.video_frame_at(u64::MAX / 2), Some(3));
+        assert_eq!(opened.metadata().video_frame_count, Some(4));
+
+        // The native hop keeps the linkage bit for bit.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("tiny.telemetry");
+        crate::write_from_source(&opened, &dest).unwrap();
+        let native = NativeRecording::open(&dest).unwrap();
+        assert_eq!(native.video_files(), source.videos.as_slice());
+        assert_eq!(
+            native.video_presentation_times_ns().unwrap(),
+            source.video_times.as_slice()
+        );
+        assert_eq!(native.video_presentation_offset_ns(), Some(101_333_333));
+        assert_eq!(native.video_frame_at(40_000_000), Some(1));
+    }
+
+    #[test]
+    fn sidecars_reject_video_linkage() {
+        let text = concat!(
+            "{\"mtx\":1,\"q\":10000000,\"dur\":40000000,",
+            "\"n\":\"tires\",\"vis\":true,\"utc\":1700000000000000000,\"tz\":\"UTC\",",
+            "\"vf\":[{\"n\":\"clip.mp4\",\"i\":1,\"fc\":1}]}\n",
+        );
+        let err = JsonlRecording::from_bytes("bad.mtjx", text.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("video belongs to the host"));
+    }
+
+    #[test]
+    fn rejects_vpts_without_vf() {
+        let text = concat!(
+            "{\"mtj\":1,\"q\":10000000,\"dur\":40000000,\"vpts\":[0,1]}\n",
+            "[]\n",
+        );
+        let err = JsonlRecording::from_bytes("bad.mtj", text.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("vpts requires vf"));
+    }
+
+    #[test]
+    fn rejects_decreasing_vpts() {
+        let text = concat!(
+            "{\"mtj\":1,\"q\":10000000,\"dur\":40000000,",
+            "\"vf\":[{\"n\":\"clip.mp4\",\"i\":1,\"fc\":2}],\"vpts\":[5,4]}\n",
+            "[]\n",
+        );
+        let err = JsonlRecording::from_bytes("bad.mtj", text.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("non-decreasing"));
     }
 
     #[test]

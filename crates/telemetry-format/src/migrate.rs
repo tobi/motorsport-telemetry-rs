@@ -14,6 +14,7 @@ pub fn apply(catalog: &mut Catalog) {
             2 => v2_to_v3(catalog),
             3 => v3_to_v4(catalog),
             4 => v4_to_v5(catalog),
+            5 => v5_to_v6(catalog),
             _ => break,
         }
         if catalog.format_version <= before {
@@ -69,6 +70,15 @@ fn v4_to_v5(catalog: &mut Catalog) {
     catalog.format_version = 5;
 }
 
+fn v5_to_v6(catalog: &mut Catalog) {
+    // v6 records applied processing passes and keeps `source_format` /
+    // `source_path` stable across rewrites. Older files never ran a pass;
+    // their channels are raw conversions. Do not invent provenance. A file
+    // whose source_path was lost to a pre-v6 rewrite stays as it is.
+    catalog.passes.clear();
+    catalog.format_version = 6;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,12 +107,14 @@ mod tests {
             videos: Vec::new(),
             presentation_offset_ns: None,
             spans: Vec::new(),
+            passes: Vec::new(),
         };
         apply(&mut catalog);
         assert_eq!(catalog.format_version, FORMAT_VERSION);
         assert!(catalog.utc_start_ns.is_none());
         assert!(catalog.timezone.is_empty());
         assert!(catalog.spans.is_empty());
+        assert!(catalog.passes.is_empty());
     }
 
     #[test]
@@ -137,6 +149,7 @@ mod tests {
             videos: Vec::new(),
             presentation_offset_ns: None,
             spans: Vec::new(),
+            passes: Vec::new(),
         };
         apply(&mut catalog);
         assert_eq!(catalog.format_version, FORMAT_VERSION);

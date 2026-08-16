@@ -17,6 +17,9 @@ struct Inspection {
     format: String,
     format_version: Option<u16>,
     format_needs_update: Option<bool>,
+    source_format: String,
+    source_path: String,
+    passes: Vec<String>,
     driver_ids: Vec<i64>,
     laps: usize,
     complete_laps: usize,
@@ -101,7 +104,15 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
         .or_else(|| gps_candidates.first().copied());
     let matched = matched_gps.map(|(_, matched)| matched);
     let (video_included, video_file_indices) = video_info(&file, &metadata);
-    let video_filenames = if metadata.video_frame_count.is_some() {
+    let video_filenames = if !metadata.videos.is_empty() {
+        // Linked files recorded in the catalog (or header): the actual video
+        // names, not the telemetry container that carries the linkage.
+        metadata
+            .videos
+            .iter()
+            .map(|video| video.filename.clone())
+            .collect()
+    } else if metadata.video_frame_count.is_some() {
         path.file_name()
             .map(|name| vec![name.to_string_lossy().into_owned()])
             .unwrap_or_default()
@@ -137,6 +148,13 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
         format: metadata.format.clone(),
         format_version: metadata.format_version,
         format_needs_update: metadata.format_version.map(needs_update),
+        source_format: metadata.source_format.clone(),
+        source_path: metadata.source_path.clone(),
+        passes: metadata
+            .passes
+            .iter()
+            .map(motorsport_telemetry::motorsport_telemetry_core::AppliedPass::label)
+            .collect(),
         driver_ids: metadata.driver_ids.clone(),
         laps: metadata.laps.len(),
         complete_laps: metadata.laps.iter().filter(|lap| lap.complete).count(),
@@ -569,6 +587,16 @@ fn print_human(inspection: &Inspection) {
             inspection.format_needs_update.unwrap_or(false)
         );
     }
+    println!("source_format: {}", inspection.source_format);
+    println!("source_path: {}", inspection.source_path);
+    println!(
+        "passes: {}",
+        if inspection.passes.is_empty() {
+            "none".into()
+        } else {
+            inspection.passes.join(", ")
+        }
+    );
     println!(
         "event_date: {}",
         inspection.event_date.as_deref().unwrap_or("unknown")
@@ -670,6 +698,9 @@ fn print_json(inspection: &Inspection) {
             "format": inspection.format,
             "format_version": inspection.format_version,
             "format_needs_update": inspection.format_needs_update,
+            "source_format": inspection.source_format,
+            "source_path": inspection.source_path,
+            "passes": inspection.passes,
             "event_date": inspection.event_date,
             "event_date_source": inspection.event_date_source,
             "event_date_warning": inspection.event_date_warning,

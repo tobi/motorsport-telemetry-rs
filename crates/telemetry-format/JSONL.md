@@ -161,7 +161,8 @@ Line 1 is a JSON object. Writers SHOULD emit keys in the order listed.
 | `q` | integer ≥ 1 | yes | Lattice quantum, nanoseconds. |
 | `dur` | integer ≥ 0 | yes | Exclusive file-relative duration, nanoseconds. |
 | `o` | integer ≥ 0 | no | Lattice origin, nanoseconds. Default `0`. |
-| `src` | string | no | Source format: `aimd`, `pds`, `motec`, `vbo`, or `telemetry`. |
+| `src` | string | no | Format of the original recording (`aimd`, `pds`, `motec`, `vbo`, ...). Carried through rewrites: a `.telemetry` -> MTJ hop keeps the vendor id. |
+| `srcp` | string | no | Path of the original recording as seen at first conversion. Carried through rewrites like `src`. |
 | `drv` | string | no | Driver name. |
 | `veh` | string | no | Vehicle name or identifier. |
 | `ven` | string | no | Venue / circuit. |
@@ -175,6 +176,10 @@ Line 1 is a JSON object. Writers SHOULD emit keys in the order listed.
 | `abs` | integer | no | Source-clock reading at file `t = 0`. |
 | `abe` | integer | no | Source-clock reading at file `dur`. |
 | `hint` | string | no | Session-hint component used by the native catalog. |
+| `vo` | integer | no | Recording-level video presentation offset, nanoseconds: `player_ns = t + vo`. See 4.2. |
+| `vf` | array | no | Linked video files, in index order. See 4.2. |
+| `vpts` | array | no | Presentation-order video frame timestamps, nanoseconds on the movie timeline. Requires `vf`. See 4.2. |
+| `passes` | array | no | Processing passes applied to this file, in application order. See 4.1. |
 | `hash` | string | no | 16-digit lowercase hex schema hash. |
 
 Omit any optional key whose value is empty, unknown, or `0` for `o`. Do not
@@ -185,8 +190,71 @@ file cannot be placed on the absolute axis).
 `clk` without `abs` is ignored. `abs` is leftover vendor-clock metadata,
 not the join key. `utc` is the primary key.
 
-`mtj`, `q`, `dur`, `o`, `utc`, `abs`, and `abe` MUST be JSON integers, not
-quoted strings and not non-integral numbers.
+`mtj`, `q`, `dur`, `o`, `utc`, `abs`, `abe`, `vo`, and every `vpts` entry
+MUST be JSON integers, not quoted strings and not non-integral numbers.
+
+### 4.1 Pass provenance (`passes`)
+
+Every entry records one lossless processing pass that appended derived
+channels to this file. Passes never modify or remove source channels;
+dropping every channel named in an entry's `out` list recovers the raw
+conversion exactly.
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `n` | string | yes | Pass name, e.g. `gps.clean`. |
+| `v` | integer | yes | Pass algorithm version. |
+| `p` | object | no | Parameters as string values, e.g. `{"max_speed_mps":"150"}`. |
+| `in` | array of strings | no | Names of the channels the pass read. |
+| `out` | array of strings | no | Names of the channels the pass appended. |
+
+```json
+{"passes":[{"n":"gps.clean","v":1,"p":{"max_speed_mps":"150","reanchor_after":"8"},
+  "in":["GPS Latitude","GPS Longitude","GPS Fix Valid"],
+  "out":["GPS Latitude Clean","GPS Longitude Clean"]}]}
+```
+
+Readers that do not understand a pass name MUST still treat its `out`
+channels as ordinary channels; the entry only explains where they came from.
+
+### 4.2 Video linkage (`vo`, `vf`, `vpts`)
+
+A recording converted from a camera container — or from a `.telemetry` file
+that carried the linkage — keeps its video synchronization. The pixels stay
+in the original video file; the header stores the mapping onto it. Two
+timelines are involved (consumer recipe: `docs/VIDEO_SYNC.md`): telemetry
+time `t` (file-relative nanoseconds) and the player's presentation timeline.
+
+- `vo` — recording-level presentation offset, nanoseconds:
+  `player_ns = t + vo`.
+- `vf` — the linked video files, in index order. Each entry:
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `n` | string | yes | Video filename (basename; resolve next to this document). |
+| `i` | integer ≥ 1 | yes | File index; multi-file rolls count up from 1. |
+| `fc` | integer ≥ 0 | yes | Frame count, `0` when unknown. |
+| `b3` | string | no | BLAKE3-256 of the video file, 64 hex digits, when it was present at convert time. Verify before trusting frame-accurate sync. |
+| `po` | integer | no | Per-file presentation offset: `video_presentation_ns = file_relative_ns + po`. |
+
+- `vpts` — the presentation-order frame timestamp table: one integer per
+  frame, nanoseconds on the movie timeline, non-decreasing. Byte-for-byte
+  the same values as the native `video_frames.bin` member. `vpts` without
+  `vf` is invalid.
+
+The frame shown at telemetry time `t` is the last index whose `vpts` entry
+is `<= t + vo` (clamped to `0`). Never derive frames from a nominal frame
+rate; real containers drop frames and carry edit-list shifts. Sidecar
+(`mtx`) documents MUST NOT carry any of these keys: video belongs to the
+host recording.
+
+```json
+{"vo":101833333,
+ "vf":[{"n":"1602_Driver02_lap0-15_SCHD0060.MP4","i":1,"fc":7556,
+        "b3":"6d10ed8ecbe469d65f411ac5eea30bc34c8df7f4738c02c204cb78cae9578c1d",
+        "po":101833333}],
+ "vpts":[0,16666666,33333333]}
+```
 
 ## 5. Laps
 
@@ -255,7 +323,9 @@ from a `.telemetry` zip.
 
 - Per-sample timestamps
 - Native integer encodings, scale, and bias
-- Video payloads, frame tables, and presentation offsets
+- Video payloads. The linkage — file references, presentation offsets,
+  and the frame timestamp table — is in the header (§4.2); the pixels stay
+  in the video file
 - Driver-stint lists (derive from a driver-id channel when present)
 - Irregular / event streams that cannot sit on the lattice
 

@@ -9,6 +9,7 @@ members = [
     "crates/motec-telemetry",
     "crates/racelogic-telemetry",
     "crates/telemetry-format",
+    "crates/telemetry-passes",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ cosworth-telemetry = { version = "0.1.0", path = "crates/cosworth-telemetry" }
 motec-telemetry = { version = "0.1.0", path = "crates/motec-telemetry" }
 racelogic-telemetry = { version = "0.1.0", path = "crates/racelogic-telemetry" }
 telemetry-format = { version = "0.1.0", path = "crates/telemetry-format" }
+telemetry-passes = { version = "0.1.0", path = "crates/telemetry-passes" }
 memmap2 = "0.9"
 flatbuffers = "25.2.10"
 quick-xml = "0.37"

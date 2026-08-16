@@ -319,6 +319,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "telemetry-format",
+ "telemetry-passes",
  "tempfile",
  "thiserror",
 ]
@@ -539,6 +540,16 @@ dependencies = [
  "tempfile",
  "thiserror",
  "zstd",
+]
+
+[[package]]
+name = "telemetry-passes"
+version = "0.1.0"
+dependencies = [
+ "motorsport-telemetry-core",
+ "telemetry-format",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

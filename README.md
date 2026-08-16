@@ -11,13 +11,15 @@ A format-neutral Rust workspace for reading, normalizing, and joining motorsport
 | MoTeC LD/LDX | `.ld` | [`motec-telemetry`](crates/motec-telemetry) | Read and write |
 | Racelogic VBOX | `.vbo` | [`racelogic-telemetry`](crates/racelogic-telemetry) | Read |
 | Native `.telemetry` | `.telemetry` | [`telemetry-format`](crates/telemetry-format) | Read and write; aligned STORE zip, FlatBuffers catalog first |
-| MTJ JSONL | `.telemetry.jsonl` | [`telemetry-format`](crates/telemetry-format/JSONL.md) | Read and write; time-aligned header / laps / channels |
+| MTJ JSONL | `.telemetry.jsonl` | [`telemetry-format`](crates/telemetry-format/JSONL.md) | Read and write; time-aligned header / laps / channels; video linkage in the header |
 | MTJ JSONL + zstd | `.telemetry.jsonl.zstd` | same | Same document, one zstd frame |
 
 [`motorsport-telemetry`](crates/motorsport-telemetry) is the unified facade.
 [`motorsport-telemetry-core`](crates/telemetry-core) defines the shared source,
 channel, unit, metadata, lap, and session model. [`motorsport-track-atlas`](crates/motorsport-track-atlas)
 provides offline circuit metadata and GPS-to-track matching.
+[`telemetry-passes`](crates/telemetry-passes) is the registry of named,
+versioned, lossless processing passes applied at conversion time.
 
 The facade crate includes a metadata CLI. It memory-maps native recordings and
 does not decode video payloads:
@@ -28,7 +30,24 @@ cargo run -p motorsport-telemetry -- --json recording.mp4
 cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds
 cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds recording.telemetry.jsonl
 cargo run -p motorsport-telemetry --bin telemetry-convert -- recording.pds recording.telemetry.jsonl.zstd
+cargo run -p motorsport-telemetry --bin telemetry-convert -- --no-passes recording.pds
+cargo run -p motorsport-telemetry --bin telemetry-convert -- --strip-passes recording.pds.telemetry
 ```
+
+## Processing passes
+
+`telemetry-convert` runs the [`telemetry-passes`](crates/telemetry-passes)
+registry by default. Each pass is named and versioned (`gps.quality@1`,
+`gps.clean@1`, `speed.distance@1`), documents what must be true of the source
+to employ it, and is **lossless**: passes only append derived channels
+(cleaned GPS, an integrated distance odometer, and per-estimate sigma
+channels), never touch source data, and `--strip-passes` recovers the raw
+conversion byte-for-byte. Applied passes are reported on stderr
+(`gps.clean@1 skipped — no GPS coordinate channels present`) and recorded in
+the file — the `.telemetry` catalog and the MTJ header both carry the pass
+list plus the original source format and path, so any converted file can
+explain which processing it received and where it came from. Rationale and
+the planned lap-progress passes: [`docs/WHY_POSITIONING_IS_HARD.md`](docs/WHY_POSITIONING_IS_HARD.md).
 
 ## Quick start
 
@@ -106,7 +125,9 @@ VBOX recordings that roll to a second video (`avifileindex` 1 then 2, files
 timestamp still uses the `avifileindex` / `avisynctime` channels; those stay
 ordinary lossless columns. `video_reference_at` reports the active file index
 and sync time. Video payloads stay in the MP4s; the catalog stores basename
-plus BLAKE3 when the files were present at convert time.
+plus BLAKE3 when the files were present at convert time. The full
+telemetry-to-video-frame recipe for consumers is
+[`docs/VIDEO_SYNC.md`](docs/VIDEO_SYNC.md).
 
 Unknown or incompatible inputs remain `None`; the library never guesses a unit or fabricates a frame.
 

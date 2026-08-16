@@ -293,6 +293,14 @@ impl TelemetrySource for TelemetryFile {
     fn video_presentation_time_ns(&self, time_ns: u64) -> Option<u64> {
         delegate!(self, source => source.video_presentation_time_ns(time_ns))
     }
+
+    fn applied_passes(&self) -> &[motorsport_telemetry_core::AppliedPass] {
+        delegate!(self, source => TelemetrySource::applied_passes(source))
+    }
+
+    fn source_origin(&self) -> Option<motorsport_telemetry_core::SourceOrigin> {
+        delegate!(self, source => TelemetrySource::source_origin(source))
+    }
 }
 
 /// Channel indexes selected for the facade's format-neutral signal roles.
@@ -415,7 +423,7 @@ impl TelemetryFile {
                 self.sample_at(lat_index, time, true)?,
                 &self.channels()[lat_index].unit,
             )?;
-            let lon = normalize_coordinate(
+            let lon = normalize_longitude(
                 self.sample_at(lon_index, time, true)?,
                 &self.channels()[lon_index].unit,
             )?;
@@ -525,7 +533,7 @@ fn normalize_sample(
         normalize_coordinate(value(Some(index), true)?, &source.channels()[index].unit)
     });
     let longitude_deg = roles.longitude.and_then(|index| {
-        normalize_coordinate(value(Some(index), true)?, &source.channels()[index].unit)
+        normalize_longitude(value(Some(index), true)?, &source.channels()[index].unit)
     });
     let lap_number = value(roles.lap_number, false).map(|value| value.round() as i64);
     let lap_time_s = roles.lap_time.and_then(|index| {
@@ -845,10 +853,28 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
                 "laptime",
             ],
         ),
-        latitude: find(channels, &["gpslatitude", "latitude", "gpslat", "lat"]),
+        // Pass-derived clean coordinates (gps.clean) are NaN-masked copies
+        // of the raw fixes and always preferable when present.
+        latitude: find(
+            channels,
+            &[
+                "gpslatitudeclean",
+                "gpslatitude",
+                "latitude",
+                "gpslat",
+                "lat",
+            ],
+        ),
         longitude: find(
             channels,
-            &["gpslongitude", "longitude", "gpslon", "lon", "long"],
+            &[
+                "gpslongitudeclean",
+                "gpslongitude",
+                "longitude",
+                "gpslon",
+                "lon",
+                "long",
+            ],
         ),
     }
 }
@@ -897,6 +923,15 @@ fn normalize_coordinate(value: f64, unit: &str) -> Option<f64> {
         "rad" | "radian" | "radians" => Some(value.to_degrees()),
         "min" | "arcmin" | "arcminute" => Some(value / 60.0),
         _ => None,
+    }
+}
+
+/// Longitude form of [`normalize_coordinate`]: VBOX stores arc-minutes with
+/// west positive, so the sign flips to the east-positive convention.
+fn normalize_longitude(value: f64, unit: &str) -> Option<f64> {
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "min" | "arcmin" | "arcminute" => Some(-value / 60.0),
+        _ => normalize_coordinate(value, unit),
     }
 }
 

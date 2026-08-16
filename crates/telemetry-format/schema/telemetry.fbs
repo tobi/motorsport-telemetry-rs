@@ -89,6 +89,11 @@ table Recording {
   channel_visible:[ubyte];
   // v5: packed span annotations (same model as JSONL k:"s").
   spans:[ubyte];
+  // v6: packed provenance of applied processing passes. Per pass: name,
+  // version, sorted key=value params, input channel names, output channel
+  // names. Passes are lossless: they only append the named output channels,
+  // so dropping those channels recovers the raw conversion byte for byte.
+  passes:[ubyte];
 }
 
 root_type Recording;

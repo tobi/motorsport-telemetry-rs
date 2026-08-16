@@ -5,8 +5,8 @@ use crate::write::TelemetryFormatError;
 use crate::zip::{parse_members, read_first_member, ZipWriter};
 use memmap2::Mmap;
 use motorsport_telemetry_core::{
-    Channel, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata, Span, TelemetrySource,
-    VideoFileRef,
+    AppliedPass, Channel, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata,
+    SourceOrigin, Span, TelemetrySource, VideoFileRef,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -129,7 +129,8 @@ impl NativeRecording {
 
     /// Header-only metadata. Does not map or checksum channel members.
     pub fn read_metadata(path: impl AsRef<Path>) -> Result<FileMetadata, TelemetryFormatError> {
-        Ok(Self::read_header(path)?.to_file_metadata())
+        let path = path.as_ref();
+        Ok(Self::read_header(path)?.to_file_metadata(&path.to_string_lossy()))
     }
 
     /// Stored laps from the catalog. Does not unpack the channel directory.
@@ -164,7 +165,12 @@ impl NativeRecording {
 
     /// Format-neutral metadata copied out of the catalog.
     pub fn metadata(&self) -> FileMetadata {
-        self.catalog.to_file_metadata()
+        self.catalog.to_file_metadata(&self.path)
+    }
+
+    /// Processing passes recorded as applied to this recording, in order.
+    pub fn passes(&self) -> &[AppliedPass] {
+        &self.catalog.passes
     }
 
     /// Interval annotations stored in the catalog. Same model as JSONL spans.
@@ -228,8 +234,9 @@ impl NativeRecording {
         let video_times = by_name
             .get("video_frames.bin")
             .map(|member| (member.offset as usize, member.size as usize));
+        // `catalog.source_path` keeps the original vendor path from disk; the
+        // opened file's own path lives in `self.path`.
         let mut catalog = catalog;
-        catalog.source_path = path.clone();
         if let Some((_, size)) = video_times {
             if let Some(video) = catalog.videos.first_mut() {
                 video.frame_count = (size / 8) as u64;
@@ -453,6 +460,19 @@ impl TelemetrySource for NativeRecording {
 
     fn spans(&self) -> &[Span] {
         &self.catalog.spans
+    }
+
+    fn applied_passes(&self) -> &[AppliedPass] {
+        &self.catalog.passes
+    }
+
+    fn source_origin(&self) -> Option<SourceOrigin> {
+        (!self.catalog.source_format.is_empty() || !self.catalog.source_path.is_empty()).then(
+            || SourceOrigin {
+                format: self.catalog.source_format.clone(),
+                path: self.catalog.source_path.clone(),
+            },
+        )
     }
 }
 

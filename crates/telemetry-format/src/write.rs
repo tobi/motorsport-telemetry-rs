@@ -3,8 +3,10 @@
 use crate::catalog::{unit_fields, Catalog, CatalogChannel};
 use crate::zip::{ZipError, ZipWriter};
 use motorsport_telemetry_core::{
-    read_source_metadata, schema_hash, Channel, SampleType, TelemetrySource,
+    read_source_metadata, schema_hash, AbsoluteTimeRange, AppliedPass, Channel, SampleType,
+    SourceIdentity, SourceLapMetadata, SourceOrigin, Span, TelemetrySource, VideoFileRef,
 };
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -17,6 +19,22 @@ pub fn write_from_source(
     let dest = dest.as_ref();
     let file = File::create(dest).map_err(io_err)?;
     write_to(source, crate::FORMAT_VERSION, BufWriter::new(file))
+}
+
+/// Writes `source` back to its raw conversion: every channel named in the
+/// recorded applied-pass outputs is dropped and the pass list is cleared.
+///
+/// Because passes are lossless — they only ever append the channels they
+/// name — this recovers the pre-pass file byte for byte. The source's
+/// original `source_format`/`source_path` identity is preserved.
+pub fn write_from_source_stripped(
+    source: &dyn TelemetrySource,
+    dest: impl AsRef<Path>,
+) -> Result<(), TelemetryFormatError> {
+    let stripped = StrippedSource::new(source);
+    let dest = dest.as_ref();
+    let file = File::create(dest).map_err(io_err)?;
+    write_to(&stripped, crate::FORMAT_VERSION, BufWriter::new(file))
 }
 
 /// Writes a `.telemetry` zip stamped with an explicit catalog version.
@@ -94,14 +112,24 @@ fn write_to(
     let utc_start_ns = source
         .utc_start_ns()
         .or_else(|| crate::placement::utc_from_metadata(&metadata, &timezone));
-    let mut catalog = Catalog {
+    // A converted artifact keeps the identity of the file it was originally
+    // converted from; only a true origin stamps its own format and path.
+    let origin = source.source_origin();
+    let catalog = Catalog {
         format_version,
         identity: metadata.identity.clone(),
         laps,
         valid_laps,
         channels: catalog_channels,
-        source_format: source.format().to_owned(),
-        source_path: source.path().to_owned(),
+        source_format: origin
+            .as_ref()
+            .map(|origin| origin.format.clone())
+            .filter(|format| !format.is_empty())
+            .unwrap_or_else(|| source.format().to_owned()),
+        source_path: origin
+            .map(|origin| origin.path)
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| source.path().to_owned()),
         schema_hash: schema_hash(source),
         duration_ns: metadata.duration_ns,
         sample_count: metadata.sample_count,
@@ -113,32 +141,11 @@ fn write_to(
         utc_start_ns,
         timezone,
         driver_stints: metadata.driver_stints.clone(),
-        videos: {
-            let mut videos = hash_videos(source);
-            if let Some(count) = source.video_frame_count() {
-                if let Some(video) = videos.first_mut() {
-                    video.frame_count = count;
-                } else if let Some(name) = Path::new(source.path()).file_name() {
-                    videos.push(motorsport_telemetry_core::VideoFileRef {
-                        filename: name.to_string_lossy().into_owned(),
-                        index: 1,
-                        blake3: hash_file(Path::new(source.path())),
-                        frame_count: count,
-                        presentation_offset_ns: source.video_presentation_offset_ns(),
-                    });
-                }
-            }
-            videos
-        },
+        videos: linked_videos(source),
         presentation_offset_ns: source.video_presentation_offset_ns(),
         spans: source.spans().to_vec(),
+        passes: source.applied_passes().to_vec(),
     };
-    let offset = catalog.presentation_offset_ns;
-    for video in &mut catalog.videos {
-        if video.presentation_offset_ns.is_none() {
-            video.presentation_offset_ns = offset;
-        }
-    }
 
     let mut zip = ZipWriter::new(writer);
     zip.write_member("metadata.fb", &crate::catalog::encode(&catalog)?)?;
@@ -161,6 +168,37 @@ fn write_to(
     }
     zip.finish()?;
     Ok(())
+}
+
+/// Collects the linked video files for `source` exactly as the native
+/// catalog records them: hash files that are present on disk, fall back to
+/// the source container itself when it is the video, and backfill per-file
+/// presentation offsets from the recording-level offset. Shared by the
+/// native and MTJ writers so both formats stamp identical linkage.
+pub(crate) fn linked_videos(
+    source: &dyn TelemetrySource,
+) -> Vec<motorsport_telemetry_core::VideoFileRef> {
+    let mut videos = hash_videos(source);
+    if let Some(count) = source.video_frame_count() {
+        if let Some(video) = videos.first_mut() {
+            video.frame_count = count;
+        } else if let Some(name) = Path::new(source.path()).file_name() {
+            videos.push(motorsport_telemetry_core::VideoFileRef {
+                filename: name.to_string_lossy().into_owned(),
+                index: 1,
+                blake3: hash_file(Path::new(source.path())),
+                frame_count: count,
+                presentation_offset_ns: source.video_presentation_offset_ns(),
+            });
+        }
+    }
+    let offset = source.video_presentation_offset_ns();
+    for video in &mut videos {
+        if video.presentation_offset_ns.is_none() {
+            video.presentation_offset_ns = offset;
+        }
+    }
+    videos
 }
 
 fn hash_videos(source: &dyn TelemetrySource) -> Vec<motorsport_telemetry_core::VideoFileRef> {
@@ -271,5 +309,138 @@ impl From<ZipError> for TelemetryFormatError {
 impl std::fmt::Display for ZipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Index-mapped view of `inner` without pass-derived channels and without
+/// the applied-pass provenance.
+struct StrippedSource<'a> {
+    inner: &'a dyn TelemetrySource,
+    /// Inner channel index for each retained channel.
+    keep: Vec<usize>,
+    channels: Vec<Channel>,
+    visible: Vec<bool>,
+}
+
+impl<'a> StrippedSource<'a> {
+    fn new(inner: &'a dyn TelemetrySource) -> Self {
+        let outputs: HashSet<&str> = inner
+            .applied_passes()
+            .iter()
+            .flat_map(|pass| pass.outputs.iter().map(String::as_str))
+            .collect();
+        let inner_visible = inner.channel_visible();
+        let mut keep = Vec::new();
+        let mut channels = Vec::new();
+        let mut visible = Vec::new();
+        for (index, channel) in inner.channels().iter().enumerate() {
+            if outputs.contains(channel.name.as_str()) {
+                continue;
+            }
+            keep.push(index);
+            channels.push(channel.clone());
+            visible.push(inner_visible.get(index).copied().unwrap_or(true));
+        }
+        Self {
+            inner,
+            keep,
+            channels,
+            visible,
+        }
+    }
+}
+
+impl TelemetrySource for StrippedSource<'_> {
+    fn path(&self) -> &str {
+        self.inner.path()
+    }
+
+    fn format(&self) -> &'static str {
+        self.inner.format()
+    }
+
+    fn channels(&self) -> &[Channel] {
+        &self.channels
+    }
+
+    fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
+        self.inner
+            .decode(self.keep[channel_index], chunk_index, local_index)
+    }
+
+    fn chunk_bytes(&self, channel_index: usize, chunk_index: usize) -> Option<&[u8]> {
+        self.inner
+            .chunk_bytes(self.keep[channel_index], chunk_index)
+    }
+
+    fn sample_affine(&self, channel_index: usize) -> (f64, f64) {
+        self.inner.sample_affine(self.keep[channel_index])
+    }
+
+    fn absolute_time_range(&self) -> Option<AbsoluteTimeRange> {
+        self.inner.absolute_time_range()
+    }
+
+    fn utc_start_ns(&self) -> Option<u64> {
+        self.inner.utc_start_ns()
+    }
+
+    fn timezone(&self) -> String {
+        self.inner.timezone()
+    }
+
+    fn channel_visible(&self) -> &[bool] {
+        &self.visible
+    }
+
+    fn spans(&self) -> &[Span] {
+        self.inner.spans()
+    }
+
+    fn applied_passes(&self) -> &[AppliedPass] {
+        // The whole point: the raw conversion has no passes.
+        &[]
+    }
+
+    fn source_origin(&self) -> Option<SourceOrigin> {
+        self.inner.source_origin()
+    }
+
+    fn identity(&self) -> SourceIdentity {
+        self.inner.identity()
+    }
+
+    fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
+        self.inner.source_lap_metadata()
+    }
+
+    fn video_files(&self) -> &[VideoFileRef] {
+        self.inner.video_files()
+    }
+
+    fn video_presentation_times_ns(&self) -> Option<&[u64]> {
+        self.inner.video_presentation_times_ns()
+    }
+
+    fn video_frame_count(&self) -> Option<u64> {
+        self.inner.video_frame_count()
+    }
+
+    fn video_frame_at(&self, time_ns: u64) -> Option<u64> {
+        self.inner.video_frame_at(time_ns)
+    }
+
+    fn video_presentation_offset_ns(&self) -> Option<i128> {
+        self.inner.video_presentation_offset_ns()
+    }
+
+    fn sample_time_ns(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> u64 {
+        self.inner
+            .sample_time_ns(self.keep[channel_index], chunk_index, local_index)
+    }
+
+    fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
+        self.inner
+            .sample_at(self.keep[channel_index], time_ns, linear)
     }
 }

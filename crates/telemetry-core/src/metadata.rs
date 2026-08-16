@@ -1,4 +1,4 @@
-use crate::TelemetrySource;
+use crate::{AppliedPass, TelemetrySource};
 use std::collections::{BTreeMap, BTreeSet};
 
 const GPS_WEEK_MS: u64 = 604_800_000;
@@ -110,8 +110,19 @@ pub struct FileMetadata {
     pub path: String,
     /// Stable lowercase format identifier.
     pub format: String,
+    /// Format identifier of the original recording this file was converted
+    /// from. Equals [`Self::format`] when the file is itself the origin.
+    pub source_format: String,
+    /// Path of the original recording as seen at first conversion. Equals
+    /// [`Self::path`] when the file is itself the origin.
+    pub source_path: String,
     /// `.telemetry` catalog version. Absent on vendor source files.
     pub format_version: Option<u16>,
+    /// Processing passes applied to this file, in application order.
+    ///
+    /// Empty on raw vendor files and raw conversions. Every listed pass only
+    /// appended the channels in [`AppliedPass::outputs`].
+    pub passes: Vec<AppliedPass>,
     /// Total number of declared channels.
     pub channel_count: usize,
     /// Number of channels containing at least one sample.
@@ -662,9 +673,20 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         }
     }
 
+    let origin = source.source_origin();
     FileMetadata {
         path: source.path().to_owned(),
         format: source.format().to_owned(),
+        source_format: origin
+            .as_ref()
+            .map(|origin| origin.format.clone())
+            .filter(|format| !format.is_empty())
+            .unwrap_or_else(|| source.format().to_owned()),
+        source_path: origin
+            .map(|origin| origin.path)
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| source.path().to_owned()),
+        passes: source.applied_passes().to_vec(),
         channel_count: source.channels().len(),
         sampled_channel_count: source
             .channels()

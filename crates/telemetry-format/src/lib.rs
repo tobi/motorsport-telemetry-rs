@@ -22,7 +22,9 @@ pub use migrate::apply as apply_migrations;
 pub use placement::{
     civil_ns_to_utc_ns, resolve_timezone, resolve_utc_start_ns, utc_from_metadata,
 };
-pub use write::{write_from_source, write_from_source_version, TelemetryFormatError};
+pub use write::{
+    write_from_source, write_from_source_stripped, write_from_source_version, TelemetryFormatError,
+};
 
 /// Reads the catalog format version from `metadata.fb` only.
 pub fn read_format_version(path: impl AsRef<std::path::Path>) -> Result<u16, TelemetryFormatError> {
@@ -133,6 +135,13 @@ mod tests {
                 },
                 meta: vec![("Laps".into(), "18".into())],
             }],
+            passes: vec![motorsport_telemetry_core::AppliedPass {
+                name: "gps.clean".into(),
+                version: 1,
+                params: vec![("max_speed_mps".into(), "150".into())],
+                inputs: vec!["GPS Latitude".into(), "GPS Longitude".into()],
+                outputs: vec!["GPS Latitude Clean".into(), "GPS Longitude Clean".into()],
+            }],
         };
         let bytes = encode(&catalog).unwrap();
         let decoded = decode(&bytes).unwrap();
@@ -149,6 +158,7 @@ mod tests {
         assert_eq!(decoded.spans.len(), 1);
         assert_eq!(decoded.spans[0].primary.title, "#443");
         assert_eq!(decoded.spans[0].meta[0], ("Laps".into(), "18".into()));
+        assert_eq!(decoded.passes, catalog.passes);
         assert!(decoded.channels[0].visible);
         assert_eq!(decoded.laps[0].first_video_frame, Some(4));
         assert_eq!(decoded.valid_laps, 1);

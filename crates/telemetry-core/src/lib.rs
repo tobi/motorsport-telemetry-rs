@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 /// Format-neutral file and session metadata derivation.
 pub mod metadata;
+/// Provenance records for named, lossless processing passes.
+pub mod pass;
 /// Interval annotations on the file-relative timeline.
 pub mod span;
 pub mod units;
@@ -14,6 +16,7 @@ pub use metadata::{
     DriverStint, FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, SourceLapMetadata,
     VideoFileRef, VideoReference,
 };
+pub use pass::{AppliedPass, SourceOrigin};
 pub use span::{Span, SpanPrimary};
 pub use units::{
     can_convert, convert, lookup as lookup_unit, normalize as normalize_unit, ConvertError,
@@ -283,6 +286,27 @@ pub trait TelemetrySource: Send + Sync {
     /// Interval annotations on the file-relative timeline. Empty when none.
     fn spans(&self) -> &[crate::Span] {
         &[]
+    }
+
+    /// Processing passes recorded as applied to this source, in order.
+    ///
+    /// Vendor recordings return an empty slice: their channels are raw
+    /// conversions. Converted artifacts report the chain of named passes
+    /// that appended their derived channels. Every listed pass is lossless:
+    /// dropping the channels named in [`AppliedPass::outputs`] recovers the
+    /// raw conversion byte for byte.
+    fn applied_passes(&self) -> &[crate::AppliedPass] {
+        &[]
+    }
+
+    /// Identity of the original vendor recording, when this source is
+    /// itself a converted artifact.
+    ///
+    /// `None` means this source *is* the origin. Writers persist this so a
+    /// `.telemetry` file always remembers the name and format it was
+    /// converted from, even across rewrites.
+    fn source_origin(&self) -> Option<crate::SourceOrigin> {
+        None
     }
 
     /// Returns identity fields embedded in the source.

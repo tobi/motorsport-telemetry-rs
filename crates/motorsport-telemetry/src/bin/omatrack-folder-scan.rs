@@ -790,7 +790,7 @@ fn sampled_gps(file: &motorsport_telemetry::TelemetryFile) -> Option<(f64, f64)>
         };
         let Some(lon) = file
             .sample_at(longitude, time, true)
-            .and_then(|value| normalize_coordinate(value, &file.channels()[longitude].unit))
+            .and_then(|value| normalize_longitude(value, &file.channels()[longitude].unit))
         else {
             continue;
         };
@@ -821,6 +821,15 @@ fn normalize_coordinate(value: f64, unit: &str) -> Option<f64> {
         "rad" | "radian" | "radians" => Some(value.to_degrees()),
         "min" | "arcmin" | "arcminute" => Some(value / 60.0),
         _ => None,
+    }
+}
+
+/// Longitude form of [`normalize_coordinate`]: VBOX stores arc-minutes with
+/// west positive, so the sign flips to the east-positive convention.
+fn normalize_longitude(value: f64, unit: &str) -> Option<f64> {
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "min" | "arcmin" | "arcminute" => Some(-value / 60.0),
+        _ => normalize_coordinate(value, unit),
     }
 }
 

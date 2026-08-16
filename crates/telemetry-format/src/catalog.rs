@@ -3,8 +3,8 @@
 use crate::zip::ZipError;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use motorsport_telemetry_core::{
-    lookup_unit, normalize_unit, AbsoluteTimeRange, Channel, Chunk, DriverStint, FileMetadata,
-    LapMetadata, SampleType, SourceIdentity, Span, UnitSource, VideoFileRef,
+    lookup_unit, normalize_unit, AbsoluteTimeRange, AppliedPass, Channel, Chunk, DriverStint,
+    FileMetadata, LapMetadata, SampleType, SourceIdentity, Span, UnitSource, VideoFileRef,
 };
 
 const V: fn(u16) -> flatbuffers::VOffsetT = |field| 4 + field * 2;
@@ -16,10 +16,12 @@ const V: fn(u16) -> flatbuffers::VOffsetT = |field| 4 + field * 2;
 /// the presentation offset on each video handle. `4` requires `utc_start_ns`
 /// (Unix epoch at file `t = 0`) and IANA `timezone`. `5` stores spans
 /// (string-annotated intervals) and per-channel visibility so the native
-/// catalog matches JSONL channel capabilities. Bump this when the on-disk
-/// layout changes and add a step in `migrate.rs`.
+/// catalog matches JSONL channel capabilities. `6` records the provenance of
+/// applied processing passes (name, version, params, inputs, outputs) and
+/// preserves the original `source_format`/`source_path` across rewrites.
+/// Bump this when the on-disk layout changes and add a step in `migrate.rs`.
 /// [`crate::NativeRecording::open`] rewrites writable older files.
-pub const FORMAT_VERSION: u16 = 5;
+pub const FORMAT_VERSION: u16 = 6;
 
 /// Parsed FlatBuffers catalog from `metadata.fb`.
 #[derive(Debug, Clone)]
@@ -48,6 +50,12 @@ pub struct Catalog {
     pub presentation_offset_ns: Option<i128>,
     /// Interval annotations. Same model as JSONL `k:"s"` records.
     pub spans: Vec<Span>,
+    /// Processing passes applied to this recording, in application order.
+    ///
+    /// Every pass is lossless: it only appended the channels it names in
+    /// [`AppliedPass::outputs`]. Empty on raw conversions and on catalogs
+    /// older than v6.
+    pub passes: Vec<AppliedPass>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +81,9 @@ pub struct CatalogChannel {
 }
 
 impl Catalog {
-    pub fn to_file_metadata(&self) -> FileMetadata {
+    /// Format-neutral summary. `path` is the `.telemetry` file itself;
+    /// the catalog's `source_*` fields describe what it was converted from.
+    pub fn to_file_metadata(&self, path: &str) -> FileMetadata {
         let driver_ids = self
             .driver_stints
             .iter()
@@ -90,9 +100,12 @@ impl Catalog {
         let session_key = (!self.session_hint.is_empty())
             .then(|| format!("{}:{:016x}", self.session_hint, self.schema_hash));
         FileMetadata {
-            path: self.source_path.clone(),
+            path: path.to_owned(),
             format: self.source_format.clone(),
+            source_format: self.source_format.clone(),
+            source_path: self.source_path.clone(),
             format_version: Some(self.format_version),
+            passes: self.passes.clone(),
             channel_count: self.channel_count as usize,
             sampled_channel_count: self.sampled_channel_count as usize,
             sample_count: self.sample_count,
@@ -162,6 +175,8 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
         .then(|| builder.create_vector(&pack_visibility(&catalog.channels)));
     let spans =
         (catalog.format_version >= 5).then(|| builder.create_vector(&pack_spans(&catalog.spans)));
+    let passes = (catalog.format_version >= 6 && !catalog.passes.is_empty())
+        .then(|| builder.create_vector(&pack_passes(&catalog.passes)));
 
     let source_format = builder.create_string(&catalog.source_format);
     let source_path = builder.create_string(&catalog.source_path);
@@ -214,6 +229,9 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
     }
     if let Some(spans) = spans {
         builder.push_slot_always::<WIPOffset<_>>(V(27), spans);
+    }
+    if let Some(passes) = passes {
+        builder.push_slot_always::<WIPOffset<_>>(V(28), passes);
     }
     let root = builder.end_table(start);
     builder.finish(root, None);
@@ -297,6 +315,11 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         presentation_offset_ns: (table.u32(21) != 0).then(|| i128::from(table.i64_field(22))),
         spans: if format_version >= 5 {
             unpack_spans(&table.u8s(27))
+        } else {
+            Vec::new()
+        },
+        passes: if format_version >= 6 {
+            unpack_passes(&table.u8s(28))
         } else {
             Vec::new()
         },
@@ -845,6 +868,80 @@ fn unpack_spans(bytes: &[u8]) -> Vec<Span> {
         });
     }
     spans
+}
+
+fn pack_passes(passes: &[AppliedPass]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(passes.len() as u32).to_le_bytes());
+    for pass in passes {
+        pack_string(&mut out, &pass.name);
+        out.extend_from_slice(&pass.version.to_le_bytes());
+        out.extend_from_slice(&(pass.params.len() as u32).to_le_bytes());
+        for (key, value) in &pass.params {
+            pack_string(&mut out, key);
+            pack_string(&mut out, value);
+        }
+        out.extend_from_slice(&(pass.inputs.len() as u32).to_le_bytes());
+        for input in &pass.inputs {
+            pack_string(&mut out, input);
+        }
+        out.extend_from_slice(&(pass.outputs.len() as u32).to_le_bytes());
+        for output in &pass.outputs {
+            pack_string(&mut out, output);
+        }
+    }
+    out
+}
+
+fn unpack_passes(bytes: &[u8]) -> Vec<AppliedPass> {
+    fn count(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
+        let at = *cursor;
+        let value = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+        *cursor = at + 4;
+        Some(value)
+    }
+    let mut cursor = 0;
+    let Some(pass_count) = count(bytes, &mut cursor) else {
+        return Vec::new();
+    };
+    let mut passes = Vec::with_capacity(pass_count.min(64));
+    for _ in 0..pass_count {
+        let name = unpack_string(bytes, &mut cursor);
+        let Some(version) = count(bytes, &mut cursor) else {
+            break;
+        };
+        let Some(param_count) = count(bytes, &mut cursor) else {
+            break;
+        };
+        let mut params = Vec::with_capacity(param_count.min(64));
+        for _ in 0..param_count {
+            let key = unpack_string(bytes, &mut cursor);
+            let value = unpack_string(bytes, &mut cursor);
+            params.push((key, value));
+        }
+        let Some(input_count) = count(bytes, &mut cursor) else {
+            break;
+        };
+        let mut inputs = Vec::with_capacity(input_count.min(64));
+        for _ in 0..input_count {
+            inputs.push(unpack_string(bytes, &mut cursor));
+        }
+        let Some(output_count) = count(bytes, &mut cursor) else {
+            break;
+        };
+        let mut outputs = Vec::with_capacity(output_count.min(64));
+        for _ in 0..output_count {
+            outputs.push(unpack_string(bytes, &mut cursor));
+        }
+        passes.push(AppliedPass {
+            name,
+            version: version as u32,
+            params,
+            inputs,
+            outputs,
+        });
+    }
+    passes
 }
 
 fn root_table(bytes: &[u8]) -> Result<Table<'_>, ZipError> {
