@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://motorsport-telemetry.rs/schema/mtx.schema.json",
+  "$comment": "Do not edit shapes here. Canonical schema is /telemetry.schema.json at the repo root. This file exists so older paths keep resolving.",
+  "$ref": "../../../telemetry.schema.json"
+}

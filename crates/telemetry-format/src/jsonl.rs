@@ -5,12 +5,14 @@
 
 use crate::write::TelemetryFormatError;
 use motorsport_telemetry_core::{
-    read_source_metadata, schema_hash, AbsoluteTimeRange, Channel, Chunk, FileMetadata,
-    LapMetadata, SampleType, SourceIdentity, SourceLapMetadata, TelemetrySource, UnitSource,
+    parse_timespan_ms, read_source_metadata, schema_hash, timespan_ms_in_range, AbsoluteTimeRange,
+    Channel, ChannelDisplay, ChannelLabel, ChannelPlot, Chunk, FileMetadata, LapMetadata,
+    SampleType, SourceIdentity, SourceLapMetadata, TelemetrySource, UnitSource, TIMESPAN_MS,
 };
 use serde_json::{Map, Number, Value};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::Path;
 
 /// zstd frame magic (`0x28B52FFD`).
@@ -25,7 +27,7 @@ pub const JSONL_VERSION: u16 = 1;
 /// Extension (`mtx`) document version written and accepted by this module.
 pub const JSONL_EXT_VERSION: u16 = 1;
 
-pub use motorsport_telemetry_core::{Span, SpanPrimary};
+pub use motorsport_telemetry_core::{Span, SpanMetaValue, SpanPrimary};
 
 /// MTX group chrome: the sidecar is the folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +42,25 @@ pub struct SidecarHeader {
     pub utc_start_ns: u64,
     /// IANA timezone, e.g. `America/New_York`.
     pub timezone: String,
+}
+
+/// One folder in an MTX sidecar and the records governed by its header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarGroup {
+    /// Folder title, visibility, chrome, and absolute placement.
+    pub header: SidecarHeader,
+    /// Lattice quantum for this group's records.
+    pub quantum_ns: u64,
+    /// Lattice origin for this group's records.
+    pub origin_ns: u64,
+    /// Exclusive end of this group's timeline.
+    pub duration_ns: u64,
+    /// Optional host schema hash declared by this group.
+    pub schema_hash: Option<u64>,
+    /// Sample channels governed by this group's header.
+    pub channel_range: Range<usize>,
+    /// Spans governed by this group's header.
+    pub span_range: Range<usize>,
 }
 
 /// One right-aligned header element.
@@ -79,8 +100,10 @@ pub struct JsonlRecording {
     duration_ns: u64,
     schema_hash: Option<u64>,
     extension: bool,
-    sidecar: Option<SidecarHeader>,
+    sidecar_groups: Vec<SidecarGroup>,
     channel_visible: Vec<bool>,
+    channel_labels: Vec<Vec<ChannelLabel>>,
+    channel_display: Vec<ChannelDisplay>,
     spans: Vec<Span>,
 }
 
@@ -153,9 +176,9 @@ impl JsonlRecording {
         self.extension
     }
 
-    /// MTX group header. `None` on a full recording.
-    pub fn sidecar(&self) -> Option<&SidecarHeader> {
-        self.sidecar.as_ref()
+    /// MTX folders in file order. Empty on a full recording.
+    pub fn sidecar_groups(&self) -> &[SidecarGroup] {
+        &self.sidecar_groups
     }
 
     /// Default visibility of each sample channel, aligned with [`TelemetrySource::channels`].
@@ -182,14 +205,23 @@ impl JsonlRecording {
         if self.extension {
             return Err(invalid("cannot attach onto an extension"));
         }
-        if let (Some(host_hash), Some(ext_hash)) = (self.schema_hash, extension.schema_hash) {
-            if host_hash != ext_hash {
-                return Err(invalid(
-                    "extension hash does not match the host schema hash",
-                ));
-            }
+        if extension.sidecar_groups.is_empty() {
+            return Err(invalid("mtx extension has no groups"));
         }
-        let shift = join_shift_ns(self, extension)?;
+        let mut channel_shifts = vec![0; extension.channels.len()];
+        let mut span_shifts = vec![0; extension.spans.len()];
+        for group in &extension.sidecar_groups {
+            if let (Some(host_hash), Some(ext_hash)) = (self.schema_hash, group.schema_hash) {
+                if host_hash != ext_hash {
+                    return Err(invalid(
+                        "extension hash does not match the host schema hash",
+                    ));
+                }
+            }
+            let shift = join_shift_ns(self, group.header.utc_start_ns);
+            channel_shifts[group.channel_range.clone()].fill(shift);
+            span_shifts[group.span_range.clone()].fill(shift);
+        }
         let mut names: std::collections::BTreeSet<String> =
             self.channels.iter().map(|ch| ch.name.clone()).collect();
         let mut channels = self.channels.clone();
@@ -197,6 +229,14 @@ impl JsonlRecording {
         let mut channel_visible = self.channel_visible.clone();
         if channel_visible.len() < channels.len() {
             channel_visible.resize(channels.len(), true);
+        }
+        let mut channel_labels = self.channel_labels.clone();
+        if channel_labels.len() < channels.len() {
+            channel_labels.resize(channels.len(), Vec::new());
+        }
+        let mut channel_display = self.channel_display.clone();
+        if channel_display.len() < channels.len() {
+            channel_display.resize(channels.len(), ChannelDisplay::trace());
         }
         let mut duration_ns = self.duration_ns;
         let mut quantum_ns = self.quantum_ns;
@@ -209,6 +249,7 @@ impl JsonlRecording {
                     channel.name
                 )));
             }
+            let shift = channel_shifts[index];
             let shifted = shift_channel(channel, shift)?;
             duration_ns = duration_ns.max(shifted.duration_ns);
             if let Some(period) = shifted.first_period_ns() {
@@ -224,13 +265,40 @@ impl JsonlRecording {
                     .copied()
                     .unwrap_or(true),
             );
+            let display = extension
+                .channel_display
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            let mut labels = if display.plot.is_trace() {
+                extension
+                    .channel_labels
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for label in &mut labels {
+                let time = i128::from(label.time_ns) + shift;
+                if time < 0 {
+                    return Err(invalid(format!(
+                        "extension label on {} starts before host t=0",
+                        channel.name
+                    )));
+                }
+                label.time_ns =
+                    u64::try_from(time).map_err(|_| invalid("extension time overflow"))?;
+            }
+            channel_labels.push(labels);
+            channel_display.push(display);
         }
         if quantum_ns == 0 {
             quantum_ns = self.quantum_ns;
         }
         let mut spans = self.spans.clone();
-        for span in &extension.spans {
-            let shifted = shift_span(span, shift)?;
+        for (index, span) in extension.spans.iter().enumerate() {
+            let shifted = shift_span(span, span_shifts[index])?;
             duration_ns = duration_ns.max(shifted.end_ns);
             spans.push(shifted);
         }
@@ -238,6 +306,8 @@ impl JsonlRecording {
         attached.channels = channels;
         attached.values = values;
         attached.channel_visible = channel_visible;
+        attached.channel_labels = channel_labels;
+        attached.channel_display = channel_display;
         attached.spans = spans;
         attached.duration_ns = duration_ns;
         attached.quantum_ns = quantum_ns;
@@ -309,7 +379,7 @@ impl JsonlRecording {
         };
         let timezone = string_field(header, "tz");
         let utc_start_ns = int_field(header, "utc")?;
-        let sidecar = if extension {
+        let sidecar_header = if extension {
             let name = header
                 .get("n")
                 .and_then(Value::as_str)
@@ -347,12 +417,7 @@ impl JsonlRecording {
             None
         };
         let source_format = string_field(header, "src");
-        let schema_hash = match string_field(header, "hash") {
-            hash if hash.is_empty() => None,
-            hash => u64::from_str_radix(&hash, 16)
-                .map_err(|_| invalid("hash must be 16-digit lowercase hex"))
-                .map(Some)?,
-        };
+        let schema_hash = parse_schema_hash(header)?;
 
         let laps = if extension {
             Vec::new()
@@ -364,9 +429,21 @@ impl JsonlRecording {
         let mut channels = Vec::new();
         let mut values = Vec::new();
         let mut channel_visible = Vec::new();
+        let mut channel_labels = Vec::new();
+        let mut channel_display = Vec::new();
         let mut spans = Vec::new();
         let mut names = std::collections::BTreeSet::new();
         let mut channel_index = 0u32;
+        let mut sidecar_groups = Vec::new();
+        let mut current_group = sidecar_header.map(|header| SidecarGroup {
+            header,
+            quantum_ns,
+            origin_ns,
+            duration_ns,
+            schema_hash,
+            channel_range: 0..0,
+            span_range: 0..0,
+        });
         for line in lines {
             let line = line?;
             if line.is_empty() {
@@ -376,13 +453,37 @@ impl JsonlRecording {
             let object = record
                 .as_object()
                 .ok_or_else(|| invalid("record must be a JSON object"))?;
+            if object.contains_key("mtx") {
+                if !extension {
+                    return Err(invalid("mtx header is not allowed in an mtj recording"));
+                }
+                let mut finished = current_group
+                    .take()
+                    .ok_or_else(|| invalid("mtx extension has no current group"))?;
+                finished.channel_range.end = channels.len();
+                finished.span_range.end = spans.len();
+                sidecar_groups.push(finished);
+                current_group = Some(parse_sidecar_group_header(
+                    object,
+                    channels.len(),
+                    spans.len(),
+                )?);
+                continue;
+            }
+            if object.contains_key("mtj") {
+                return Err(invalid("mtj header is only allowed on the first line"));
+            }
+            let (record_origin_ns, record_quantum_ns, record_duration_ns) = current_group
+                .as_ref()
+                .map(|group| (group.origin_ns, group.quantum_ns, group.duration_ns))
+                .unwrap_or((origin_ns, quantum_ns, duration_ns));
             match record_kind(object)? {
                 RecordKind::Channel => {
                     let parsed = parse_channel(
                         object,
-                        origin_ns,
-                        quantum_ns,
-                        duration_ns,
+                        record_origin_ns,
+                        record_quantum_ns,
+                        record_duration_ns,
                         channel_index,
                         extension,
                     )?;
@@ -395,12 +496,19 @@ impl JsonlRecording {
                     channels.push(parsed.channel);
                     values.push(parsed.values);
                     channel_visible.push(parsed.visible);
+                    channel_labels.push(parsed.labels);
+                    channel_display.push(parsed.display);
                     channel_index += 1;
                 }
                 RecordKind::Span => {
-                    spans.push(parse_span(object, quantum_ns, extension)?);
+                    spans.push(parse_span(object, record_quantum_ns, extension)?);
                 }
             }
+        }
+        if let Some(mut finished) = current_group {
+            finished.channel_range.end = channels.len();
+            finished.span_range.end = spans.len();
+            sidecar_groups.push(finished);
         }
 
         Ok(Self {
@@ -418,8 +526,10 @@ impl JsonlRecording {
             duration_ns,
             schema_hash,
             extension,
-            sidecar,
+            sidecar_groups,
             channel_visible,
+            channel_labels,
+            channel_display,
             spans,
         })
     }
@@ -854,6 +964,20 @@ impl TelemetrySource for JsonlRecording {
     fn spans(&self) -> &[Span] {
         &self.spans
     }
+
+    fn channel_labels(&self, channel_index: usize) -> &[ChannelLabel] {
+        self.channel_labels
+            .get(channel_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn channel_display(&self, channel_index: usize) -> ChannelDisplay {
+        self.channel_display
+            .get(channel_index)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 struct AlignedSeries {
@@ -863,6 +987,8 @@ struct AlignedSeries {
     period_ns: u64,
     values: Vec<Option<f64>>,
     visible: bool,
+    labels: Vec<ChannelLabel>,
+    display: ChannelDisplay,
 }
 
 impl AlignedSeries {
@@ -875,6 +1001,8 @@ struct ParsedChannel {
     channel: Channel,
     values: Vec<f64>,
     visible: bool,
+    labels: Vec<ChannelLabel>,
+    display: ChannelDisplay,
 }
 
 fn collect_aligned(
@@ -931,6 +1059,12 @@ fn collect_aligned(
         period_ns,
         values,
         visible: source.channel_visible().get(index).copied().unwrap_or(true),
+        display: source.channel_display(index),
+        labels: if source.channel_display(index).plot.is_trace() {
+            source.channel_labels(index).to_vec()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -1142,14 +1276,10 @@ fn write_clock_fields(
     Ok(())
 }
 
-fn join_shift_ns(
-    host: &JsonlRecording,
-    ext: &JsonlRecording,
-) -> Result<i128, TelemetryFormatError> {
-    if let (Some(host_utc), Some(ext_utc)) = (host.utc_start_ns, ext.utc_start_ns) {
-        return Ok(i128::from(ext_utc) - i128::from(host_utc));
-    }
-    Ok(0)
+fn join_shift_ns(host: &JsonlRecording, ext_utc: u64) -> i128 {
+    host.utc_start_ns
+        .map(|host_utc| i128::from(ext_utc) - i128::from(host_utc))
+        .unwrap_or(0)
 }
 
 fn shift_channel(channel: &Channel, shift_ns: i128) -> Result<Channel, TelemetryFormatError> {
@@ -1265,7 +1395,58 @@ fn write_channel(
     if series.t0_ns != origin_ns {
         write!(writer, ",\"t0\":{}", series.t0_ns)?;
     }
+    write_display_fields(writer, &series.display)?;
+    if !series.labels.is_empty() {
+        writer.write_all(b",\"lbl\":[")?;
+        for (index, label) in series.labels.iter().enumerate() {
+            if index > 0 {
+                writer.write_all(b",")?;
+            }
+            write!(writer, "[{},", label.time_ns)?;
+            write_json_string(writer, &label.text)?;
+            writer.write_all(b"]")?;
+        }
+        writer.write_all(b"]")?;
+    }
     writer.write_all(b"}")?;
+    Ok(())
+}
+
+fn write_display_fields(
+    writer: &mut impl Write,
+    display: &ChannelDisplay,
+) -> Result<(), TelemetryFormatError> {
+    if !display.plot.is_trace() {
+        writer.write_all(b",\"plt\":")?;
+        write_json_string(writer, display.plot.as_str())?;
+    }
+    match (display.scale_min, display.scale_max) {
+        (Some(min), Some(max)) => {
+            writer.write_all(b",\"sc\":[")?;
+            write_number(writer, min)?;
+            writer.write_all(b",")?;
+            write_number(writer, max)?;
+            writer.write_all(b"]")?;
+        }
+        (Some(min), None) => {
+            writer.write_all(b",\"sc\":[")?;
+            write_number(writer, min)?;
+            writer.write_all(b"]")?;
+        }
+        (None, Some(max)) => {
+            writer.write_all(b",\"sc\":[null,")?;
+            write_number(writer, max)?;
+            writer.write_all(b"]")?;
+        }
+        (None, None) => {}
+    }
+    if let Some(decimals) = display.decimals {
+        write!(writer, ",\"rnd\":{decimals}")?;
+    }
+    if !display.format.is_empty() {
+        writer.write_all(b",\"fmt\":")?;
+        write_json_string(writer, &display.format)?;
+    }
     Ok(())
 }
 
@@ -1402,6 +1583,88 @@ fn parse_right(value: Option<&Value>) -> Result<Vec<HeaderChrome>, TelemetryForm
     Ok(right)
 }
 
+fn parse_schema_hash(header: &Map<String, Value>) -> Result<Option<u64>, TelemetryFormatError> {
+    let hash = string_field(header, "hash");
+    if hash.is_empty() {
+        return Ok(None);
+    }
+    if hash.len() != 16
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid("hash must be 16-digit lowercase hex"));
+    }
+    u64::from_str_radix(&hash, 16)
+        .map(Some)
+        .map_err(|_| invalid("hash must be 16-digit lowercase hex"))
+}
+
+fn parse_sidecar_group_header(
+    object: &Map<String, Value>,
+    channel_start: usize,
+    span_start: usize,
+) -> Result<SidecarGroup, TelemetryFormatError> {
+    if object.contains_key("mtj") {
+        return Err(invalid("mtx header cannot contain mtj"));
+    }
+    let version = int_field(object, "mtx")?.ok_or_else(|| invalid("mtx header is missing mtx"))?;
+    if version != u64::from(JSONL_EXT_VERSION) {
+        return Err(invalid(format!("unsupported mtx version {version}")));
+    }
+    let quantum_ns = int_field(object, "q")?.ok_or_else(|| invalid("mtx header is missing q"))?;
+    if quantum_ns == 0 {
+        return Err(invalid("q must be greater than 0"));
+    }
+    let duration_ns =
+        int_field(object, "dur")?.ok_or_else(|| invalid("mtx header is missing dur"))?;
+    let origin_ns = int_field(object, "o")?.unwrap_or(0);
+    if origin_ns % quantum_ns != 0 {
+        return Err(invalid("o is not on the time lattice"));
+    }
+    if duration_ns < origin_ns || (duration_ns - origin_ns) % quantum_ns != 0 {
+        return Err(invalid("dur is not on the time lattice"));
+    }
+    let name = object
+        .get("n")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("mtx header is missing n"))?;
+    if name.is_empty() {
+        return Err(invalid("mtx header n must be non-empty"));
+    }
+    let utc_start_ns =
+        int_field(object, "utc")?.ok_or_else(|| invalid("mtx header is missing utc"))?;
+    if utc_start_ns == 0 {
+        return Err(invalid(
+            "mtx header utc must be Unix-epoch nanoseconds at t=0",
+        ));
+    }
+    let timezone = string_field(object, "tz");
+    if timezone.is_empty() {
+        return Err(invalid("mtx header is missing tz"));
+    }
+    if jiff::tz::TimeZone::get(&timezone).is_err() {
+        return Err(invalid(format!(
+            "mtx header tz is not an IANA timezone: {timezone}"
+        )));
+    }
+    Ok(SidecarGroup {
+        header: SidecarHeader {
+            name: name.to_owned(),
+            visible: parse_vis(object, true, "mtx header")?,
+            right: parse_right(object.get("r"))?,
+            utc_start_ns,
+            timezone,
+        },
+        quantum_ns,
+        origin_ns,
+        duration_ns,
+        schema_hash: parse_schema_hash(object)?,
+        channel_range: channel_start..channel_start,
+        span_range: span_start..span_start,
+    })
+}
+
 fn parse_span(
     object: &Map<String, Value>,
     quantum_ns: u64,
@@ -1435,7 +1698,7 @@ fn parse_span(
     })
 }
 
-fn parse_meta(value: Option<&Value>) -> Result<Vec<(String, String)>, TelemetryFormatError> {
+fn parse_meta(value: Option<&Value>) -> Result<Vec<(String, SpanMetaValue)>, TelemetryFormatError> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -1453,12 +1716,52 @@ fn parse_meta(value: Option<&Value>) -> Result<Vec<(String, String)>, TelemetryF
         let key = pair[0]
             .as_str()
             .ok_or_else(|| invalid("meta name must be a string"))?;
-        let text = pair[1]
-            .as_str()
-            .ok_or_else(|| invalid("meta value must be a string"))?;
-        meta.push((key.to_owned(), text.to_owned()));
+        meta.push((key.to_owned(), parse_meta_value(&pair[1])?));
     }
     Ok(meta)
+}
+
+fn parse_meta_value(value: &Value) -> Result<SpanMetaValue, TelemetryFormatError> {
+    match value {
+        Value::Number(number) => parse_timespan_number(number),
+        Value::String(text) => Ok(SpanMetaValue::from_stored_text(text.clone())),
+        Value::Object(object) => {
+            let unit = object
+                .get("u")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("typed meta value is missing u"))?;
+            if unit != TIMESPAN_MS
+                && motorsport_telemetry_core::normalize_unit(unit) != Some(TIMESPAN_MS)
+            {
+                return Err(invalid(format!(
+                    "typed meta unit {unit} is not timespan_ms"
+                )));
+            }
+            let raw = object
+                .get("v")
+                .ok_or_else(|| invalid("typed meta value is missing v"))?;
+            match raw {
+                Value::Number(number) => parse_timespan_number(number),
+                Value::String(text) => parse_timespan_ms(text)
+                    .map(SpanMetaValue::TimeMs)
+                    .ok_or_else(|| invalid("timespan_ms string is not M:SS.FFF")),
+                _ => Err(invalid("timespan_ms v must be an integer or M:SS.FFF")),
+            }
+        }
+        _ => Err(invalid(
+            "meta value must be a string, millisecond integer, or {v,u}",
+        )),
+    }
+}
+
+fn parse_timespan_number(number: &Number) -> Result<SpanMetaValue, TelemetryFormatError> {
+    let ms = number
+        .as_u64()
+        .ok_or_else(|| invalid("timespan_ms must be an integer"))?;
+    if !timespan_ms_in_range(ms) {
+        return Err(invalid("timespan_ms exceeds 100 hours"));
+    }
+    Ok(SpanMetaValue::TimeMs(ms as u32))
 }
 
 fn validate_color(color: &str) -> Result<(), TelemetryFormatError> {
@@ -1514,13 +1817,26 @@ fn write_span(writer: &mut impl Write, span: &Span) -> Result<(), TelemetryForma
             writer.write_all(b"[")?;
             write_json_string(writer, key)?;
             writer.write_all(b",")?;
-            write_json_string(writer, value)?;
+            write_meta_value(writer, value)?;
             writer.write_all(b"]")?;
         }
         writer.write_all(b"]")?;
     }
     writer.write_all(b"}")?;
     Ok(())
+}
+
+fn write_meta_value(
+    writer: &mut impl Write,
+    value: &SpanMetaValue,
+) -> Result<(), TelemetryFormatError> {
+    match value {
+        SpanMetaValue::Text(text) => write_json_string(writer, text),
+        SpanMetaValue::TimeMs(ms) => {
+            write!(writer, "{{\"v\":{ms},\"u\":\"{}\"}}", TIMESPAN_MS)?;
+            Ok(())
+        }
+    }
 }
 
 fn parse_laps(value: &Value, quantum_ns: u64) -> Result<Vec<LapMetadata>, TelemetryFormatError> {
@@ -1631,6 +1947,13 @@ fn parse_channel(
             "channel {name} extends beyond dur + one period"
         )));
     }
+    let display = parse_display(record, name)?;
+    let labels = parse_labels(record, name, origin_ns, quantum_ns)?;
+    if !labels.is_empty() && !display.plot.is_trace() {
+        return Err(invalid(format!(
+            "channel {name} labels are only allowed on plt=trace"
+        )));
+    }
     Ok(ParsedChannel {
         channel: Channel {
             id,
@@ -1658,7 +1981,140 @@ fn parse_channel(
         },
         values,
         visible: parse_vis(record, require_vis, &format!("channel {name}"))?,
+        labels,
+        display,
     })
+}
+
+fn parse_display(
+    record: &Map<String, Value>,
+    name: &str,
+) -> Result<ChannelDisplay, TelemetryFormatError> {
+    let plot = match record.get("plt").and_then(Value::as_str) {
+        None | Some("") => ChannelPlot::Trace,
+        Some(value) => ChannelPlot::parse(value).ok_or_else(|| {
+            invalid(format!(
+                "channel {name} plt must be trace, gauge, or compass"
+            ))
+        })?,
+    };
+    let (scale_min, scale_max) = match record.get("sc") {
+        None => (None, None),
+        Some(Value::Array(pair)) if !pair.is_empty() => {
+            let min = match pair.first() {
+                Some(Value::Null) | None => None,
+                Some(value) => Some(json_finite(value, name, "sc min")?),
+            };
+            let max = match pair.get(1) {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(json_finite(value, name, "sc max")?),
+            };
+            if let (Some(low), Some(high)) = (min, max) {
+                if low >= high {
+                    return Err(invalid(format!(
+                        "channel {name} sc min must be less than max"
+                    )));
+                }
+            }
+            (min, max)
+        }
+        Some(_) => {
+            return Err(invalid(format!(
+                "channel {name} sc must be [min, max] numbers"
+            )))
+        }
+    };
+    let decimals = match record.get("rnd") {
+        None => None,
+        Some(value) => {
+            let number = json_u64(value)?
+                .ok_or_else(|| invalid(format!("channel {name} rnd must be an integer ≥ 0")))?;
+            if number > 15 {
+                return Err(invalid(format!("channel {name} rnd must be 0..=15")));
+            }
+            Some(number as u8)
+        }
+    };
+    let format = string_field(record, "fmt");
+    if format.chars().any(char::is_whitespace) {
+        return Err(invalid(format!(
+            "channel {name} fmt must not contain whitespace (use 0.0°C not '0.0 °C')"
+        )));
+    }
+    if format.chars().count() > 16 {
+        return Err(invalid(format!(
+            "channel {name} fmt is longer than 16 characters"
+        )));
+    }
+    Ok(ChannelDisplay {
+        plot,
+        scale_min,
+        scale_max,
+        decimals,
+        format,
+    })
+}
+
+fn json_finite(value: &Value, name: &str, what: &str) -> Result<f64, TelemetryFormatError> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| invalid(format!("channel {name} {what} must be a number")))?;
+    if !number.is_finite() {
+        return Err(invalid(format!("channel {name} {what} must be finite")));
+    }
+    Ok(number)
+}
+
+fn parse_labels(
+    record: &Map<String, Value>,
+    name: &str,
+    origin_ns: u64,
+    quantum_ns: u64,
+) -> Result<Vec<ChannelLabel>, TelemetryFormatError> {
+    let Some(value) = record.get("lbl") else {
+        return Ok(Vec::new());
+    };
+    let rows = value
+        .as_array()
+        .ok_or_else(|| invalid(format!("channel {name} lbl must be an array")))?;
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut previous = None;
+    for row in rows {
+        let pair = row
+            .as_array()
+            .ok_or_else(|| invalid(format!("channel {name} lbl entry must be [ns, text]")))?;
+        if pair.len() < 2 {
+            return Err(invalid(format!(
+                "channel {name} lbl entry must be [ns, text]"
+            )));
+        }
+        let time_ns = json_u64(&pair[0])?
+            .ok_or_else(|| invalid(format!("channel {name} label time must be an integer")))?;
+        if time_ns < origin_ns || time_ns % quantum_ns != 0 {
+            return Err(invalid(format!(
+                "channel {name} label time is not on the time lattice"
+            )));
+        }
+        if previous.is_some_and(|prev| time_ns <= prev) {
+            return Err(invalid(format!(
+                "channel {name} labels must be in increasing time order"
+            )));
+        }
+        let text = pair[1]
+            .as_str()
+            .ok_or_else(|| invalid(format!("channel {name} label text must be a string")))?;
+        if text.is_empty() {
+            return Err(invalid(format!(
+                "channel {name} label text must be non-empty"
+            )));
+        }
+        previous = Some(time_ns);
+        labels.push(ChannelLabel {
+            time_ns,
+            text: text.to_owned(),
+        });
+    }
+    Ok(labels)
 }
 
 /// Converts a JSON `hz` number into a nanosecond sample period.
@@ -2145,8 +2601,8 @@ mod tests {
         let opened =
             JsonlRecording::from_bytes("ride.telemetry.ext.jsonl", text.as_bytes()).unwrap();
         assert!(opened.is_extension());
-        assert_eq!(opened.sidecar().unwrap().name, "Ride height");
-        assert!(opened.sidecar().unwrap().visible);
+        assert_eq!(opened.sidecar_groups()[0].header.name, "Ride height");
+        assert!(opened.sidecar_groups()[0].header.visible);
         assert!(opened.metadata().laps.is_empty());
         assert_eq!(opened.channels().len(), 1);
         assert_eq!(opened.channel_visible(), [true]);
@@ -2154,6 +2610,47 @@ mod tests {
         assert_eq!(opened.sample_time_ns(0, 0, 0), 10_000_000);
         assert_eq!(opened.decode(0, 0, 0), 42.0);
         assert_eq!(opened.decode(0, 0, 3), 39.0);
+    }
+
+    #[test]
+    fn repeated_mtx_headers_start_independent_groups() {
+        let text = concat!(
+            "{\"mtx\":1,\"n\":\"Ride height\",\"q\":10000000,\"dur\":20000000,\"vis\":1,\"utc\":1000,\"tz\":\"UTC\"}\n",
+            "{\"n\":\"Ride Height FL\",\"hz\":100,\"vis\":1,\"v\":[42,41]}\n",
+            "{\"k\":\"s\",\"n\":\"Bottoming\",\"s\":0,\"e\":10000000,\"vis\":1}\n",
+            "{\"mtx\":1,\"n\":\"Stints\",\"q\":5000000,\"dur\":10000000,\"vis\":0,\"utc\":20001000,\"tz\":\"UTC\"}\n",
+            "{\"n\":\"Fuel Delta\",\"hz\":200,\"vis\":1,\"v\":[3,2]}\n",
+            "{\"k\":\"s\",\"n\":\"Driver A\",\"s\":0,\"e\":5000000,\"vis\":1}\n",
+        );
+        let extension =
+            JsonlRecording::from_bytes("groups.telemetry.ext.jsonl", text.as_bytes()).unwrap();
+        let groups = extension.sidecar_groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].header.name, "Ride height");
+        assert_eq!(groups[0].channel_range, 0..1);
+        assert_eq!(groups[0].span_range, 0..1);
+        assert_eq!(groups[1].header.name, "Stints");
+        assert!(!groups[1].header.visible);
+        assert_eq!(groups[1].quantum_ns, 5_000_000);
+        assert_eq!(groups[1].channel_range, 1..2);
+        assert_eq!(groups[1].span_range, 1..2);
+
+        let host = JsonlRecording::from_bytes(
+            "host.jsonl",
+            concat!(
+                "{\"mtj\":1,\"q\":5000000,\"dur\":50000000,\"utc\":1000,\"tz\":\"UTC\"}\n",
+                "[]\n",
+                "{\"n\":\"Speed\",\"hz\":200,\"v\":[1,2]}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let merged = host.attach(&extension).unwrap();
+        assert_eq!(merged.sample_time_ns(1, 0, 0), 0);
+        assert_eq!(merged.sample_time_ns(2, 0, 0), 20_000_000);
+        assert_eq!(merged.spans()[0].start_ns, 0);
+        assert_eq!(merged.spans()[1].start_ns, 20_000_000);
+        assert_eq!(merged.spans()[1].end_ns, 25_000_000);
     }
 
     #[test]
@@ -2232,6 +2729,89 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_attaches_channel_labels() {
+        let host = JsonlRecording::from_bytes(
+            "host.jsonl",
+            concat!(
+                "{\"mtj\":1,\"q\":10000000,\"dur\":40000000,\"utc\":1000,\"tz\":\"UTC\"}\n",
+                "[]\n",
+                "{\"n\":\"Speed\",\"hz\":100,\"v\":[1,2,3,4],\"lbl\":[[10000000,\"brake lock\"]]}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(host.channel_labels(0)[0].time_ns, 10_000_000);
+        assert_eq!(host.channel_labels(0)[0].text, "brake lock");
+        let ext = JsonlRecording::from_bytes(
+            "extra.telemetry.ext.jsonl",
+            concat!(
+                "{\"mtx\":1,\"n\":\"Notes\",\"q\":10000000,\"dur\":20000000,\"vis\":1,\"utc\":20001000,\"tz\":\"UTC\"}\n",
+                "{\"n\":\"Ride\",\"hz\":100,\"vis\":1,\"v\":[9,8],\"lbl\":[[0,\"pit in\"]]}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let merged = host.attach(&ext).unwrap();
+        assert_eq!(merged.channel_labels(0)[0].text, "brake lock");
+        assert_eq!(merged.channel_labels(1)[0].time_ns, 20_000_000);
+        assert_eq!(merged.channel_labels(1)[0].text, "pit in");
+    }
+
+    #[test]
+    fn rejects_labels_on_foreign_plot() {
+        let err = JsonlRecording::from_bytes(
+            "bad.jsonl",
+            concat!(
+                "{\"mtj\":1,\"q\":1000000000,\"dur\":2000000000}\n",
+                "[]\n",
+                "{\"n\":\"Heart Rate\",\"hz\":1,\"plt\":\"gauge\",\"v\":[140],\"lbl\":[[0,\"spike\"]]}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("only allowed on plt=trace"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parses_foreign_channel_display() {
+        let opened = JsonlRecording::from_bytes(
+            "bio.jsonl",
+            concat!(
+                "{\"mtj\":1,\"q\":1000000000,\"dur\":2000000000}\n",
+                "[]\n",
+                "{\"n\":\"Water Temp\",\"hz\":1,\"u\":\"°C\",\"plt\":\"gauge\",\"sc\":[60,120],\"rnd\":1,\"fmt\":\"0.0°C\",\"v\":[88.4,89.1]}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let display = opened.channel_display(0);
+        assert_eq!(display.plot, ChannelPlot::Gauge);
+        assert_eq!(display.scale_min, Some(60.0));
+        assert_eq!(display.scale_max, Some(120.0));
+        assert_eq!(display.decimals, Some(1));
+        assert_eq!(display.format, "0.0°C");
+        assert!(opened.channel_labels(0).is_empty());
+    }
+
+    #[test]
+    fn rejects_label_off_the_lattice() {
+        let err = JsonlRecording::from_bytes(
+            "bad.jsonl",
+            concat!(
+                "{\"mtj\":1,\"q\":10000000,\"dur\":40000000}\n",
+                "[]\n",
+                "{\"n\":\"Speed\",\"hz\":100,\"v\":[1,2],\"lbl\":[[1,\"x\"]]}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("lattice"), "{err}");
+    }
+
+    #[test]
     fn attach_joins_on_utc_ns_not_clk_abs() {
         let host = JsonlRecording::from_bytes(
             "host.jsonl",
@@ -2299,7 +2879,7 @@ mod tests {
         let opened =
             JsonlRecording::from_bytes("lmp2.telemetry.ext.jsonl", text.as_bytes()).unwrap();
         assert!(opened.is_extension());
-        let group = opened.sidecar().unwrap();
+        let group = &opened.sidecar_groups()[0].header;
         assert_eq!(group.name, "Sebring 12H 2025");
         assert!(!group.visible);
         assert_eq!(
@@ -2323,13 +2903,45 @@ mod tests {
         assert_eq!(
             stint.meta,
             [
-                ("Laps".into(), "28".into()),
-                ("Best".into(), "1:50.332".into()),
-                ("Avg".into(), "1:52.104".into()),
-                ("License".into(), "IMSA".into()),
+                ("Laps".into(), SpanMetaValue::Text("28".into())),
+                ("Best".into(), SpanMetaValue::TimeMs(110_332)),
+                ("Avg".into(), SpanMetaValue::TimeMs(112_104)),
+                ("License".into(), SpanMetaValue::Text("IMSA".into())),
             ]
         );
         assert_eq!(stint.end_ns - stint.start_ns, 5_400_000_000_000);
+    }
+
+    #[test]
+    fn timespan_ms_meta_is_integer_and_averages() {
+        let opened = JsonlRecording::from_bytes(
+            "stints.telemetry.ext.jsonl",
+            concat!(
+                "{\"mtx\":1,\"n\":\"Times\",\"q\":1000000,\"dur\":2000000,\"vis\":1,",
+                "\"utc\":1742040000000000000,\"tz\":\"UTC\"}\n",
+                "{\"k\":\"s\",\"n\":\"a\",\"s\":0,\"e\":1000000,\"vis\":1,\"m\":",
+                "[[\"Best\",{\"v\":110332,\"u\":\"timespan_ms\"}]]}\n",
+                "{\"k\":\"s\",\"n\":\"b\",\"s\":1000000,\"e\":2000000,\"vis\":1,\"m\":",
+                "[[\"Best\",110110]]}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let times: Vec<u32> = opened
+            .spans()
+            .iter()
+            .map(|span| span.meta[0].1.as_timespan_ms().unwrap())
+            .collect();
+        assert_eq!(times, [110_332, 110_110]);
+        assert_eq!(
+            motorsport_telemetry_core::average_timespan_ms(&times),
+            Some(110_221)
+        );
+        assert_eq!(
+            motorsport_telemetry_core::format_timespan_ms(times[0]),
+            "1:50.332"
+        );
+        assert_eq!(opened.spans()[0].meta[0].1.display(), "1:50.332");
     }
 
     #[test]
@@ -2358,9 +2970,9 @@ mod tests {
                 subtitle: "EL".into(),
             },
             meta: vec![
-                ("Laps".into(), "18".into()),
-                ("Total drive time".into(), "1:30:00".into()),
-                ("Driver License".into(), "IMSA".into()),
+                ("Laps".into(), SpanMetaValue::Text("18".into())),
+                ("Total drive time".into(), SpanMetaValue::TimeMs(5_400_000)),
+                ("Driver License".into(), SpanMetaValue::Text("IMSA".into())),
             ],
         }];
         let dir = tempfile::tempdir().unwrap();
@@ -2373,7 +2985,7 @@ mod tests {
         assert!(text.contains("\"title\":\"#443\""));
         assert!(text.contains("[\"Driver License\",\"IMSA\"]"));
         let opened = JsonlRecording::open(&dest).unwrap();
-        assert_eq!(opened.sidecar(), Some(&header));
+        assert_eq!(opened.sidecar_groups()[0].header, header);
         assert_eq!(opened.spans(), spans.as_slice());
     }
 

@@ -162,13 +162,13 @@ Line 1 is a JSON object. Writers SHOULD emit keys in the order listed.
 | `dur` | integer ≥ 0 | yes | Exclusive file-relative duration, nanoseconds. |
 | `o` | integer ≥ 0 | no | Lattice origin, nanoseconds. Default `0`. |
 | `src` | string | no | Source format: `aimd`, `pds`, `motec`, `vbo`, or `telemetry`. |
-| `drv` | string | no | Driver name. |
-| `veh` | string | no | Vehicle name or identifier. |
-| `ven` | string | no | Venue / circuit. |
-| `evt` | string | no | Event name. |
-| `ses` | string | no | Session name. |
-| `date` | string | no | Source date string, unchanged. |
-| `time` | string | no | Source time string, unchanged. |
+| `drv` | string | no | Driver name. 1–80. |
+| `veh` | string | no | Vehicle name or identifier. 1–80. |
+| `ven` | string | no | Venue / circuit. 1–80. |
+| `evt` | string | no | Event name. 1–80. |
+| `ses` | string | no | Session name. 1–80. |
+| `date` | string | no | Source date string, unchanged. 1–32. |
+| `time` | string | no | Source time string, unchanged. 1–32. |
 | `utc` | integer | yes on write when known | Unix-epoch nanoseconds (UTC) at file `t = 0`. |
 | `tz` | string | yes on write when known | IANA venue timezone, e.g. `America/New_York`. |
 | `clk` | string | no | Source clock name, e.g. `gps` or `utc`. Not a timezone. |
@@ -220,12 +220,17 @@ Each remaining line is one object:
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
-| `n` | string | yes | Channel name. Unique in the file. Non-empty. |
+| `n` | string | yes | Channel name. Unique in the file. 1–64 Unicode code points. |
 | `hz` | number > 0 | yes | Sample rate in hertz. See §3.1. |
-| `u` | string | no | Unit as declared by the source. Omit when unknown. |
+| `u` | string | no | Unit as declared by the source. 1–24. Omit when unknown. |
 | `v` | array | yes | Values, oldest first. Each element is a JSON number or `null`. |
 | `t0` | integer ≥ 0 | no | First-sample time, file-relative nanoseconds. Default `o`. |
 | `vis` | `0` or `1` | yes in MTX | Default visibility. Optional on `mtj` (default `1`). |
+| `plt` | string | no | Plot class: `trace` (default), `gauge`, or `compass`. |
+| `sc` | `[min, max]` | no | Suggested display scale. Either bound may be `null`. |
+| `rnd` | integer 0–15 | no | Decimal places to show. |
+| `fmt` | string | no | Rounding / unit format hint. 1–16, no whitespace: `0.0°C`, `000`, `0°`. |
+| `lbl` | array | no | Sparse comments on **traces only**. `[[ns,"text"],…]`. |
 
 `v` MUST contain at least one element. `NaN` and infinities are not JSON;
 missing or non-finite native samples are `null`.
@@ -247,6 +252,48 @@ distinct. Writers SHOULD preserve the source spelling.
 
 `hz` SHOULD be a JSON integer when `period_ns` divides one second exactly
 (100, 50, 25, 10, …). Otherwise it is the JSON number `1e9 / period_ns`.
+
+### 6.1 Plot class and display (`plt`, `sc`, `rnd`, `fmt`)
+
+`plt` says how to draw the channel. Omit it for a normal overlay **trace**.
+
+| `plt` | Use for | How to treat it |
+|---|---|---|
+| `trace` (default) | Speed, throttle, brake, steering, RPM, ride height | Y-vs-time strip. May share an axis with other traces of the same unit. |
+| `gauge` | Temperature, BPM, SpO2, and other foreign scalars | Own pane or gauge. Do **not** overlay on a speed/throttle strip. |
+| `compass` | Wind direction, heading | Compass / rose. Domain wraps at 360°. Do not plot as an unbounded Y axis. |
+
+`sc` is a suggested display range, not a clip and not a unit conversion.
+`rnd` is decimal places. `fmt` is a hint of at most 16 characters with
+**no whitespace** (`0.0°C`, `000`, `0°`). Viewers MAY ignore both. Do not
+invent `sc` / `rnd` / `fmt` from the channel name if the writer omitted them.
+
+Writer guidance for common foreign signals:
+
+| Signal | `plt` | typical `sc` | `rnd` | `fmt` |
+|---|---|---|---|---|
+| Coolant / tyre / oil temp | `gauge` | e.g. `[60,120]` or `[0,150]` | `1` | `0.0°C` |
+| Heart rate (BPM) | `gauge` | `[40,200]` | `0` | `000` |
+| SpO2 | `gauge` | `[80,100]` | `0` | `000%` |
+| Wind direction | `compass` | `[0,360]` | `0` | `0°` |
+
+### 6.2 Channel labels (`lbl`)
+
+Optional sparse comments. **Allowed only when `plt` is omitted or `trace`.**
+A `gauge` or `compass` channel MUST NOT carry `lbl`.
+
+Each element is `[time_ns, text]`. `time_ns` is file-relative, a lattice
+point, `≥ o`. Entries MUST be in strictly increasing time order. `text` is
+a non-empty string. Omit the key when there are no comments.
+
+A viewer draws a **dot** on this channel's trace at each `time_ns`. On
+hover the comment expands to a **dotted vertical** across the full height
+of the trace view. Labels are not samples and do not use `v`.
+
+```
+{"n":"Speed","hz":100,"u":"km/h","v":[10,11,12],"lbl":[[10000000,"brake lock"]]}
+{"n":"Water Temp","hz":1,"u":"°C","plt":"gauge","sc":[60,120],"rnd":1,"fmt":"0.0°C","v":[88.4]}
+```
 
 ## 7. What this format does not contain
 
@@ -313,13 +360,16 @@ the host, the whole host, or a window that starts later or runs longer.
 
 ### 11.1 Minimum document
 
-Two sections only:
+An MTX document contains one or more groups. Each group is:
 
-1. Exactly one **header** object whose identifying key is `mtx`, not `mtj`.
-2. Zero or more **records**: sample channels (§6) and/or spans (§12).
+1. One **header** object whose identifying key is `mtx`, not `mtj`.
+2. Zero or more **records**: sample channels (§6) and/or spans (§12), ending
+   at the next `mtx` header or end of file.
 
-The sidecar **is** the group. Host software treats every record in one MTX
-file as one folder named by the header `n`. There is no folder record type.
+Writing another complete `mtx` header starts another folder in the same file.
+There is no separate folder record type. Header `n` names that folder and
+header `vis` controls whether it starts expanded. Channel names remain unique
+across the whole file so every group can attach to one host without ambiguity.
 
 No laps line. No blank lines. Same compact JSON and `LF` rules as a recording.
 Same zstd wrapping as §8. Preferred names:
@@ -340,12 +390,12 @@ Same zstd wrapping as §8. Preferred names:
 | Key | Type | Required | Meaning |
 |---|---|---|---|
 | `mtx` | integer | yes | Extension spec version. This version is `1`. |
-| `n` | string | yes | Group name shown as the folder title, e.g. `Sebring 12H 2025`. Non-empty. |
-| `q` | integer ≥ 1 | yes | Lattice quantum of **this sidecar**, nanoseconds. |
-| `dur` | integer ≥ 0 | yes | Exclusive end of this sidecar's own timeline. |
+| `n` | string | yes | Group name shown as the folder title, e.g. `Sebring 12H 2025`. 1–64. |
+| `q` | integer ≥ 1 | yes | Lattice quantum of **this group**, nanoseconds. |
+| `dur` | integer ≥ 0 | yes | Exclusive end of this group's own timeline. |
 | `vis` | `0` or `1` | yes | `1` group starts expanded. `0` starts collapsed. |
-| `utc` | integer ≥ 1 | yes | Unix-epoch nanoseconds (UTC) at this sidecar's `t = 0`. |
-| `tz` | string | yes | IANA venue timezone. Copy from the host when the host has one. |
+| `utc` | integer ≥ 1 | yes | Unix-epoch nanoseconds (UTC) at this group's `t = 0`. |
+| `tz` | string | yes | IANA venue timezone for this group. Copy from the host when the host has one. |
 | `r` | array | no | Right-aligned chrome. See below. |
 | `o` | integer ≥ 0 | no | Lattice origin. Default `0`. |
 | `clk` | string | no | Vendor clock name. Not a join key. |
@@ -355,6 +405,11 @@ Same zstd wrapping as §8. Preferred names:
 
 A header MUST contain `mtx` and MUST NOT contain `mtj`. `q`, `dur`, and `o`
 obey §3.
+
+Every repeated header is complete and independently defines `q`, `dur`, `o`,
+`utc`, `tz`, and optional `hash` for the records that follow it. These fields
+MAY differ between groups; attach computes the host shift from each group's
+`utc`.
 
 **Right-aligned chrome `r`.** Order is left-to-right on the right side of the
 group header. Each element is one of:
@@ -372,8 +427,9 @@ host. Unknown keys are ignored.
 ### 11.3 Join (nanoseconds is the primary key)
 
 An extension does not store per-sample timestamps. The primary key is the
-same integer nanosecond as the host. A sidecar MUST stamp `utc` (Unix-epoch
-ns at its own `t = 0`) and `tz`. Join uses only those nanoseconds:
+same integer nanosecond as the host. Every group header MUST stamp `utc`
+(Unix-epoch ns at that group's `t = 0`) and `tz`. Join uses only those
+nanoseconds:
 
 ```
 t[i] = t0 + i · period_ns(hz)
@@ -384,9 +440,10 @@ host_file_ns = ext_file_ns + ext.utc − host.utc
 
 **Write host file-relative nanoseconds.** That is the default and the usual
 path. Open the host, read `laps[].start_ns` / `end_ns` or any
-`sample_time_ns`, snap to `q`, put those integers in `t0` / `s` / `e`. Copy
-the host's `utc` and `tz` onto the sidecar header (then `ext.utc == host.utc`
-and the shift is zero). Do not convert through a timezone. A sidecar that
+`sample_time_ns`, snap to that group's `q`, put those integers in `t0` / `s` /
+`e`. Copy the host's `utc` and `tz` onto the group header (then
+`group.utc == host.utc` and the shift is zero). Do not convert through a
+timezone. A sidecar that
 only covers lap 3 starts at that lap's host `start_ns`; it does not reset
 to zero.
 
@@ -429,8 +486,8 @@ A **span** is an interval on the same file-relative timeline: beginning, end,
 and string metadata. It is the OpenTelemetry idea on a race clock — a stint,
 a yellow, a pit — not a sampled signal.
 
-There is no folder record. The MTX file is the group: header `n` is the
-folder title, header `vis` is whether that group starts open.
+There is no folder record. In an MTX file, each `mtx` header starts a folder:
+header `n` is its title and header `vis` is whether that group starts open.
 
 Spans MAY appear in a recording (`mtj`) or an extension (`mtx`). They do not
 use `hz` or `v`. Time join for an extension (§11.3) shifts every span `s`/`e`
@@ -453,35 +510,115 @@ shown). A host `mtj` recording MAY omit `vis` (treated as `1`).
 ### 12.2 Span
 
 ```
-{"k":"s","n":"443-stint-1","s":0,"e":3600000000000,"vis":1,"c":"#e11d48","p":{"title":"#443","sub":"EL · 1:52.1"},"m":[["Laps","18"],["Best","1:50.332"],["Avg","1:52.104"],["License","IMSA"]]}
+{"k":"s","n":"443-stint-1","s":0,"e":3600000000000,"vis":1,"c":"#e11d48","p":{"title":"#443","sub":"EL · 1:52.1"},"m":[["Laps","18"],["Best",{"v":110332,"u":"timespan_ms"}],["Avg",{"v":112104,"u":"timespan_ms"}],["License","IMSA"]]}
 ```
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
 | `k` | `"s"` | yes | Span. |
-| `n` | string | no | Stable id. Not shown if `p.title` is set. |
+| `n` | string | no | Stable id. 1–64. Not shown if `p.title` is set. |
 | `s` | integer ≥ 0 | yes | Inclusive start, file-relative nanoseconds. |
 | `e` | integer ≥ 0 | yes | Exclusive end, file-relative nanoseconds. `e > s`. |
 | `vis` | `0` or `1` | yes in MTX | Default visibility inside the sidecar group. |
 | `c` | string | no | Display color `#RRGGBB` (six hex digits, `#` required). |
 | `p` | object | no | **Primary** labels, drawn on the span. |
-| `p.title` | string | no | Main label (car number, stint name). |
-| `p.sub` | string | no | Secondary label (`primary.subtitle`: driver, avg lap). |
-| `m` | array | no | **Meta** hover fields. Each element is `["Name","value"]`. Order is the hover order. |
+| `p.title` | string | no | Main label (car number, stint name). 1–32. |
+| `p.sub` | string | no | Secondary label (`primary.subtitle`: driver, avg lap). 1–48. |
+| `m` | array | no | **Meta** hover fields. Each element is `["Name", value]`. Value is a string, a `timespan_ms` integer, or `{"v":ms,"u":"timespan_ms"}`. |
 
 `s` and `e` MUST be lattice points. The span occupies `[s, e)`.
 
-**Primary vs meta.** `p` is on-span chrome. `m` is on-hover only. Values in
-`m` stay strings (`"1:50.332"`, not a typed duration).
+**Primary vs meta.** `p` is on-span chrome. `m` is on-hover only. Text
+stays a string (`"IMSA"`, `"28"`). Race times MUST be `timespan_ms`
+(§13.1) so they can be averaged.
+
+```
+["Best",{"v":110332,"u":"timespan_ms"}]
+["Best",110332]
+```
+
+A legacy `"1:50.332"` string is accepted and parsed. Writers emit the
+object (or the integer).
 
 ### 12.3 Example: 12 h of LMP2 stints
 
-One sidecar, one group named in the header. Collapsing the group hides every
-stint. Individual `vis` still controls whether a span is on when the group
-is open.
+This example has one group named in its header. Collapsing the group hides
+every stint. Individual `vis` still controls whether a span is on when the
+group is open. Additional folders can follow by writing another complete
+`mtx` header and its records.
 
 ```jsonl
 {"mtx":1,"n":"Sebring 12H 2025","q":1000000,"dur":12600000000000,"vis":1,"utc":1742040000000000000,"tz":"America/New_York","r":[{"t":"LMP2 stints during the race"},{"p":["Avg lap","1:52.1"]}]}
-{"k":"s","n":"443-1","s":0,"e":5400000000000,"vis":1,"c":"#e11d48","p":{"title":"#443","sub":"EL · 1:52.1"},"m":[["Laps","28"],["Best","1:50.332"],["Avg","1:52.104"],["Total drive time","1:30:00"],["Driver License","IMSA"]]}
-{"k":"s","n":"443-2","s":5400000000000,"e":12600000000000,"vis":1,"c":"#2563eb","p":{"title":"#443","sub":"MB · 1:51.8"},"m":[["Laps","38"],["Best","1:50.110"],["Avg","1:51.804"],["Total drive time","2:00:00"],["Driver License","IMSA"]]}
+{"k":"s","n":"443-1","s":0,"e":5400000000000,"vis":1,"c":"#e11d48","p":{"title":"#443","sub":"EL · 1:52.1"},"m":[["Laps","28"],["Best",{"v":110332,"u":"timespan_ms"}],["Avg",{"v":112104,"u":"timespan_ms"}],["Total drive time",{"v":5400000,"u":"timespan_ms"}],["Driver License","IMSA"]]}
+{"k":"s","n":"443-2","s":5400000000000,"e":12600000000000,"vis":1,"c":"#2563eb","p":{"title":"#443","sub":"MB · 1:51.8"},"m":[["Laps","38"],["Best",{"v":110110,"u":"timespan_ms"}],["Avg",{"v":111804,"u":"timespan_ms"}],["Total drive time",{"v":7200000,"u":"timespan_ms"}],["Driver License","IMSA"]]}
 ```
+
+## 13. Writer-strict string lengths
+
+Lengths are Unicode code points (JSON Schema `maxLength`). A writer MUST
+omit the key rather than emit `""`. The canonical table and worked
+`examples` are in [`telemetry.schema.json`](../../telemetry.schema.json).
+
+| Field | min | max |
+|---|---:|---:|
+| Channel `n`, span `n`, MTX group `n` | 1 | 64 |
+| `drv` `veh` `ven` `evt` `ses` | 1 | 80 |
+| `u` | 1 | 24 |
+| `fmt` (no whitespace) | 1 | 16 |
+| `tz` | 3 | 64 |
+| Label text | 1 | 80 |
+| Chrome `r[].t` | 1 | 120 |
+| Chrome pill part | 1 | 32 |
+| `p.title` / `p.sub` | 1 | 32 / 48 |
+| `m` name / value | 1 | 32 / 48 |
+| `date` `time` `clk` | 1 | 32 |
+| `hint` | 1 | 64 |
+| `hash` | 16 | 16 |
+| `c` | 7 | 7 |
+
+`r` MUST have at most 8 items, `m` at most 16 pairs, `lbl` at most 256
+pairs.
+
+### 13.1 `timespan_ms`
+
+Race durations (lap, sector, stint, drive time) are stored as **integer
+milliseconds**. The type is `u32`. The legal range is `0..=360000000`
+(100 hours inclusive). That is enough for a 24 h race and still exact
+for `avg = round(sum(v) / n)`.
+
+| | |
+|---|---|
+| Unit / format token | `timespan_ms` (aliases `laptime_ms`, `racetime_ms`) |
+| Storage | integer ms, `0..=360000000` |
+| SI factor | `0.001` (same dimension as `ms` / `s`) |
+| Display < 1 h | `M:SS.FFF` — `110332` → `1:50.332` |
+| Display ≥ 1 h | `H:MM:SS.FFF` — `5400000` → `1:30:00.000` |
+
+On a channel: `"u":"timespan_ms"` and/or `"fmt":"timespan_ms"`, `v` is
+milliseconds. On span meta: `{"v":110332,"u":"timespan_ms"}` or the
+integer `110332`. Readers still parse a racing-time string. Writers MUST
+NOT write a float.
+
+`timespan_ms` converts to `s`, `ms`, `min`, `h` through the unit
+registry. It does not convert to a civil clock.
+
+### 13.2 Convertible units
+
+The file MAY store any 1–24 unit string the source declared. Conversion
+is defined only for the registry in
+`crates/telemetry-core/src/units.rs` and documented in
+`telemetry.schema.json` `$defs.unitCatalog`. Same dimension only.
+
+Accepted both ways, among others:
+
+| Dimension | Canonical | Also accepted |
+|---|---|---|
+| Speed | `km/h` | `kph`, `kmh`, `kmph`, `km/hr` |
+| Speed | `mph` | `mi/h`, `mp/h` |
+| Pressure | `bar` | `Bar` |
+| Pressure | `psi` | `PSI`, `lbf/in^2` |
+| Temperature | `C` | `°C`, `degC` |
+| Time | `timespan_ms` | `laptime_ms`, `racetime_ms` |
+
+`convert(100, "km/h", "mph")` and `convert(1, "bar", "psi")` are the
+supported pair conversions. A writer SHOULD emit the canonical name.

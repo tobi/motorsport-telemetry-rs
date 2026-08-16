@@ -15,8 +15,8 @@ pub use jsonl::{
     is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, period_ns_from_hz,
     write_jsonl_extension_from_source, write_jsonl_extension_from_source_with,
     write_jsonl_from_source, write_jsonl_from_source_with, write_jsonl_timeline,
-    write_jsonl_timeline_with, write_jsonl_to, HeaderChrome, JsonlRecording, SidecarHeader, Span,
-    SpanPrimary, JSONL_EXT_VERSION, JSONL_VERSION, JSONL_ZSTD_LEVEL,
+    write_jsonl_timeline_with, write_jsonl_to, HeaderChrome, JsonlRecording, SidecarGroup,
+    SidecarHeader, Span, SpanPrimary, JSONL_EXT_VERSION, JSONL_VERSION, JSONL_ZSTD_LEVEL,
 };
 pub use migrate::apply as apply_migrations;
 pub use placement::{
@@ -98,6 +98,11 @@ mod tests {
                 duration_ns: 3,
                 kind: 0,
                 visible: true,
+                labels: vec![motorsport_telemetry_core::ChannelLabel {
+                    time_ns: 1_000_000,
+                    text: "note".into(),
+                }],
+                display: motorsport_telemetry_core::ChannelDisplay::trace(),
                 chunks: vec![Chunk {
                     sample_period_ns: 1_000_000,
                     sample_count: 3,
@@ -131,7 +136,10 @@ mod tests {
                     title: "#443".into(),
                     subtitle: "EL".into(),
                 },
-                meta: vec![("Laps".into(), "18".into())],
+                meta: vec![(
+                    "Laps".into(),
+                    motorsport_telemetry_core::SpanMetaValue::Text("18".into()),
+                )],
             }],
         };
         let bytes = encode(&catalog).unwrap();
@@ -148,8 +156,15 @@ mod tests {
         assert_eq!(decoded.timezone, "America/Chicago");
         assert_eq!(decoded.spans.len(), 1);
         assert_eq!(decoded.spans[0].primary.title, "#443");
-        assert_eq!(decoded.spans[0].meta[0], ("Laps".into(), "18".into()));
+        assert_eq!(
+            decoded.spans[0].meta[0],
+            (
+                "Laps".into(),
+                motorsport_telemetry_core::SpanMetaValue::Text("18".into())
+            )
+        );
         assert!(decoded.channels[0].visible);
+        assert_eq!(decoded.channels[0].labels[0].text, "note");
         assert_eq!(decoded.laps[0].first_video_frame, Some(4));
         assert_eq!(decoded.valid_laps, 1);
         assert_eq!(decoded.laps.len(), 1);
@@ -229,6 +244,58 @@ mod tests {
     }
 
     #[test]
+    fn schema_documents_every_convertible_unit() {
+        let schema = include_str!("../../../telemetry.schema.json");
+        for def in motorsport_telemetry_core::UNITS {
+            if !def.dimension.is_convertible() {
+                continue;
+            }
+            assert!(
+                schema.contains(&format!("\"{}\"", def.canonical)),
+                "telemetry.schema.json is missing convertible unit {}",
+                def.canonical
+            );
+        }
+        assert!(schema.contains("\"mp/h\""));
+        assert!(schema.contains("timespan_ms"));
+        assert!(schema.contains("360000000"));
+    }
+
+    #[test]
+    fn mtx_example_sidecars_validate() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("scripts/validate-mtx.py");
+        for name in [
+            "sebring-lmp2.telemetry.ext.jsonl",
+            "multi-folder.telemetry.ext.jsonl",
+        ] {
+            let example = root.join("schema/examples").join(name);
+            let status = std::process::Command::new("python3")
+                .arg(&script)
+                .arg(&example)
+                .status()
+                .expect("python3");
+            assert!(
+                status.success(),
+                "validate-mtx.py failed on {}",
+                example.display()
+            );
+        }
+        let self_check = std::process::Command::new("python3")
+            .arg(&script)
+            .arg("--self-check")
+            .output()
+            .expect("python3");
+        if !self_check.status.success() {
+            let stderr = String::from_utf8_lossy(&self_check.stderr);
+            assert!(
+                stderr.contains("jsonschema is required"),
+                "validate-mtx.py --self-check rejected a schema example: {stderr}"
+            );
+        }
+    }
+
+    #[test]
     fn native_preserves_jsonl_spans_and_visibility() {
         use motorsport_telemetry_core::TelemetrySource;
         let host = JsonlRecording::from_bytes(
@@ -236,7 +303,7 @@ mod tests {
             concat!(
                 "{\"mtj\":1,\"q\":1000000000,\"dur\":2000000000,\"utc\":1000,\"tz\":\"UTC\"}\n",
                 "[]\n",
-                "{\"n\":\"Speed\",\"hz\":1,\"vis\":0,\"v\":[1,2]}\n",
+                "{\"n\":\"Speed\",\"hz\":1,\"vis\":0,\"v\":[1,2],\"lbl\":[[0,\"brake lock\"]]}\n",
                 "{\"k\":\"s\",\"n\":\"443-1\",\"s\":0,\"e\":1000000000,\"vis\":1,\"c\":\"#e11d48\",",
                 "\"p\":{\"title\":\"#443\",\"sub\":\"EL\"},\"m\":[[\"Laps\",\"18\"]]}\n",
             )
@@ -251,14 +318,23 @@ mod tests {
         assert_eq!(opened.spans().len(), 1);
         assert_eq!(opened.spans()[0].name, "443-1");
         assert_eq!(opened.spans()[0].primary.title, "#443");
-        assert_eq!(opened.spans()[0].meta, [("Laps".into(), "18".into())]);
+        assert_eq!(
+            opened.spans()[0].meta,
+            [(
+                "Laps".into(),
+                motorsport_telemetry_core::SpanMetaValue::Text("18".into())
+            )]
+        );
         assert_eq!(opened.decode(0, 0, 0), 1.0);
+        assert_eq!(opened.channel_labels(0).len(), 1);
+        assert_eq!(opened.channel_labels(0)[0].text, "brake lock");
 
         let back = dir.path().join("back.telemetry.jsonl");
         write_jsonl_from_source_with(&opened, &back, false).unwrap();
         let again = JsonlRecording::open(&back).unwrap();
         assert_eq!(again.channel_visible(), [false]);
         assert_eq!(again.spans(), opened.spans());
+        assert_eq!(again.channel_labels(0)[0].text, "brake lock");
     }
 
     #[test]

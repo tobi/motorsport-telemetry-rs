@@ -3,8 +3,10 @@
 ## `.telemetry` format version
 
 `FORMAT_VERSION` in `crates/telemetry-format/src/catalog.rs` is the on-disk
-catalog version (`5`: spans + per-channel visibility; v4 added
-`utc_start_ns` + IANA `timezone`). Clients compare
+catalog version (`8`: typed span meta `timespan_ms` as u32le; v7 plot
+class / display scale / rounding; v6 comment labels; v5 spans + visibility;
+v4 `utc_start_ns` + timezone).
+Clients compare
 `FileMetadata::format_version` (or `read_format_version`) against it.
 
 When the catalog layout or required zip members change:
@@ -24,7 +26,9 @@ from the original vendor recording.
 ## JSONL (MTJ)
 
 `JSONL_VERSION` in `crates/telemetry-format/src/jsonl.rs` is independent of
-`FORMAT_VERSION`. The document rules are `crates/telemetry-format/JSONL.md`.
+`FORMAT_VERSION`. The user guide (layout + examples) is `TELEMETRY.md`. The writer-strict
+schema is `telemetry.schema.json`. The normative JSONL rules are
+`crates/telemetry-format/JSONL.md`.
 A valid file is time-aligned: no per-sample timestamps, every `t0` / sample
 instant / lap boundary / `dur` on the header lattice `q`. Irregular channels
 are omitted, not given `[t, v]` pairs. Preferred names are `.telemetry.jsonl`

@@ -14,6 +14,9 @@ pub fn apply(catalog: &mut Catalog) {
             2 => v2_to_v3(catalog),
             3 => v3_to_v4(catalog),
             4 => v4_to_v5(catalog),
+            5 => v5_to_v6(catalog),
+            6 => v6_to_v7(catalog),
+            7 => v7_to_v8(catalog),
             _ => break,
         }
         if catalog.format_version <= before {
@@ -67,6 +70,32 @@ fn v4_to_v5(catalog: &mut Catalog) {
     }
     catalog.spans.clear();
     catalog.format_version = 5;
+}
+
+fn v5_to_v6(catalog: &mut Catalog) {
+    // v6 adds sparse per-channel comment labels. Older files have none.
+    for channel in &mut catalog.channels {
+        channel.labels.clear();
+    }
+    catalog.format_version = 6;
+}
+
+fn v6_to_v7(catalog: &mut Catalog) {
+    // v7 adds plot class / scale / rounding. Older channels stay traces.
+    for channel in &mut catalog.channels {
+        channel.display = motorsport_telemetry_core::ChannelDisplay::trace();
+        if !channel.display.plot.is_trace() {
+            channel.labels.clear();
+        }
+    }
+    catalog.format_version = 7;
+}
+
+fn v7_to_v8(catalog: &mut Catalog) {
+    // v8 types span meta: racing-time strings become timespan_ms (u32).
+    // unpack_spans already reinterprets v5–v7 strings; this step only
+    // advances the version so the rewrite packs the u32 form.
+    catalog.format_version = 8;
 }
 
 #[cfg(test)]
