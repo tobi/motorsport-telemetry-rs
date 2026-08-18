@@ -150,6 +150,7 @@ impl<'a> PassedSource<'a> {
         let at = chunk.data_ptr as usize + local_index as usize * width;
         let bytes = &store.data[at..at + width];
         match store.sample_type {
+            SampleType::I8 => bytes[0] as i8 as f64,
             SampleType::U8 => bytes[0] as f64,
             SampleType::I16 => i16::from_le_bytes(bytes.try_into().unwrap()) as f64,
             SampleType::U16 => u16::from_le_bytes(bytes.try_into().unwrap()) as f64,
@@ -172,6 +173,10 @@ impl TelemetrySource for PassedSource<'_> {
 
     fn channels(&self) -> &[Channel] {
         &self.channels
+    }
+
+    fn diagnostics(&self) -> &[motorsport_telemetry_core::Diagnostic] {
+        self.inner.diagnostics()
     }
 
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {

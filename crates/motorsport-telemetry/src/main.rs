@@ -1,4 +1,7 @@
-use motorsport_telemetry::motorsport_telemetry_core::{FileMetadata, TelemetrySource};
+use motorsport_telemetry::motorsport_telemetry_core::{
+    validate::implies_decode_fault, validate_source_with, Diagnostic, Diagnostics, FileMetadata,
+    Severity, TelemetrySource, ValidateOptions,
+};
 use motorsport_telemetry::{open, TelemetryError, TelemetryFile};
 use racelogic_telemetry::RacelogicFile;
 use serde_json::json;
@@ -22,10 +25,11 @@ Inspect recordings, convert them to .telemetry or JSONL, and verify
 the on-disk formats this crate writes.
 
 Commands:
-  inspect    Print laps, track, video, and identity for a file
-             or every matching recording under a folder
+  inspect    Print laps, track, video, identity, and diagnostics
+             for a file or every matching recording under a folder
   convert    Write native .telemetry (default) or JSONL by suffix
-  verify     Check .telemetry / .telemetry.jsonl / .zstd
+  verify     Check .telemetry / .telemetry.jsonl / .zstd and flag
+             decode faults
 
 Run motorsport-telemetry <command> --help for that command.
 Run motorsport-telemetry help <command> for the same text.
@@ -37,10 +41,14 @@ Options:
 
 const INSPECT_HELP: &str = "\
 Usage: motorsport-telemetry inspect [options] <path>
-
 Print laps, track, video, and identity. <path> may be one recording or a
 folder. A folder is walked recursively; only recognized telemetry names
 are considered, then --mask (if any) filters that set.
+
+A diagnostics: section lists problems the reader recovered from and
+plausibility findings from the validator; `none` means a clean file. With
+--json each file report carries a `diagnostics` array of {severity, code,
+channel, message} objects.
 
 Arguments:
   <path>               A telemetry file, or a directory to scan
@@ -118,6 +126,12 @@ Check that each file is a valid native .telemetry archive or an MTJ/MTX
 JSONL document (plain or zstd). Opens a native file without rewriting an
 older catalog. Decodes one sample from every channel.
 
+After the format check, reader diagnostics and plausibility findings are
+printed for every file. A file whose channels claim more sample bytes than
+the file holds, or whose decoded values are absurdly large, is a decode
+fault (the bytes were read at the wrong width) and fails even though it
+opened. Plain warnings do not fail the command.
+
 Accepted names:
   .telemetry
   .telemetry.jsonl  .jsonl  .mtj
@@ -127,7 +141,7 @@ Accepted names:
 A compressed frame still verifies under a .telemetry.jsonl name (zstd
 magic is sniffed). Vendor files (.pds .ld .mp4 .vbo) are rejected.
 
-Exit status is 1 if any file fails, 2 on usage errors.
+Exit status is 1 if any file fails or is a decode fault, 2 on usage errors.
 
 Examples:
   motorsport-telemetry verify run.telemetry
@@ -165,6 +179,7 @@ struct Inspection {
     event_date: Option<String>,
     event_date_source: Option<String>,
     event_date_warning: Option<String>,
+    diagnostics: Vec<Diagnostic>,
 }
 
 fn main() {
@@ -746,8 +761,12 @@ fn verify_native(path: &Path) -> Result<String, String> {
     let opened = NativeRecording::open_unchanged(path).map_err(|error| error.to_string())?;
     let metadata = opened.metadata();
     probe_samples(&opened)?;
+    let diagnostics = source_diagnostics(&opened, fs::metadata(path).ok().map(|meta| meta.len()));
+    if implies_decode_fault(&diagnostics) {
+        return Err(decode_fault_message(&diagnostics));
+    }
     let stale = needs_update(metadata.format_version.unwrap_or(0));
-    Ok(format!(
+    let mut report = format!(
         "{}: ok  native v{}  channels={} laps={} utc={}{}",
         path.display(),
         metadata.format_version.unwrap_or(0),
@@ -762,12 +781,21 @@ fn verify_native(path: &Path) -> Result<String, String> {
         } else {
             String::new()
         }
-    ))
+    );
+    report.push_str(&format_diagnostics_block(diagnostics.items()));
+    Ok(report)
 }
 
 fn verify_jsonl(path: &Path) -> Result<String, String> {
     let opened = JsonlRecording::open(path).map_err(|error| error.to_string())?;
     probe_samples(&opened)?;
+    // JSONL is text: a sample is many bytes of text, not `byte_width`, so the
+    // file length bears no relation to the decoded footprint and the footprint
+    // check is skipped.
+    let diagnostics = source_diagnostics(&opened, None);
+    if implies_decode_fault(&diagnostics) {
+        return Err(decode_fault_message(&diagnostics));
+    }
     let compressed = is_jsonl_zstd_path(path) || starts_with_zstd(path);
     let kind = if opened.is_extension() { "mtx" } else { "mtj" };
     let extra = if opened.is_extension() {
@@ -775,7 +803,7 @@ fn verify_jsonl(path: &Path) -> Result<String, String> {
     } else {
         format!("  laps={}", opened.metadata().laps.len())
     };
-    Ok(format!(
+    let mut report = format!(
         "{}: ok  {kind}:{}{}  channels={} spans={} utc={} q={}{extra}",
         path.display(),
         if opened.is_extension() {
@@ -791,7 +819,9 @@ fn verify_jsonl(path: &Path) -> Result<String, String> {
             .map(|utc| utc.to_string())
             .unwrap_or_else(|| "none".into()),
         opened.quantum_ns(),
-    ))
+    );
+    report.push_str(&format_diagnostics_block(diagnostics.items()));
+    Ok(report)
 }
 
 fn probe_samples(source: &impl TelemetrySource) -> Result<(), String> {
@@ -802,6 +832,84 @@ fn probe_samples(source: &impl TelemetrySource) -> Result<(), String> {
         let _ = source.decode(index, 0, 0);
     }
     Ok(())
+}
+
+/// Combines a source's reader diagnostics with the plausibility validator's
+/// findings.
+///
+/// `file_len` is the backing file's byte length for binary formats whose
+/// decoded samples correspond one-to-one to packed file bytes (native
+/// `.telemetry`); `None` for text formats such as JSONL, where the file
+/// length bears no relation to the decoded footprint and the footprint
+/// check would falsely fire on compact text.
+fn source_diagnostics(source: &dyn TelemetrySource, file_len: Option<u64>) -> Diagnostics {
+    let mut combined = Diagnostics::new();
+    combined.extend(source.diagnostics().iter().cloned());
+    let options = ValidateOptions {
+        file_len,
+        ..ValidateOptions::default()
+    };
+    combined.append(validate_source_with(source, options));
+    combined
+}
+
+/// One-line count of diagnostics by severity, or `none` when empty.
+fn diagnostics_summary(diagnostics: &[Diagnostic]) -> String {
+    if diagnostics.is_empty() {
+        return "none".into();
+    }
+    let mut info = 0usize;
+    let mut warnings = 0usize;
+    let mut errors = 0usize;
+    for diagnostic in diagnostics {
+        match diagnostic.severity {
+            Severity::Info => info += 1,
+            Severity::Warning => warnings += 1,
+            Severity::Error => errors += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if info > 0 {
+        parts.push(format!("{info} info{}", if info == 1 { "" } else { "s" }));
+    }
+    if warnings > 0 {
+        parts.push(format!(
+            "{warnings} warning{}",
+            if warnings == 1 { "" } else { "s" }
+        ));
+    }
+    if errors > 0 {
+        parts.push(format!(
+            "{errors} error{}",
+            if errors == 1 { "" } else { "s" }
+        ));
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Renders a `diagnostics:` summary line plus one indented line per finding,
+/// prefixed with a newline so it can be appended to an existing report.
+fn format_diagnostics_block(items: &[Diagnostic]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\ndiagnostics: {}", diagnostics_summary(items));
+    for diagnostic in items {
+        out.push_str(&format!("\n  {diagnostic}"));
+    }
+    out
+}
+
+/// The failure message printed when a file's diagnostics imply a decode fault.
+fn decode_fault_message(diagnostics: &Diagnostics) -> String {
+    let mut message =
+        String::from("decode fault: at least one channel was decoded at the wrong sample width");
+    message.push_str(&format_diagnostics_block(diagnostics.items()));
+    message
 }
 
 fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryError> {
@@ -855,6 +963,7 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
         &["carclass", "vehicleclass", "classid", "competitionclass"],
     );
     let event_date = event_date(path, &metadata);
+    let diagnostics = file.validate().into_items();
 
     Ok(Inspection {
         file: path.to_string_lossy().into_owned(),
@@ -890,6 +999,7 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
         event_date: event_date.selected.map(|date| date.to_string()),
         event_date_source: event_date.source,
         event_date_warning: event_date.warning,
+        diagnostics,
     })
 }
 
@@ -1397,6 +1507,13 @@ fn print_human(inspection: &Inspection) {
             .track_length_m
             .map_or_else(|| "unknown".into(), |length| format!("{length:.0} m"))
     );
+    println!(
+        "diagnostics: {}",
+        diagnostics_summary(&inspection.diagnostics)
+    );
+    for diagnostic in &inspection.diagnostics {
+        println!("  {diagnostic}");
+    }
 }
 
 fn print_json(inspection: &Inspection) {
@@ -1446,6 +1563,18 @@ fn inspection_json(inspection: &Inspection) -> serde_json::Value {
         "track_name": inspection.track_name,
         "layout": inspection.layout,
         "track_length_m": inspection.track_length_m,
+        "diagnostics": inspection
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                json!({
+                    "severity": diagnostic.severity.name(),
+                    "code": diagnostic.code,
+                    "channel": diagnostic.channel,
+                    "message": diagnostic.message,
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -1566,6 +1695,13 @@ mod tests {
         assert!(arguments(Vec::<OsString>::new()).is_err());
         assert!(arguments(["inspect".into(), "one.ld".into(), "two.ld".into()]).is_err());
         assert!(arguments(["unknown".into()]).is_err());
+        assert_eq!(
+            arguments(["verify".into(), "--help".into()]),
+            Ok(Command::Help {
+                topic: HelpTopic::Verify
+            })
+        );
+        assert!(arguments(["inspect".into(), "--mask".into()]).is_err());
     }
 
     #[test]

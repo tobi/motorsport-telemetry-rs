@@ -517,50 +517,49 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
     } else {
         select_lap_counter(source, duration_ns)
     };
-    let timer_resets = source_laps
-        .is_none()
-        .then(|| {
-            channel_index(
-                source,
-                &[
-                    "currentlaptime",
-                    "lapcurrentlaptime",
-                    "laptime",
-                    "laptimerunning",
-                    "lapprogression",
-                    "lapprogress",
-                    "lapprogresspct",
-                ],
-            )
-            .map(|index| {
-                let values = samples(source, index);
-                let is_progress = ["lapprogression", "lapprogress", "lapprogresspct"]
-                    .iter()
-                    .any(|wanted| normalized_eq(&source.channels()[index].name, wanted));
-                let max_value = values
-                    .iter()
-                    .map(|(_, value)| *value)
-                    .filter(|value| value.is_finite())
-                    .fold(0.0_f64, f64::max);
-                let reset_threshold = if max_value > 1_000.0 { 5_000.0 } else { 5.0 };
-                values
-                    .windows(2)
-                    .filter_map(|pair| {
-                        let before = pair[0].1;
-                        let after = pair[1].1;
-                        let reset = if is_progress {
-                            let full_lap = if max_value > 2.0 { 100.0 } else { 1.0 };
-                            before >= full_lap * 0.75 && after <= full_lap * 0.25
-                        } else {
-                            before - after > reset_threshold
-                        };
-                        (before.is_finite() && after.is_finite() && reset).then_some(pair[1].0)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+    let timer_resets = if source_laps.is_none() {
+        channel_index(
+            source,
+            &[
+                "currentlaptime",
+                "lapcurrentlaptime",
+                "laptime",
+                "laptimerunning",
+                "lapprogression",
+                "lapprogress",
+                "lapprogresspct",
+            ],
+        )
+        .map(|index| {
+            let values = samples(source, index);
+            let is_progress = ["lapprogression", "lapprogress", "lapprogresspct"]
+                .iter()
+                .any(|wanted| normalized_eq(&source.channels()[index].name, wanted));
+            let max_value = values
+                .iter()
+                .map(|(_, value)| *value)
+                .filter(|value| value.is_finite())
+                .fold(0.0_f64, f64::max);
+            let reset_threshold = if max_value > 1_000.0 { 5_000.0 } else { 5.0 };
+            values
+                .windows(2)
+                .filter_map(|pair| {
+                    let before = pair[0].1;
+                    let after = pair[1].1;
+                    let reset = if is_progress {
+                        let full_lap = if max_value > 2.0 { 100.0 } else { 1.0 };
+                        before >= full_lap * 0.75 && after <= full_lap * 0.25
+                    } else {
+                        before - after > reset_threshold
+                    };
+                    (before.is_finite() && after.is_finite() && reset).then_some(pair[1].0)
+                })
+                .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut laps = if let Some(source_laps) = &source_laps {
         source_laps.laps.clone()
     } else if counter_crossings > 0 {

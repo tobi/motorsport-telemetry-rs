@@ -5,11 +5,13 @@ use aim_telemetry::AimFile;
 use cosworth_telemetry::CosworthFile;
 use motec_telemetry::MotecFile;
 use motorsport_telemetry_core::{
-    group_sessions, read_source_metadata, Channel, FileMetadata, SessionMetadata, SourceIdentity,
-    TelemetrySource, VideoReference,
+    group_sessions, read_source_metadata, validate_source_with, Channel, Diagnostic, Diagnostics,
+    FileMetadata, SessionMetadata, SourceIdentity, TelemetrySource, ValidateOptions,
+    VideoReference,
 };
 use motorsport_track_atlas::{match_track, TrackMatch};
 use racelogic_telemetry::RacelogicFile;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use telemetry_format::{is_jsonl_path, JsonlRecording, NativeRecording};
@@ -309,6 +311,10 @@ impl TelemetrySource for TelemetryFile {
     fn source_origin(&self) -> Option<motorsport_telemetry_core::SourceOrigin> {
         delegate!(self, source => TelemetrySource::source_origin(source))
     }
+
+    fn diagnostics(&self) -> &[Diagnostic] {
+        delegate!(self, source => source.diagnostics())
+    }
 }
 
 /// Channel indexes selected for the facade's format-neutral signal roles.
@@ -443,6 +449,54 @@ impl TelemetryFile {
         }
         let matched = match_track(lat_sum / count as f64, lon_sum / count as f64, 50_000.0)?;
         TrackContext::new(matched).ok()
+    }
+
+    /// Problems the underlying reader recovered from while it read this file,
+    /// in the order it encountered them.
+    ///
+    /// These are the reader's own findings: values it assumed, clamped, or
+    /// dropped because the bytes did not state them. An empty slice is a
+    /// positive claim that everything returned is what the file stated.
+    /// Recovery that is not reported here is indistinguishable from correct
+    /// data, which is how a misread sample width once produced speeds of
+    /// 1.5e308 m/s. Use [`Self::validate`] to also run the format-neutral
+    /// plausibility checks.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        delegate!(self, source => source.diagnostics())
+    }
+
+    /// Runs the format-neutral plausibility validator over this open file and
+    /// returns its findings combined with the reader's own diagnostics.
+    ///
+    /// Reader diagnostics come first, in the order the reader encountered
+    /// them; validator findings follow, in the order the validator produces
+    /// them. The validator is given the byte length of the backing file read
+    /// from filesystem metadata, which is what enables the
+    /// `layout.footprint_exceeds_file` check.
+    ///
+    /// That footprint check compares the sum of every channel's claimed
+    /// sample bytes to the file length, so it is only meaningful for binary
+    /// formats where decoded samples correspond one-to-one to packed file
+    /// bytes: Pi/Cosworth PDS, MoTeC LD, and native `.telemetry`. VBO and
+    /// JSONL are text (a sample is many bytes of text, not `byte_width`), and
+    /// AiM `aimd` expands one GPS packet into many channels, so their file
+    /// length bears no relation to the decoded footprint. For those formats
+    /// `file_len` is left `None` and the footprint check is skipped, as if
+    /// [`validate_source`](motorsport_telemetry_core::validate::validate_source)
+    /// had been called directly.
+    pub fn validate(&self) -> Diagnostics {
+        let mut combined = Diagnostics::new();
+        combined.extend(self.diagnostics().iter().cloned());
+        let mut options = ValidateOptions::default();
+        let binary = matches!(
+            self,
+            TelemetryFile::Cosworth(_) | TelemetryFile::Motec(_) | TelemetryFile::Native(_)
+        );
+        if binary {
+            options.file_len = fs::metadata(self.path()).ok().map(|meta| meta.len());
+        }
+        combined.append(validate_source_with(self, options));
+        combined
     }
 }
 

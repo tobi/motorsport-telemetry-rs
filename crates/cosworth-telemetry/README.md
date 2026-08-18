@@ -15,6 +15,21 @@ summary; `read_metadata_from_bytes` is the owned-buffer form.
 PDS has no universally reliable absolute session key, so that field remains
 empty unless the format exposes one.
 
+## Definition-layout detection
+
+PDS definition records vary by logger firmware. The reader detects both the
+quantity/unit fields and the sample-type field from each file instead of
+assuming fixed offsets. It scores candidate type fields against the chunk
+payload layout: the selected widths must make adjacent payloads tile the file.
+This prevents a missing field from silently turning every channel into
+`float64`.
+
+Type code `0` is signed `int8` (used by TPMS RSSI channels), followed by
+`uint8`, `int16`, `uint16`, `int32`, `uint32`, `float32`, and `float64`.
+Unsupported future codes recover as `float32` only with a
+`pds.type_code_unrecognized` warning. Truncated counts and dropped chunks are
+also available through `TelemetrySource::diagnostics()`.
+
 ```rust,no_run
 use motorsport_telemetry_core::TelemetrySource;
 use cosworth_telemetry::CosworthFile;

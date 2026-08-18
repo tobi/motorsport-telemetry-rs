@@ -22,10 +22,13 @@ const V: fn(u16) -> flatbuffers::VOffsetT = |field| 4 + field * 2;
 /// stores typed span meta (`timespan_ms` as u32le). `9` records the
 /// provenance of applied processing passes (name, version, params, inputs,
 /// outputs) and preserves the original `source_format`/`source_path` across
-/// rewrites.
+/// rewrites. `10` adds signed `int8` (`SampleType::I8`, sample-type code 0)
+/// so PDS TPMS RSSI and similar 1-byte signed channels round-trip without
+/// being misread as `f32`. No schema fields or zip members change; v1–v9
+/// writers never emitted code 0, so older catalogs migrate as a no-op.
 /// Bump this when the on-disk layout changes and add a step in `migrate.rs`.
 /// [`crate::NativeRecording::open`] rewrites writable older files.
-pub const FORMAT_VERSION: u16 = 9;
+pub const FORMAT_VERSION: u16 = 10;
 
 /// Parsed FlatBuffers catalog from `metadata.fb`.
 #[derive(Debug, Clone)]
@@ -374,6 +377,7 @@ fn unit_source_from(code: u8) -> UnitSource {
 
 fn sample_type_from(code: u8) -> SampleType {
     match code {
+        0 => SampleType::I8,
         1 => SampleType::U8,
         2 => SampleType::I16,
         3 => SampleType::U16,
@@ -415,6 +419,35 @@ fn dimension_code(dimension: motorsport_telemetry_core::Dimension) -> u8 {
     }
 }
 
+/// Reads a little-endian `u16` from `bytes` at `at`, or `None` if out of range.
+fn le_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+}
+/// Reads a little-endian `u32` from `bytes` at `at`, or `None` if out of range.
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+/// Reads a little-endian `i32` from `bytes` at `at`, or `None` if out of range.
+fn le_i32(bytes: &[u8], at: usize) -> Option<i32> {
+    Some(i32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+/// Reads a little-endian `i64` from `bytes` at `at`, or `None` if out of range.
+fn le_i64(bytes: &[u8], at: usize) -> Option<i64> {
+    Some(i64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+/// Reads a little-endian `u64` from `bytes` at `at`, or `None` if out of range.
+fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+/// Reads a little-endian `f64` from `bytes` at `at`, or `None` if out of range.
+fn le_f64(bytes: &[u8], at: usize) -> Option<f64> {
+    Some(f64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+/// Reads one byte from `bytes` at `at`, or `None` if out of range.
+fn byte_at(bytes: &[u8], at: usize) -> Option<u8> {
+    bytes.get(at).copied()
+}
+
 struct Table<'a> {
     buf: &'a [u8],
     loc: usize,
@@ -422,15 +455,15 @@ struct Table<'a> {
 
 impl<'a> Table<'a> {
     fn slot(&self, field: u16) -> Option<usize> {
-        let vtable_rel = i32::from_le_bytes(self.buf[self.loc..self.loc + 4].try_into().ok()?);
+        let vtable_rel = le_i32(self.buf, self.loc)?;
         let vtable = self.loc.checked_sub(vtable_rel as usize)?;
-        let vsize = u16::from_le_bytes(self.buf.get(vtable..vtable + 2)?.try_into().ok()?) as usize;
+        let vsize = le_u16(self.buf, vtable)? as usize;
         let off = 4 + field as usize * 2;
         if off + 2 > vsize {
             return None;
         }
-        let rel = u16::from_le_bytes(self.buf[vtable + off..vtable + off + 2].try_into().ok()?);
-        (rel != 0).then_some(self.loc + rel as usize)
+        let rel = le_u16(self.buf, vtable.checked_add(off)?)?;
+        (rel != 0).then_some(self.loc.checked_add(rel as usize)?)
     }
 
     fn u16_field(&self, field: u16) -> u16 {
@@ -463,38 +496,42 @@ impl<'a> Table<'a> {
     }
     fn string(&self, field: u16) -> Option<String> {
         let at = self.indirect(field)?;
-        let len = u32::from_le_bytes(self.buf.get(at..at + 4)?.try_into().ok()?) as usize;
-        let bytes = self.buf.get(at + 4..at + 4 + len)?;
+        let len = le_u32(self.buf, at)? as usize;
+        let start = at.checked_add(4)?;
+        let end = start.checked_add(len)?;
+        let bytes = self.buf.get(start..end)?;
         Some(std::str::from_utf8(bytes).ok()?.to_owned())
     }
     fn table(&self, field: u16) -> Option<Table<'a>> {
-        Some(Table {
-            buf: self.buf,
-            loc: self.indirect(field)?,
-        })
+        let loc = self.indirect(field)?;
+        let end = loc.checked_add(4)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        Some(Table { buf: self.buf, loc })
     }
     fn u8s(&self, field: u16) -> Vec<u8> {
         let Some(at) = self.indirect(field) else {
             return Vec::new();
         };
-        let Some(len) = self
-            .buf
-            .get(at..at + 4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(u32::from_le_bytes)
-        else {
+        let Some(len) = le_u32(self.buf, at) else {
             return Vec::new();
         };
-        self.buf
-            .get(at + 4..at + 4 + len as usize)
-            .unwrap_or_default()
-            .to_vec()
+        let start = match at.checked_add(4) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let end = match start.checked_add(len as usize) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        self.buf.get(start..end).unwrap_or_default().to_vec()
     }
 
     fn indirect(&self, field: u16) -> Option<usize> {
         let at = self.slot(field)?;
-        let rel = u32::from_le_bytes(self.buf.get(at..at + 4)?.try_into().ok()?) as usize;
-        Some(at + rel)
+        let rel = le_u32(self.buf, at)? as usize;
+        at.checked_add(rel)
     }
 }
 
@@ -526,48 +563,51 @@ fn pack_videos(videos: &[VideoFileRef], format_version: u16) -> Vec<u8> {
 }
 
 fn unpack_videos(bytes: &[u8], format_version: u16) -> Vec<VideoFileRef> {
-    if bytes.len() < 4 {
+    let Some(count) = le_u32(bytes, 0) else {
         return Vec::new();
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    };
     let mut cursor = 4;
+    // Each video entry is at least 17 bytes (filename len + index + hashed
+    // flag + frame count), so a valid count never exceeds the remaining bytes
+    // divided by 17. Bounding the count prevents a mutated u32::MAX from
+    // driving an unbounded allocation or iteration; the read loop also
+    // bounds-breaks on missing bytes.
+    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 17);
     let mut videos = Vec::with_capacity(count);
     for _ in 0..count {
         let filename = unpack_string(bytes, &mut cursor);
-        if cursor + 4 + 1 > bytes.len() {
+        let Some(index) = le_u32(bytes, cursor) else {
             break;
-        }
-        let index = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        };
         cursor += 4;
-        let hashed = bytes[cursor];
+        let Some(hashed) = byte_at(bytes, cursor) else {
+            break;
+        };
         cursor += 1;
         let blake3 = if hashed != 0 {
-            if cursor + 32 > bytes.len() {
+            let Some(bytes_slice) = bytes.get(cursor..cursor + 32) else {
                 break;
-            }
+            };
             let mut hash = [0u8; 32];
-            hash.copy_from_slice(&bytes[cursor..cursor + 32]);
+            hash.copy_from_slice(bytes_slice);
             cursor += 32;
             Some(hash)
         } else {
             None
         };
-        if cursor + 8 > bytes.len() {
+        let Some(frame_count) = le_u64(bytes, cursor) else {
             break;
-        }
-        let frame_count = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        };
         cursor += 8;
         let presentation_offset_ns = if format_version >= 3 {
-            if cursor >= bytes.len() {
+            let Some(present) = byte_at(bytes, cursor) else {
                 break;
-            }
-            let present = bytes[cursor];
+            };
             cursor += 1;
             if present != 0 {
-                if cursor + 8 > bytes.len() {
+                let Some(offset) = le_i64(bytes, cursor) else {
                     break;
-                }
-                let offset = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                };
                 cursor += 8;
                 Some(i128::from(offset))
             } else {
@@ -610,33 +650,43 @@ fn pack_laps(laps: &[LapMetadata], format_version: u16) -> Vec<u8> {
 }
 
 fn unpack_laps(bytes: &[u8], format_version: u16) -> Vec<LapMetadata> {
-    if bytes.len() < 4 {
+    let Some(count) = le_u32(bytes, 0) else {
         return Vec::new();
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    };
     let mut cursor = 4;
+    // Each lap entry is at least 33 bytes (number + start + end + duration +
+    // complete flag), so a valid count never exceeds the remaining bytes
+    // divided by 33. Bounds the allocation and iteration against a mutated
+    // u32::MAX; the read loop also bounds-breaks on missing bytes.
+    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 33);
     let mut laps = Vec::with_capacity(count);
     for _ in 0..count {
-        if cursor + 33 > bytes.len() {
+        let Some(number) = le_i64(bytes, cursor) else {
             break;
-        }
-        let number = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        let start_ns = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
-        let end_ns = u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap());
-        let duration_ns = u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap());
-        let complete = bytes[cursor + 32] != 0;
+        };
+        let Some(start_ns) = le_u64(bytes, cursor + 8) else {
+            break;
+        };
+        let Some(end_ns) = le_u64(bytes, cursor + 16) else {
+            break;
+        };
+        let Some(duration_ns) = le_u64(bytes, cursor + 24) else {
+            break;
+        };
+        let Some(complete_byte) = byte_at(bytes, cursor + 32) else {
+            break;
+        };
+        let complete = complete_byte != 0;
         cursor += 33;
         let first_video_frame = if format_version >= 3 {
-            if cursor >= bytes.len() {
+            let Some(present) = byte_at(bytes, cursor) else {
                 break;
-            }
-            let present = bytes[cursor];
+            };
             cursor += 1;
             if present != 0 {
-                if cursor + 8 > bytes.len() {
+                let Some(frame) = le_u64(bytes, cursor) else {
                     break;
-                }
-                let frame = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                };
                 cursor += 8;
                 Some(frame)
             } else {
@@ -669,20 +719,30 @@ fn pack_stints(stints: &[DriverStint]) -> Vec<u8> {
 }
 
 fn unpack_stints(bytes: &[u8]) -> Vec<DriverStint> {
-    if bytes.len() < 4 {
+    let Some(count) = le_u32(bytes, 0) else {
         return Vec::new();
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    };
     let mut cursor = 4;
+    // Each stint is 24 bytes, so a valid count never exceeds the remaining
+    // bytes divided by 24. Bounding the count prevents a mutated u32::MAX
+    // from driving an unbounded allocation or iteration; the read loop also
+    // bounds-breaks on missing bytes.
+    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 24);
     let mut stints = Vec::with_capacity(count);
     for _ in 0..count {
-        if cursor + 24 > bytes.len() {
+        let Some(driver_id) = le_i64(bytes, cursor) else {
             break;
-        }
+        };
+        let Some(start_ns) = le_u64(bytes, cursor + 8) else {
+            break;
+        };
+        let Some(end_ns) = le_u64(bytes, cursor + 16) else {
+            break;
+        };
         stints.push(DriverStint {
-            driver_id: i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()),
-            start_ns: u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap()),
-            end_ns: u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap()),
+            driver_id,
+            start_ns,
+            end_ns,
         });
         cursor += 24;
     }
@@ -696,13 +756,15 @@ fn pack_string(out: &mut Vec<u8>, value: &str) {
 }
 
 fn unpack_string(bytes: &[u8], cursor: &mut usize) -> String {
-    if *cursor + 4 > bytes.len() {
+    let Some(len) = le_u32(bytes, *cursor) else {
         return String::new();
-    }
-    let len = u32::from_le_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    };
     *cursor += 4;
-    let end = (*cursor + len).min(bytes.len());
-    let value = String::from_utf8_lossy(&bytes[*cursor..end]).into_owned();
+    let end = cursor
+        .checked_add(len as usize)
+        .unwrap_or(bytes.len())
+        .min(bytes.len());
+    let value = String::from_utf8_lossy(bytes.get(*cursor..end).unwrap_or_default()).into_owned();
     *cursor = end;
     value
 }
@@ -738,60 +800,91 @@ fn pack_channels(channels: &[CatalogChannel]) -> Vec<u8> {
 }
 
 fn unpack_channels(bytes: &[u8]) -> Vec<CatalogChannel> {
-    if bytes.len() < 4 {
+    let Some(count) = le_u32(bytes, 0) else {
         return Vec::new();
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    };
     let mut cursor = 4;
+    // Each channel entry is at least 65 bytes (id + five string lengths +
+    // five flag bytes + scale + bias + sample_count + duration + chunk_count),
+    // so a valid count never exceeds the remaining bytes divided by 65. Bounds
+    // allocation and iteration against a mutated u32::MAX; the read loop also
+    // bounds-breaks on missing bytes.
+    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 65);
     let mut channels = Vec::with_capacity(count);
     for _ in 0..count {
-        if cursor + 4 > bytes.len() {
+        let Some(id) = le_u32(bytes, cursor) else {
             break;
-        }
-        let id = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        };
         cursor += 4;
         let name = unpack_string(bytes, &mut cursor);
         let member = unpack_string(bytes, &mut cursor);
         let time_member = unpack_string(bytes, &mut cursor);
         let unit_raw = unpack_string(bytes, &mut cursor);
         let unit_canonical = unpack_string(bytes, &mut cursor);
-        if cursor + 5 + 8 + 8 + 8 + 8 + 4 > bytes.len() {
+        let Some(unit_source_byte) = byte_at(bytes, cursor) else {
             break;
-        }
-        let unit_source = unit_source_from(bytes[cursor]);
-        let dimension = bytes[cursor + 1];
-        let sample_type = sample_type_from(bytes[cursor + 2]);
-        let uses_step = bytes[cursor + 3] != 0;
-        let kind = bytes[cursor + 4];
+        };
+        let Some(dimension_byte) = byte_at(bytes, cursor + 1) else {
+            break;
+        };
+        let Some(sample_type_byte) = byte_at(bytes, cursor + 2) else {
+            break;
+        };
+        let Some(uses_step_byte) = byte_at(bytes, cursor + 3) else {
+            break;
+        };
+        let Some(kind_byte) = byte_at(bytes, cursor + 4) else {
+            break;
+        };
+        let unit_source = unit_source_from(unit_source_byte);
+        let dimension = dimension_byte;
+        let sample_type = sample_type_from(sample_type_byte);
+        let uses_step = uses_step_byte != 0;
+        let kind = kind_byte;
         cursor += 5;
-        let scale = f64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let Some(scale) = le_f64(bytes, cursor) else {
+            break;
+        };
         cursor += 8;
-        let bias = f64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let Some(bias) = le_f64(bytes, cursor) else {
+            break;
+        };
         cursor += 8;
-        let sample_count = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let Some(sample_count) = le_u64(bytes, cursor) else {
+            break;
+        };
         cursor += 8;
-        let duration_ns = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let Some(duration_ns) = le_u64(bytes, cursor) else {
+            break;
+        };
         cursor += 8;
-        let chunk_count =
-            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let Some(chunk_count) = le_u32(bytes, cursor) else {
+            break;
+        };
         cursor += 4;
+        // Each chunk is 32 bytes; bound the count by the remaining bytes so a
+        // mutated u32::MAX cannot drive unbounded allocation or iteration.
+        let chunk_count = (chunk_count as usize).min(bytes.len().saturating_sub(cursor) / 32);
         let mut chunks = Vec::with_capacity(chunk_count);
         for _ in 0..chunk_count {
-            if cursor + 32 > bytes.len() {
+            let Some(sample_period_ns) = le_u64(bytes, cursor) else {
                 break;
-            }
+            };
+            let Some(sample_count_chunk) = le_u64(bytes, cursor + 8) else {
+                break;
+            };
+            let Some(sample_base) = le_u64(bytes, cursor + 16) else {
+                break;
+            };
+            let Some(time_base_ns) = le_u64(bytes, cursor + 24) else {
+                break;
+            };
             chunks.push(Chunk {
-                sample_period_ns: u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()),
-                sample_count: u64::from_le_bytes(
-                    bytes[cursor + 8..cursor + 16].try_into().unwrap(),
-                ),
+                sample_period_ns,
+                sample_count: sample_count_chunk,
                 data_ptr: 0,
-                sample_base: u64::from_le_bytes(
-                    bytes[cursor + 16..cursor + 24].try_into().unwrap(),
-                ),
-                time_base_ns: u64::from_le_bytes(
-                    bytes[cursor + 24..cursor + 32].try_into().unwrap(),
-                ),
+                sample_base,
+                time_base_ns,
             });
             cursor += 32;
         }
@@ -847,23 +940,25 @@ fn pack_labels(channels: &[CatalogChannel]) -> Vec<u8> {
 }
 
 fn apply_labels(channels: &mut [CatalogChannel], bytes: &[u8]) {
-    if bytes.len() < 4 {
+    let Some(count) = le_u32(bytes, 0) else {
         return;
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    };
+    let count = count as usize;
     let mut cursor = 4;
     for channel in channels.iter_mut().take(count) {
-        if cursor + 4 > bytes.len() {
+        let Some(n) = le_u32(bytes, cursor) else {
             break;
-        }
-        let n = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        };
         cursor += 4;
+        // Each label is at least 12 bytes (time_ns + text length), so a valid
+        // count never exceeds the remaining bytes divided by 12. Bounds the
+        // allocation and iteration against a mutated u32::MAX.
+        let n = (n as usize).min(bytes.len().saturating_sub(cursor) / 12);
         let mut labels = Vec::with_capacity(n);
         for _ in 0..n {
-            if cursor + 8 > bytes.len() {
+            let Some(time_ns) = le_u64(bytes, cursor) else {
                 break;
-            }
-            let time_ns = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+            };
             cursor += 8;
             let text = unpack_string(bytes, &mut cursor);
             labels.push(ChannelLabel { time_ns, text });
@@ -925,45 +1020,43 @@ fn pack_display(channels: &[CatalogChannel]) -> Vec<u8> {
 }
 
 fn apply_display(channels: &mut [CatalogChannel], bytes: &[u8]) {
-    if bytes.len() < 4 {
+    let Some(count) = le_u32(bytes, 0) else {
         return;
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    };
+    let count = count as usize;
     let mut cursor = 4;
     for channel in channels.iter_mut().take(count) {
-        if cursor + 2 > bytes.len() {
+        let Some(plot_byte) = byte_at(bytes, cursor) else {
             break;
-        }
-        let plot = plot_from(bytes[cursor]);
-        let flags = bytes[cursor + 1];
+        };
+        let Some(flags) = byte_at(bytes, cursor + 1) else {
+            break;
+        };
+        let plot = plot_from(plot_byte);
         cursor += 2;
         let mut display = ChannelDisplay {
             plot,
             ..ChannelDisplay::trace()
         };
         if flags & 1 != 0 {
-            if cursor + 8 > bytes.len() {
+            let Some(min) = le_f64(bytes, cursor) else {
                 break;
-            }
-            display.scale_min = Some(f64::from_le_bytes(
-                bytes[cursor..cursor + 8].try_into().unwrap(),
-            ));
+            };
+            display.scale_min = Some(min);
             cursor += 8;
         }
         if flags & 2 != 0 {
-            if cursor + 8 > bytes.len() {
+            let Some(max) = le_f64(bytes, cursor) else {
                 break;
-            }
-            display.scale_max = Some(f64::from_le_bytes(
-                bytes[cursor..cursor + 8].try_into().unwrap(),
-            ));
+            };
+            display.scale_max = Some(max);
             cursor += 8;
         }
         if flags & 4 != 0 {
-            if cursor >= bytes.len() {
+            let Some(decimals) = byte_at(bytes, cursor) else {
                 break;
-            }
-            display.decimals = Some(bytes[cursor]);
+            };
+            display.decimals = Some(decimals);
             cursor += 1;
         }
         if flags & 8 != 0 {
@@ -1003,44 +1096,52 @@ fn pack_spans(spans: &[Span]) -> Vec<u8> {
 }
 
 fn unpack_spans(bytes: &[u8], format_version: u16) -> Vec<Span> {
-    if bytes.len() < 4 {
+    let Some(count) = le_u32(bytes, 0) else {
         return Vec::new();
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    };
     let mut cursor = 4;
+    // Each span is at least 33 bytes (name length + start + end + visible +
+    // color + title + subtitle lengths + meta_count), so a valid count never
+    // exceeds the remaining bytes divided by 33. Bounds allocation and
+    // iteration against a mutated u32::MAX; the read loop also bounds-breaks.
+    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 33);
     let mut spans = Vec::with_capacity(count);
     for _ in 0..count {
         let name = unpack_string(bytes, &mut cursor);
-        if cursor + 16 + 1 > bytes.len() {
+        let Some(start_ns) = le_u64(bytes, cursor) else {
             break;
-        }
-        let start_ns = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        let end_ns = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
-        let visible = bytes[cursor + 16] != 0;
+        };
+        let Some(end_ns) = le_u64(bytes, cursor + 8) else {
+            break;
+        };
+        let Some(visible_byte) = byte_at(bytes, cursor + 16) else {
+            break;
+        };
+        let visible = visible_byte != 0;
         cursor += 17;
         let color = unpack_string(bytes, &mut cursor);
         let title = unpack_string(bytes, &mut cursor);
         let subtitle = unpack_string(bytes, &mut cursor);
-        if cursor + 4 > bytes.len() {
+        let Some(meta_count) = le_u32(bytes, cursor) else {
             break;
-        }
-        let meta_count = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        };
         cursor += 4;
+        // Each meta entry is at least 8 bytes (key length + value length), so
+        // a valid count never exceeds the remaining bytes divided by 8.
+        let meta_count = (meta_count as usize).min(bytes.len().saturating_sub(cursor) / 8);
         let mut meta = Vec::with_capacity(meta_count);
         for _ in 0..meta_count {
             let key = unpack_string(bytes, &mut cursor);
             let value = if format_version >= 8 {
-                if cursor >= bytes.len() {
+                let Some(kind) = byte_at(bytes, cursor) else {
                     break;
-                }
-                let kind = bytes[cursor];
+                };
                 cursor += 1;
                 match kind {
                     1 => {
-                        if cursor + 4 > bytes.len() {
+                        let Some(ms) = le_u32(bytes, cursor) else {
                             break;
-                        }
-                        let ms = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+                        };
                         cursor += 4;
                         SpanMetaValue::TimeMs(ms.min(TIMESPAN_MS_MAX))
                     }
@@ -1090,15 +1191,27 @@ fn pack_passes(passes: &[AppliedPass]) -> Vec<u8> {
 fn unpack_passes(bytes: &[u8]) -> Vec<AppliedPass> {
     fn count(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
         let at = *cursor;
-        let value = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
-        *cursor = at + 4;
+        let value = le_u32(bytes, at)? as usize;
+        *cursor = at.checked_add(4)?;
         Some(value)
+    }
+    /// Bounds an untrusted element count by the bytes remaining at `cursor`
+    /// divided by the minimum encoded size of one element. A valid file never
+    /// has more elements than `remaining / min_record`, so this never truncates
+    /// real data but prevents a mutated u32::MAX from driving unbounded
+    /// allocation or iteration. The params/inputs/outputs loops call only
+    /// `unpack_string`, which returns empty without advancing once the buffer
+    /// is exhausted, so without this bound they could spin billions of times.
+    fn bounded(count: usize, bytes: &[u8], cursor: usize, min_record: usize) -> usize {
+        count.min(bytes.len().saturating_sub(cursor) / min_record)
     }
     let mut cursor = 0;
     let Some(pass_count) = count(bytes, &mut cursor) else {
         return Vec::new();
     };
-    let mut passes = Vec::with_capacity(pass_count.min(64));
+    // Each pass is at least 20 bytes (name + version + three count fields).
+    let pass_count = bounded(pass_count, bytes, cursor, 20);
+    let mut passes = Vec::with_capacity(pass_count);
     for _ in 0..pass_count {
         let name = unpack_string(bytes, &mut cursor);
         let Some(version) = count(bytes, &mut cursor) else {
@@ -1107,7 +1220,9 @@ fn unpack_passes(bytes: &[u8]) -> Vec<AppliedPass> {
         let Some(param_count) = count(bytes, &mut cursor) else {
             break;
         };
-        let mut params = Vec::with_capacity(param_count.min(64));
+        // Each param is two strings, at least 8 bytes total.
+        let param_count = bounded(param_count, bytes, cursor, 8);
+        let mut params = Vec::with_capacity(param_count);
         for _ in 0..param_count {
             let key = unpack_string(bytes, &mut cursor);
             let value = unpack_string(bytes, &mut cursor);
@@ -1116,14 +1231,18 @@ fn unpack_passes(bytes: &[u8]) -> Vec<AppliedPass> {
         let Some(input_count) = count(bytes, &mut cursor) else {
             break;
         };
-        let mut inputs = Vec::with_capacity(input_count.min(64));
+        // Each input is one string, at least 4 bytes.
+        let input_count = bounded(input_count, bytes, cursor, 4);
+        let mut inputs = Vec::with_capacity(input_count);
         for _ in 0..input_count {
             inputs.push(unpack_string(bytes, &mut cursor));
         }
         let Some(output_count) = count(bytes, &mut cursor) else {
             break;
         };
-        let mut outputs = Vec::with_capacity(output_count.min(64));
+        // Each output is one string, at least 4 bytes.
+        let output_count = bounded(output_count, bytes, cursor, 4);
+        let mut outputs = Vec::with_capacity(output_count);
         for _ in 0..output_count {
             outputs.push(unpack_string(bytes, &mut cursor));
         }
@@ -1142,8 +1261,13 @@ fn root_table(bytes: &[u8]) -> Result<Table<'_>, ZipError> {
     if bytes.len() < 8 {
         return Err(ZipError("catalog is too small".into()));
     }
-    let root = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    if root + 4 > bytes.len() {
+    let root = le_u32(bytes, 0)
+        .ok_or_else(|| ZipError("catalog root offset is unreadable".into()))?
+        as usize;
+    let end = root
+        .checked_add(4)
+        .ok_or_else(|| ZipError("catalog root offset overflows usize".into()))?;
+    if end > bytes.len() {
         return Err(ZipError("catalog root is out of range".into()));
     }
     Ok(Table {

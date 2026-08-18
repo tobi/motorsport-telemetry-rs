@@ -136,8 +136,8 @@ impl Encoded {
     /// exactly. LD natively offers i16, i32, f32 and f64.
     fn for_sample_type(source: SampleType) -> Self {
         match source {
-            // 0..255 and -32768..32767 both fit i16 exactly.
-            SampleType::U8 | SampleType::I16 => Self {
+            // Every i8/u8 value and every i16 value fits i16 exactly.
+            SampleType::I8 | SampleType::U8 | SampleType::I16 => Self {
                 datatype_a: 0x03,
                 width: 2,
             },

@@ -3,7 +3,7 @@ use motorsport_telemetry::{
     read_lap_metadata, TelemetryNormalizer,
 };
 use std::path::PathBuf;
-use telemetry_format::{write_from_source, write_jsonl_from_source};
+use telemetry_format::{write_from_source, write_jsonl_from_source, write_jsonl_from_source_with};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -71,9 +71,18 @@ fn vbo_sample_exposes_time_of_day() {
 fn reusable_normalizer_uses_lap_metadata_fallback() {
     let file = open(fixture("synthetic_cosworth.pds")).unwrap();
     let normalizer = TelemetryNormalizer::new(&file, file.signal_roles(), None);
-
-    assert_eq!(normalizer.sample(1_000_000_000).lap_progress, Some(0.25));
-    assert_eq!(normalizer.sample(2_000_000_000).lap_progress, Some(0.5));
+    let flying = file
+        .metadata()
+        .laps
+        .into_iter()
+        .find(|lap| lap.number == 2 && lap.complete)
+        .expect("flying lap 2");
+    let quarter = flying.start_ns + flying.duration_ns / 4;
+    let half = flying.start_ns + flying.duration_ns / 2;
+    let q = normalizer.sample(quarter).lap_progress.unwrap();
+    let h = normalizer.sample(half).lap_progress.unwrap();
+    assert!((q - 0.25).abs() < 0.03, "quarter={q}");
+    assert!((h - 0.5).abs() < 0.03, "half={h}");
 }
 
 #[test]
@@ -178,10 +187,11 @@ fn jsonl_round_trip_is_time_aligned() {
             .iter()
             .position(|candidate| candidate.name == channel.name)
             .unwrap();
-        assert_eq!(
-            opened.decode(index, 0, 0),
-            source.decode(original, 0, 0),
-            "{}",
+        let left = opened.decode(index, 0, 0);
+        let right = source.decode(original, 0, 0);
+        assert!(
+            (left - right).abs() <= 1e-9 * right.abs().max(1.0),
+            "{} {left} != {right}",
             channel.name
         );
     }
@@ -209,6 +219,37 @@ fn jsonl_round_trip_is_time_aligned() {
             );
         }
     }
+}
+
+#[test]
+fn jsonl_uncompressed_round_trip_keeps_cosworth_lap_summary() {
+    let source = open(fixture("synthetic_cosworth.pds")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("synthetic_cosworth.telemetry.jsonl");
+    write_jsonl_from_source_with(&source, &dest, false).unwrap();
+    let bytes = std::fs::read(&dest).unwrap();
+    assert_eq!(bytes[0], b'{');
+    assert_ne!(&bytes[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+    let opened = open(&dest).unwrap();
+
+    let source_meta = source.metadata();
+    let opened_meta = opened.metadata();
+    assert_eq!(opened_meta.laps.len(), source_meta.laps.len());
+    assert_eq!(
+        opened_meta.laps.iter().filter(|lap| lap.complete).count(),
+        source_meta.laps.iter().filter(|lap| lap.complete).count()
+    );
+    assert_eq!(opened_meta.valid_laps, source_meta.valid_laps);
+    assert_eq!(
+        opened_meta.fastest_lap.as_ref().map(|lap| lap.number),
+        source_meta.fastest_lap.as_ref().map(|lap| lap.number)
+    );
+    assert_eq!(source_meta.laps.len(), 5);
+    assert_eq!(source_meta.valid_laps, 3);
+    assert_eq!(
+        source_meta.fastest_lap.as_ref().map(|lap| lap.number),
+        Some(2)
+    );
 }
 
 #[test]

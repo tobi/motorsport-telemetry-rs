@@ -1,5 +1,7 @@
 /target/
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Real telemetry is private and often large. Only deterministic synthetic
 # fixtures under tests/fixtures are force-added.

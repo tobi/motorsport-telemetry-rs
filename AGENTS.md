@@ -3,10 +3,11 @@
 ## `.telemetry` format version
 
 `FORMAT_VERSION` in `crates/telemetry-format/src/catalog.rs` is the on-disk
-catalog version (`9`: pass provenance + preserved `source_format`/`source_path`
-across rewrites; v8 typed span meta `timespan_ms` as u32le; v7 plot
-class / display scale / rounding; v6 comment labels; v5 spans + visibility;
-v4 `utc_start_ns` + timezone).
+catalog version (`10`: signed `int8` sample encoding, code 0; v9 pass
+provenance + preserved `source_format`/`source_path` across rewrites; v8
+typed span meta `timespan_ms` as u32le; v7 plot class / display scale /
+rounding; v6 comment labels; v5 spans + visibility; v4 `utc_start_ns` +
+timezone).
 Clients compare
 `FileMetadata::format_version` (or `read_format_version`) against it.
 

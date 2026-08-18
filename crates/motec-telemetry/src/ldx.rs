@@ -5,7 +5,7 @@
 
 use crate::write::MotecMetadata;
 use crate::{invalid, MotecError};
-use motorsport_telemetry_core::{LapMetadata, SourceLapMetadata, TelemetrySource};
+use motorsport_telemetry_core::{Diagnostic, LapMetadata, SourceLapMetadata, TelemetrySource};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
@@ -22,6 +22,8 @@ pub struct LdxMetadata {
     pub fastest_lap: Option<i64>,
     /// Fastest lap duration declared in the sidecar.
     pub fastest_lap_time_ns: Option<u64>,
+    /// Recovery diagnostics collected while parsing the sidecar.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl LdxMetadata {
@@ -133,6 +135,9 @@ pub fn parse_motec_ldx_bytes(
     let mut reader = Reader::from_reader(data);
     reader.config_mut().trim_text(true);
     let mut metadata = LdxMetadata::default();
+    let mut dropped_markers = 0u32;
+    let mut unknown_tag_count = 0u32;
+    let mut unknown_tag_names: Vec<String> = Vec::new();
     loop {
         let event = reader
             .read_event()
@@ -158,6 +163,8 @@ pub fn parse_motec_ldx_bytes(
                     metadata
                         .marker_times_ns
                         .push((time_us * 1_000.0).round() as u64);
+                } else {
+                    dropped_markers += 1;
                 }
             }
         } else if name.as_ref() == b"String" {
@@ -182,10 +189,37 @@ pub fn parse_motec_ldx_bytes(
                 }
                 _ => {}
             }
+        } else if !matches!(
+            name.as_ref(),
+            b"LDXFile" | b"Layers" | b"Layer" | b"MarkerBlock" | b"MarkerGroup" | b"Details"
+        ) {
+            unknown_tag_count += 1;
+            let tag = String::from_utf8_lossy(name.as_ref()).to_string();
+            if !unknown_tag_names.contains(&tag) {
+                unknown_tag_names.push(tag);
+            }
         }
     }
     metadata.marker_times_ns.sort_unstable();
     metadata.marker_times_ns.dedup();
+    if dropped_markers > 0 {
+        metadata.diagnostics.push(Diagnostic::warning(
+            "ldx.marker_time_unparsable",
+            format!(
+                "{dropped_markers} lap marker(s) dropped because their Time \
+                 attribute did not parse as a non-negative finite number"
+            ),
+        ));
+    }
+    if unknown_tag_count > 0 {
+        metadata.diagnostics.push(Diagnostic::info(
+            "ldx.unknown_tag",
+            format!(
+                "{unknown_tag_count} unknown XML element(s) skipped: {}",
+                unknown_tag_names.join(", ")
+            ),
+        ));
+    }
     Ok(metadata)
 }
 

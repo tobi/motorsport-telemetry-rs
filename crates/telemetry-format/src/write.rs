@@ -77,9 +77,9 @@ fn write_to(
             unit_canonical,
             unit_source: channel.unit_source,
             dimension,
-            sample_type: if values.is_empty() && channel.sample_count == 0 {
-                channel.sample_type
-            } else if source.chunk_bytes(index, 0).is_some() {
+            sample_type: if (values.is_empty() && channel.sample_count == 0)
+                || source.chunk_bytes(index, 0).is_some()
+            {
                 channel.sample_type
             } else {
                 SampleType::F64
@@ -369,6 +369,10 @@ impl TelemetrySource for StrippedSource<'_> {
         &self.channels
     }
 
+    fn diagnostics(&self) -> &[motorsport_telemetry_core::Diagnostic] {
+        self.inner.diagnostics()
+    }
+
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
         self.inner
             .decode(self.keep[channel_index], chunk_index, local_index)
@@ -448,5 +452,236 @@ impl TelemetrySource for StrippedSource<'_> {
     fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
         self.inner
             .sample_at(self.keep[channel_index], time_ns, linear)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zip::parse_members;
+    use crate::NativeRecording;
+    use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
+
+    /// 50 Hz. Same threshold as [`is_event`].
+    const PERIOD_NS: u64 = 20_000_000;
+    const JITTER_NS: u64 = 2_000_000;
+    const SAMPLE_COUNT: u64 = 4;
+    const VALUES: [f64; 4] = [10.0, 11.0, 12.5, 13.0];
+
+    struct TinySource {
+        channels: Vec<Channel>,
+        values: Vec<Vec<f64>>,
+        times: Vec<Vec<u64>>,
+    }
+
+    impl TelemetrySource for TinySource {
+        fn path(&self) -> &str {
+            "tiny"
+        }
+        fn format(&self) -> &'static str {
+            "pds"
+        }
+        fn channels(&self) -> &[Channel] {
+            &self.channels
+        }
+        fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
+            let base = self.channels[channel_index].chunks[chunk_index].sample_base;
+            self.values[channel_index][(base + local_index) as usize]
+        }
+        fn sample_time_ns(
+            &self,
+            channel_index: usize,
+            chunk_index: usize,
+            local_index: u64,
+        ) -> u64 {
+            let base = self.channels[channel_index].chunks[chunk_index].sample_base;
+            self.times[channel_index][(base + local_index) as usize]
+        }
+    }
+
+    fn hz50_channel(name: &str, id: u32, count: u64) -> Channel {
+        Channel {
+            id,
+            name: name.into(),
+            unit: "km/h".into(),
+            unit_source: UnitSource::Declared,
+            sample_type: SampleType::F64,
+            chunks: vec![Chunk {
+                sample_period_ns: PERIOD_NS,
+                sample_count: count,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: 0,
+            }],
+            sample_count: count,
+            duration_ns: count * PERIOD_NS,
+        }
+    }
+
+    fn empty_channel(name: &str, id: u32) -> Channel {
+        Channel {
+            id,
+            name: name.into(),
+            unit: String::new(),
+            unit_source: UnitSource::Unknown,
+            sample_type: SampleType::F64,
+            chunks: Vec::new(),
+            sample_count: 0,
+            duration_ns: 0,
+        }
+    }
+
+    fn grid_times(count: u64) -> Vec<u64> {
+        (0..count).map(|i| i * PERIOD_NS).collect()
+    }
+
+    /// Alternate `+amp` / `-amp` around the 50 Hz lattice.
+    fn jittered_times(count: u64, amp: u64) -> Vec<u64> {
+        (0..count)
+            .map(|i| {
+                let expected = i * PERIOD_NS;
+                if i % 2 == 0 {
+                    expected + amp
+                } else {
+                    expected - amp
+                }
+            })
+            .collect()
+    }
+
+    fn speed(times: Vec<u64>) -> TinySource {
+        TinySource {
+            channels: vec![hz50_channel("Speed", 1, SAMPLE_COUNT)],
+            values: vec![VALUES.to_vec()],
+            times: vec![times],
+        }
+    }
+
+    fn write_tiny(source: &TinySource) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("run.telemetry");
+        write_from_source(source, &dest).unwrap();
+        (dir, dest)
+    }
+
+    fn zip_names(path: &std::path::Path) -> Vec<String> {
+        parse_members(&std::fs::read(path).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|member| member.name)
+            .collect()
+    }
+
+    fn assert_first_last_decode(source: &TinySource, opened: &NativeRecording, channel: usize) {
+        let last = source.channels[channel].sample_count - 1;
+        assert_eq!(opened.decode(channel, 0, 0), source.decode(channel, 0, 0));
+        assert_eq!(
+            opened.decode(channel, 0, last),
+            source.decode(channel, 0, last)
+        );
+    }
+
+    #[test]
+    fn regular_50hz_writes_kind0_without_time_member() {
+        let source = speed(grid_times(SAMPLE_COUNT));
+        let (_dir, dest) = write_tiny(&source);
+        let header = NativeRecording::read_header(&dest).unwrap();
+        assert_eq!(header.channels.len(), 1);
+        assert_eq!(header.channels[0].kind, 0);
+        assert!(header.channels[0].time_member.is_empty());
+        assert_eq!(header.channels[0].member, "channels/0000.bin");
+        let names = zip_names(&dest);
+        assert!(names.contains(&"channels/0000.bin".into()));
+        assert!(!names.iter().any(|name| name.ends_with(".time.bin")));
+
+        let opened = NativeRecording::open_unchanged(&dest).unwrap();
+        assert_eq!(opened.decode(0, 0, 0), 10.0);
+        assert_eq!(opened.decode(0, 0, 3), 13.0);
+        assert_eq!(opened.sample_time_ns(0, 0, 0), 0);
+        assert_eq!(opened.sample_time_ns(0, 0, 3), 3 * PERIOD_NS);
+    }
+
+    #[test]
+    fn sub_2ms_jitter_still_regular() {
+        let amp = 400_000;
+        assert!(amp < JITTER_NS);
+        let source = speed(jittered_times(SAMPLE_COUNT, amp));
+        let (_dir, dest) = write_tiny(&source);
+        let header = NativeRecording::read_header(&dest).unwrap();
+        assert_eq!(header.channels[0].kind, 0);
+        assert!(header.channels[0].time_member.is_empty());
+        assert!(!zip_names(&dest)
+            .iter()
+            .any(|name| name.ends_with(".time.bin")));
+
+        // Regular write discards per-sample times; readers reconstruct the lattice.
+        let opened = NativeRecording::open_unchanged(&dest).unwrap();
+        assert_first_last_decode(&source, &opened, 0);
+        assert_eq!(opened.sample_time_ns(0, 0, 0), 0);
+        assert_eq!(opened.sample_time_ns(0, 0, 1), PERIOD_NS);
+        assert_ne!(
+            opened.sample_time_ns(0, 0, 0),
+            source.sample_time_ns(0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn over_2ms_jitter_becomes_event_with_time_column() {
+        let amp = 5_000_000;
+        assert!(amp > JITTER_NS);
+        let source = speed(jittered_times(SAMPLE_COUNT, amp));
+        let (_dir, dest) = write_tiny(&source);
+        let header = NativeRecording::read_header(&dest).unwrap();
+        assert_eq!(header.channels[0].kind, 1);
+        assert_eq!(header.channels[0].time_member, "channels/0000.time.bin");
+        let names = zip_names(&dest);
+        assert!(names.contains(&"channels/0000.bin".into()));
+        assert!(names.contains(&"channels/0000.time.bin".into()));
+
+        let opened = NativeRecording::open_unchanged(&dest).unwrap();
+        assert_first_last_decode(&source, &opened, 0);
+        for local in 0..SAMPLE_COUNT {
+            assert_eq!(
+                opened.sample_time_ns(0, 0, local),
+                source.sample_time_ns(0, 0, local)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_sample_channels_have_no_payload_members() {
+        let source = TinySource {
+            channels: vec![
+                empty_channel("Empty", 1),
+                hz50_channel("Speed", 2, SAMPLE_COUNT),
+                empty_channel("AlsoEmpty", 3),
+            ],
+            values: vec![Vec::new(), VALUES.to_vec(), Vec::new()],
+            times: vec![Vec::new(), grid_times(SAMPLE_COUNT), Vec::new()],
+        };
+        let (_dir, dest) = write_tiny(&source);
+        let header = NativeRecording::read_header(&dest).unwrap();
+        assert_eq!(header.channels.len(), 3);
+        assert_eq!(header.channels[0].sample_count, 0);
+        assert_eq!(header.channels[2].sample_count, 0);
+        assert_eq!(header.channels[0].member, "channels/0000.bin");
+        assert_eq!(header.channels[1].member, "channels/0001.bin");
+        assert_eq!(header.channels[2].member, "channels/0002.bin");
+        let names = zip_names(&dest);
+        assert!(!names.contains(&"channels/0000.bin".into()));
+        assert!(names.contains(&"channels/0001.bin".into()));
+        assert!(!names.contains(&"channels/0002.bin".into()));
+        assert!(!names.iter().any(|name| name.ends_with(".time.bin")));
+    }
+
+    #[test]
+    fn open_unchanged_decodes_first_and_last_samples() {
+        let source = speed(grid_times(SAMPLE_COUNT));
+        let (_dir, dest) = write_tiny(&source);
+        let unchanged = NativeRecording::open_unchanged(&dest).unwrap();
+        assert_first_last_decode(&source, &unchanged, 0);
+        let opened = NativeRecording::open(&dest).unwrap();
+        assert_first_last_decode(&source, &opened, 0);
+        assert_eq!(opened.catalog().format_version, crate::FORMAT_VERSION);
     }
 }

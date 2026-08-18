@@ -2,6 +2,8 @@
 """Generate small deterministic fixtures for every supported telemetry format."""
 from __future__ import annotations
 
+import json
+import math
 import struct
 import sys
 from pathlib import Path
@@ -154,25 +156,252 @@ def make_aimd(itow_ms: int = 573_634_560, driver_id: float = 3.0, lap_number: fl
     return ftyp + mdat + moov
 
 
+ATLAS = Path(__file__).resolve().parents[2] / "crates/motorsport-track-atlas/data/tracks.jsonl"
+PDS_HZ = 5
+PDS_TICKS = 2_000_000  # 5 Hz: 2e6 ticks × 100 ns
+EARTH_M = 6_371_000.0
+
+
+def load_road_america() -> tuple[list[tuple[float, float]], float, list[tuple[float, float]]]:
+    """Centerline (lat, lon), length m, and (marker, apex_speed) hints."""
+    track = None
+    for line in ATLAS.read_text().splitlines():
+        if '"slug":"road-america"' in line:
+            track = json.loads(line)
+            break
+    if track is None:
+        raise SystemExit("road-america missing from motorsport-track-atlas/data/tracks.jsonl")
+    layout = track["layouts"][0]
+    coords = layout["centerline_geojson"]["features"][0]["geometry"]["coordinates"]
+    if coords[0] == coords[-1]:
+        coords = coords[:-1]
+    points = [(lat, lon) for lon, lat in coords]
+    # Slowest legal apex speeds for a mid-pack GT/LMP2-ish car (m/s).
+    apex = {
+        0.099: 32.0,  # T1 after the front straight
+        0.1725: 38.0,  # T3
+        0.2775: 55.0,  # Moraine Sweep
+        0.3525: 36.0,  # T5
+        0.4025: 34.0,  # T6
+        0.44: 40.0,  # T7
+        0.4995: 42.0,  # T8
+        0.5725: 40.0,  # Carousel
+        0.66: 62.0,  # Kink
+        0.735: 50.0,  # Kettle Bottoms
+        0.7905: 28.0,  # Canada Corner
+        0.8395: 36.0,  # Bill Mitchell
+        0.8905: 38.0,  # T14 onto the straight
+    }
+    return points, 6514.0, sorted(apex.items())
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * EARTH_M * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def heading_rad(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return math.atan2(y, x)
+
+
+def unwrap(angles: list[float]) -> list[float]:
+    out = [angles[0]]
+    for angle in angles[1:]:
+        prev = out[-1]
+        delta = (angle - prev + math.pi) % (2 * math.pi) - math.pi
+        out.append(prev + delta)
+    return out
+
+
+def road_america_limit() -> tuple[list[float], list[float], list[float], list[float]]:
+    """Progress samples with GPS and a curvature-limited target speed."""
+    points, length_m, apexes = load_road_america()
+    n = len(points)
+    dist = [0.0]
+    heads = []
+    for i in range(n):
+        a, b = points[i], points[(i + 1) % n]
+        dist.append(dist[-1] + haversine_m(a[0], a[1], b[0], b[1]))
+        heads.append(heading_rad(a[0], a[1], b[0], b[1]))
+    total = dist[-1]
+    heads = unwrap(heads + [heads[0]])
+    kappa = []
+    for i in range(n):
+        ds = max(dist[i + 1] - dist[i], 1.0)
+        kappa.append(abs(heads[i + 1] - heads[i]) / ds)
+    # Smooth one-two neighbours so a single jagged vertex is not a hairpin.
+    smooth = []
+    for i in range(n):
+        window = [kappa[(i + j) % n] for j in (-2, -1, 0, 1, 2)]
+        smooth.append(sorted(window)[2])
+    a_lat = 11.5
+    v_max, v_min = 72.0, 20.0
+    limit = []
+    progress = []
+    lats = []
+    lons = []
+    for i in range(n):
+        p = dist[i] / total
+        v = math.sqrt(a_lat / max(smooth[i], 1e-4))
+        for marker, apex_v in apexes:
+            width = 0.018
+            fall = max(0.0, 1.0 - abs(p - marker) / width)
+            if fall > 0:
+                v = min(v, apex_v + (v_max - apex_v) * (1.0 - fall) ** 2)
+        limit.append(max(v_min, min(v_max, v)))
+        progress.append(p)
+        lats.append(points[i][0])
+        lons.append(points[i][1])
+    # Closed loop for wrap-around braking.
+    progress.append(1.0)
+    limit.append(limit[0])
+    lats.append(lats[0])
+    lons.append(lons[0])
+    # Forward / backward speed pass (accel 5.5, brake 11 m/s²).
+    v = limit[:]
+    for i in range(n):
+        ds = (progress[i + 1] - progress[i]) * length_m
+        v[i + 1] = min(v[i + 1], math.sqrt(v[i] ** 2 + 2 * 5.5 * ds))
+    for i in range(n - 1, -1, -1):
+        ds = (progress[i + 1] - progress[i]) * length_m
+        v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2 * 11.0 * ds))
+    return progress, v, lats, lons
+
+
+def interp_loop(progress: list[float], values: list[float], p: float) -> float:
+    p %= 1.0
+    for i in range(len(progress) - 1):
+        if progress[i] <= p <= progress[i + 1]:
+            span = progress[i + 1] - progress[i]
+            t = 0.0 if span <= 0 else (p - progress[i]) / span
+            return values[i] + (values[i + 1] - values[i]) * t
+    return values[0]
+
+
+def simulate_stint() -> dict[str, list[float]]:
+    """Out-lap from pit exit, three flying laps, in-lap to pit entry. 5 Hz."""
+    progress, v_limit, lats, lons = road_america_limit()
+    length_m = 6514.0
+    dt = 1.0 / PDS_HZ
+    # (lap_number, p0, p1, speed_scale, crawl_after)
+    legs = [
+        (1.0, 0.056, 1.0, 0.70, None),  # out, from pit exit
+        (2.0, 0.0, 1.0, 1.00, None),
+        (3.0, 0.0, 1.0, 0.985, None),
+        (4.0, 0.0, 1.0, 0.970, None),
+        (5.0, 0.0, 0.94, 0.82, 0.88),  # in, peel off toward pits
+    ]
+    speed: list[float] = []
+    throttle: list[float] = []
+    brake: list[float] = []
+    g_lat: list[float] = []
+    g_long: list[float] = []
+    distance: list[float] = []
+    laps: list[float] = []
+    driver: list[float] = []
+    latitude: list[float] = []
+    longitude: list[float] = []
+    prev_v = 12.0
+    for lap_number, p0, p1, scale, crawl_after in legs:
+        p = p0
+        lap_s = 0.0
+        while p < p1 - 1e-6:
+            target = interp_loop(progress, v_limit, p) * scale
+            if crawl_after is not None and p >= crawl_after:
+                fade = min(1.0, (p - crawl_after) / 0.04)
+                target = target * (1.0 - fade) + 8.0 * fade
+            # First-order chase of the target so throttle/brake are not binary.
+            if target > prev_v:
+                v = min(target, prev_v + 5.5 * dt)
+            else:
+                v = max(target, prev_v - 11.0 * dt)
+            a_long = (v - prev_v) / dt
+            ds = max(v, 4.0) * dt
+            # Finite-difference heading over a short lookahead for lateral g.
+            h0 = heading_rad(
+                interp_loop(progress, lats, p),
+                interp_loop(progress, lons, p),
+                interp_loop(progress, lats, p + 0.002),
+                interp_loop(progress, lons, p + 0.002),
+            )
+            h1 = heading_rad(
+                interp_loop(progress, lats, p + 0.002),
+                interp_loop(progress, lons, p + 0.002),
+                interp_loop(progress, lats, p + 0.004),
+                interp_loop(progress, lons, p + 0.004),
+            )
+            dpsi = (h1 - h0 + math.pi) % (2 * math.pi) - math.pi
+            kappa = abs(dpsi) / max(haversine_m(
+                interp_loop(progress, lats, p),
+                interp_loop(progress, lons, p),
+                interp_loop(progress, lats, p + 0.002),
+                interp_loop(progress, lons, p + 0.002),
+            ), 1.0)
+            speed.append(round(v, 4))
+            if a_long >= 0.4:
+                throttle.append(round(min(100.0, 25.0 + a_long / 5.5 * 75.0), 2))
+                brake.append(0.0)
+            elif a_long <= -0.8:
+                throttle.append(0.0)
+                brake.append(round(min(100.0, (-a_long) / 11.0 * 100.0), 2))
+            else:
+                throttle.append(18.0 if target < 40 else 55.0)
+                brake.append(0.0)
+            g_lat.append(round(v * v * kappa * (1 if dpsi >= 0 else -1), 4))
+            g_long.append(round(a_long, 4))
+            distance.append(round(lap_s, 3))
+            laps.append(lap_number)
+            driver.append(7.0)
+            latitude.append(round(interp_loop(progress, lats, p), 7))
+            longitude.append(round(interp_loop(progress, lons, p), 7))
+            lap_s += ds
+            p += ds / length_m
+            prev_v = v
+        prev_v = min(prev_v, 35.0)
+    return {
+        "speed": speed,
+        "throttle": throttle,
+        "brake": brake,
+        "g_lat": g_lat,
+        "g_long": g_long,
+        "distance": distance,
+        "laps": laps,
+        "driver": driver,
+        "latitude": latitude,
+        "longitude": longitude,
+    }
+
+
 def make_pds() -> bytes:
+    series = simulate_stint()
+    count = len(series["speed"])
     channels = [
-        (1, "Speed", "m/s", SAMPLES["speed"]),
-        (2, "Throttle Pos", "%", SAMPLES["throttle"]),
-        (3, "Brake Pedal Pos", "%", SAMPLES["brake"]),
-        (4, "G_FORCE_LAT", "m/s^2", SAMPLES["g_lat"]),
-        (5, "G_FORCE_LONG", "m/s^2", SAMPLES["g_long"]),
-        (6, "Lap Distance", "m", SAMPLES["distance"]),
-        (7, "Lap Number", "count", SAMPLES["lap"]),
-        (8, "GPS Latitude", "deg", SAMPLES["latitude"]),
-        (9, "GPS Longitude", "deg", SAMPLES["longitude"]),
+        (1, "Speed", "m/s", series["speed"]),
+        (2, "Throttle Pos", "%", series["throttle"]),
+        (3, "Brake Pedal Pos", "%", series["brake"]),
+        (4, "G_FORCE_LAT", "m/s^2", series["g_lat"]),
+        (5, "G_FORCE_LONG", "m/s^2", series["g_long"]),
+        (6, "Lap Distance", "m", series["distance"]),
+        (7, "Lap Number", "count", series["laps"]),
+        (8, "Driver ID", "count", series["driver"]),
+        (9, "GPS Latitude", "deg", series["latitude"]),
+        (10, "GPS Longitude", "deg", series["longitude"]),
     ]
     definition_width = 0xC0
     defs = 0x200
     chunks = defs + definition_width * len(channels)
     chunk_width = 0x40
-    chunk_count = len(channels) * 2
+    chunk_count = len(channels)
     end = chunks + chunk_width * chunk_count
-    data = bytearray(0x1800)
+    data_start = 0x1000
+    data = bytearray(data_start + 8 * count * len(channels) + 0x40)
     data[0x40:0x80] = b"\xff" * 0x40
 
     def u32(offset: int, value: int) -> None:
@@ -192,24 +421,23 @@ def make_pds() -> bytes:
         data[offset + 8 : offset + 8 + len(name_bytes)] = name_bytes
         data[offset + 0x90 : offset + 0x90 + len(unit_bytes)] = unit_bytes
 
-    def chunk(offset: int, order: int, channel_id: int, pointer: int) -> None:
+    def chunk(offset: int, order: int, channel_id: int, pointer: int, samples: int) -> None:
         u32(offset, order)
         u32(offset + 4, channel_id)
         u32(offset + 8, channel_id)
-        u32(offset + 0x18, 10_000_000)
-        u32(offset + 0x1C, 2)
+        u32(offset + 0x18, PDS_TICKS)
+        u32(offset + 0x1C, samples)
         u32(offset + 0x38, pointer)
 
     directory(0x80, defs, len(channels), 8, 1, chunk_count)
     directory(0xA0, chunks, chunk_count, 1, 3, 0)
     directory(0xC0, end, 0, 1, 1, 0)
+    pointer = data_start
     for index, (channel_id, name, unit, values) in enumerate(channels):
         definition(defs + index * definition_width, channel_id, name, unit)
-        for pair in range(2):
-            chunk_index = index * 2 + pair
-            pointer = 0x1000 + chunk_index * 0x20
-            chunk(chunks + chunk_index * chunk_width, chunk_index + 1, channel_id, pointer)
-            struct.pack_into("<2d", data, pointer, *values[pair * 2 : pair * 2 + 2])
+        chunk(chunks + index * chunk_width, index + 1, channel_id, pointer, count)
+        struct.pack_into(f"<{count}d", data, pointer, *values)
+        pointer += 8 * count
     return bytes(data)
 
 

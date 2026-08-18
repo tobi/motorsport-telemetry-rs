@@ -315,7 +315,8 @@ mod tests {
                 "[]\n",
                 "{\"n\":\"Speed\",\"hz\":1,\"vis\":0,\"v\":[1,2],\"lbl\":[[0,\"brake lock\"]]}\n",
                 "{\"k\":\"s\",\"n\":\"443-1\",\"s\":0,\"e\":1000000000,\"vis\":1,\"c\":\"#e11d48\",",
-                "\"p\":{\"title\":\"#443\",\"sub\":\"EL\"},\"m\":[[\"Laps\",\"18\"]]}\n",
+                "\"p\":{\"title\":\"#443\",\"sub\":\"EL\"},\"m\":[[\"Laps\",\"18\"],",
+                "[\"Best\",{\"v\":110332,\"u\":\"timespan_ms\"}]]}\n",
             )
             .as_bytes(),
         )
@@ -330,10 +331,16 @@ mod tests {
         assert_eq!(opened.spans()[0].primary.title, "#443");
         assert_eq!(
             opened.spans()[0].meta,
-            [(
-                "Laps".into(),
-                motorsport_telemetry_core::SpanMetaValue::Text("18".into())
-            )]
+            [
+                (
+                    "Laps".into(),
+                    motorsport_telemetry_core::SpanMetaValue::Text("18".into())
+                ),
+                (
+                    "Best".into(),
+                    motorsport_telemetry_core::SpanMetaValue::TimeMs(110_332)
+                ),
+            ]
         );
         assert_eq!(opened.decode(0, 0, 0), 1.0);
         assert_eq!(opened.channel_labels(0).len(), 1);
@@ -421,7 +428,302 @@ mod tests {
         assert_eq!(read_format_version(&dest).unwrap(), 1);
 
         let mut permissions = std::fs::metadata(&dest).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
         permissions.set_readonly(false);
         std::fs::set_permissions(&dest, permissions).unwrap();
+    }
+
+    #[test]
+    fn corrupt_catalog_root_offset_returns_invalid_not_panic() {
+        use crate::catalog::{decode, encode, Catalog, CatalogChannel};
+        use motorsport_telemetry_core::{Chunk, SampleType, UnitSource};
+        let catalog = Catalog {
+            format_version: FORMAT_VERSION,
+            identity: Default::default(),
+            laps: Vec::new(),
+            valid_laps: 0,
+            channels: vec![CatalogChannel {
+                id: 1,
+                name: "Speed".into(),
+                member: "channels/0000.bin".into(),
+                time_member: String::new(),
+                unit_raw: "km/h".into(),
+                unit_canonical: "km/h".into(),
+                unit_source: UnitSource::Declared,
+                dimension: 2,
+                sample_type: SampleType::F32,
+                scale: 1.0,
+                bias: 0.0,
+                uses_step: false,
+                sample_count: 0,
+                duration_ns: 0,
+                kind: 0,
+                visible: true,
+                labels: Vec::new(),
+                display: motorsport_telemetry_core::ChannelDisplay::trace(),
+                chunks: vec![Chunk {
+                    sample_period_ns: 1_000_000,
+                    sample_count: 0,
+                    data_ptr: 0,
+                    sample_base: 0,
+                    time_base_ns: 0,
+                }],
+            }],
+            source_format: "pds".into(),
+            source_path: "x.pds".into(),
+            schema_hash: 1,
+            duration_ns: 0,
+            sample_count: 0,
+            channel_count: 1,
+            sampled_channel_count: 1,
+            session_hint: String::new(),
+            comment: String::new(),
+            clock: None,
+            utc_start_ns: Some(1_700_000_000_000_000_000),
+            timezone: "America/Chicago".into(),
+            driver_stints: Vec::new(),
+            videos: Vec::new(),
+            presentation_offset_ns: None,
+            spans: Vec::new(),
+            passes: Vec::new(),
+        };
+        let mut bytes = encode(&catalog).unwrap();
+        // Overwrite the root table offset (first 4 bytes, u32 LE) to point
+        // past the buffer. This must return Invalid, not panic.
+        let past_end = (bytes.len() + 1000) as u32;
+        bytes[0..4].copy_from_slice(&past_end.to_le_bytes());
+        let result = decode(&bytes);
+        assert!(result.is_err(), "expected Invalid, got Ok");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("out of range") || msg.contains("overflow"),
+            "expected out-of-range error, got: {msg}"
+        );
+
+        // Also test a vtable offset that points past the buffer: corrupt the
+        // root offset to point near the end so root+4 is valid but the
+        // vtable read lands out of bounds.
+        let mut bytes2 = encode(&catalog).unwrap();
+        let near_end = (bytes2.len() - 2) as u32;
+        bytes2[0..4].copy_from_slice(&near_end.to_le_bytes());
+        // This should NOT panic — slot() returns None for out-of-bounds vtable.
+        let _ = decode(&bytes2);
+    }
+
+    #[test]
+    fn zip_header_declaring_member_larger_than_file_returns_invalid() {
+        use crate::zip::{read_first_member, ZipWriter};
+        use std::io::{Cursor, Seek};
+        // Build a valid zip local header for "metadata.fb" with a declared
+        // size far larger than the actual file.
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(&mut cursor);
+        writer.write_member("metadata.fb", b"hello").unwrap();
+        writer.finish().unwrap();
+        let mut bytes = cursor.into_inner();
+        // Overwrite the compressed/uncompressed size fields (bytes 22..26
+        // and 26..30 in the local header are size and... actually 22..26 is
+        // the uncompressed size, 26..28 is name length, 28..30 is extra len).
+        // The local header starts at byte 0. Set the declared size to 1 GiB.
+        let declared: u32 = 0x4000_0000;
+        bytes[22..26].copy_from_slice(&declared.to_le_bytes());
+        let mut reader = Cursor::new(&bytes[..]);
+        let result = read_first_member(&mut reader);
+        assert!(result.is_err(), "expected Invalid, got Ok");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds remaining file bytes"),
+            "expected size exceeds remaining, got: {msg}"
+        );
+        // Verify we did NOT allocate the declared buffer: the reader position
+        // should still be just past the header (no 1 GiB read attempted).
+        let pos = reader.stream_position().unwrap();
+        assert!(
+            pos < 200,
+            "reader advanced to {pos}, suggesting a huge allocation was attempted"
+        );
+    }
+
+    #[test]
+    fn missing_video_frames_bin_reports_diagnostic() {
+        use crate::catalog::{encode, Catalog, CatalogChannel};
+        use motorsport_telemetry_core::{
+            Chunk, SampleType, TelemetrySource, UnitSource, VideoFileRef,
+        };
+        // Build a .telemetry with a video handle in the catalog but no
+        // video_frames.bin member in the archive.
+        let catalog = Catalog {
+            format_version: FORMAT_VERSION,
+            identity: Default::default(),
+            laps: Vec::new(),
+            valid_laps: 0,
+            channels: vec![CatalogChannel {
+                id: 1,
+                name: "Speed".into(),
+                member: "channels/0000.bin".into(),
+                time_member: String::new(),
+                unit_raw: "km/h".into(),
+                unit_canonical: "km/h".into(),
+                unit_source: UnitSource::Declared,
+                dimension: 2,
+                sample_type: SampleType::F32,
+                scale: 1.0,
+                bias: 0.0,
+                uses_step: false,
+                sample_count: 4,
+                duration_ns: 4_000_000,
+                kind: 0,
+                visible: true,
+                labels: Vec::new(),
+                display: motorsport_telemetry_core::ChannelDisplay::trace(),
+                chunks: vec![Chunk {
+                    sample_period_ns: 1_000_000,
+                    sample_count: 4,
+                    data_ptr: 0,
+                    sample_base: 0,
+                    time_base_ns: 0,
+                }],
+            }],
+            source_format: "pds".into(),
+            source_path: "x.pds".into(),
+            schema_hash: 1,
+            duration_ns: 4_000_000,
+            sample_count: 4,
+            channel_count: 1,
+            sampled_channel_count: 1,
+            session_hint: String::new(),
+            comment: String::new(),
+            clock: None,
+            utc_start_ns: Some(1_700_000_000_000_000_000),
+            timezone: "America/Chicago".into(),
+            driver_stints: Vec::new(),
+            videos: vec![VideoFileRef {
+                filename: "video.mp4".into(),
+                index: 0,
+                blake3: None,
+                frame_count: 0,
+                presentation_offset_ns: None,
+            }],
+            presentation_offset_ns: Some(0),
+            spans: Vec::new(),
+            passes: Vec::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("novideo.telemetry");
+        // Write using the public writer, which creates a valid .telemetry zip.
+        // We need a TelemetrySource to write from. Use from_bytes with a
+        // manually constructed archive.
+        let catalog_bytes = encode(&catalog).unwrap();
+        // Build a zip manually using the crate's ZipWriter.
+        use crate::zip::ZipWriter as InnerZipWriter;
+        let file = std::fs::File::create(&dest).unwrap();
+        let mut zip = InnerZipWriter::new(std::io::BufWriter::new(file));
+        zip.write_member("metadata.fb", &catalog_bytes).unwrap();
+        zip.finish().unwrap();
+
+        let opened = NativeRecording::open(&dest).unwrap();
+        let diags = opened.diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == "telemetry.video_frames_unusable"),
+            "expected video_frames_unusable diagnostic, got: {:?}",
+            diags.iter().map(|d| d.code).collect::<Vec<_>>()
+        );
+        assert!(
+            diags.iter().any(|d| d.code == "telemetry.member_missing"),
+            "expected member_missing diagnostic, got: {:?}",
+            diags.iter().map(|d| d.code).collect::<Vec<_>>()
+        );
+        assert!(opened.channels()[0].chunks.is_empty());
+        assert_eq!(opened.channels()[0].sample_count, 0);
+    }
+
+    #[test]
+    fn i8_channel_round_trips_sign_extended() {
+        use crate::catalog::{encode, Catalog, CatalogChannel};
+        use motorsport_telemetry_core::{Chunk, SampleType, TelemetrySource, UnitSource};
+        // I8 channel with bytes [-128, -73, 0, 127] → sign-extended f64.
+        let raw: [i8; 4] = [-128, -73, 0, 127];
+        let raw_bytes: [u8; 4] = raw.map(|v| v as u8);
+        let catalog = Catalog {
+            format_version: FORMAT_VERSION,
+            identity: Default::default(),
+            laps: Vec::new(),
+            valid_laps: 0,
+            channels: vec![CatalogChannel {
+                id: 1,
+                name: "TPMS_RSSI".into(),
+                member: "channels/0000.bin".into(),
+                time_member: String::new(),
+                unit_raw: "dBm".into(),
+                unit_canonical: "dBm".into(),
+                unit_source: UnitSource::Declared,
+                dimension: 0,
+                sample_type: SampleType::I8,
+                scale: 1.0,
+                bias: 0.0,
+                uses_step: false,
+                sample_count: 4,
+                duration_ns: 4_000_000,
+                kind: 0,
+                visible: true,
+                labels: Vec::new(),
+                display: motorsport_telemetry_core::ChannelDisplay::trace(),
+                chunks: vec![Chunk {
+                    sample_period_ns: 1_000_000,
+                    sample_count: 4,
+                    data_ptr: 0,
+                    sample_base: 0,
+                    time_base_ns: 0,
+                }],
+            }],
+            source_format: "pds".into(),
+            source_path: "x.pds".into(),
+            schema_hash: 1,
+            duration_ns: 4_000_000,
+            sample_count: 4,
+            channel_count: 1,
+            sampled_channel_count: 1,
+            session_hint: String::new(),
+            comment: String::new(),
+            clock: None,
+            utc_start_ns: Some(1_700_000_000_000_000_000),
+            timezone: "America/Chicago".into(),
+            driver_stints: Vec::new(),
+            videos: Vec::new(),
+            presentation_offset_ns: None,
+            spans: Vec::new(),
+            passes: Vec::new(),
+        };
+        let catalog_bytes = encode(&catalog).unwrap();
+        // Verify the packed channel uses sample_type code 0.
+        // The channel vector starts after the count u32. The sample_type byte
+        // is at offset: 4 (count) + 4 (id) + 4+0 (name len+data) + 4+0 (member)
+        // + 4+0 (time_member) + 4+4 (unit_raw) + 4+4 (unit_canonical) + 5 bytes
+        // (unit_source, dimension, sample_type, uses_step, kind) → sample_type
+        // is the 3rd byte of the 5-byte block.
+        // Instead of fragile offset math, just verify via round-trip decode.
+        use crate::zip::ZipWriter as InnerZipWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("i8.telemetry");
+        let file = std::fs::File::create(&dest).unwrap();
+        let mut zip = InnerZipWriter::new(std::io::BufWriter::new(file));
+        zip.write_member("metadata.fb", &catalog_bytes).unwrap();
+        zip.write_member("channels/0000.bin", &raw_bytes).unwrap();
+        zip.finish().unwrap();
+
+        let opened = NativeRecording::open(&dest).unwrap();
+        assert_eq!(opened.channels().len(), 1);
+        assert_eq!(opened.channels()[0].sample_type, SampleType::I8);
+        assert_eq!(opened.decode(0, 0, 0), -128.0);
+        assert_eq!(opened.decode(0, 0, 1), -73.0);
+        assert_eq!(opened.decode(0, 0, 2), 0.0);
+        assert_eq!(opened.decode(0, 0, 3), 127.0);
     }
 }

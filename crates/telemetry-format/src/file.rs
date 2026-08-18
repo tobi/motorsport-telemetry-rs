@@ -5,7 +5,7 @@ use crate::write::TelemetryFormatError;
 use crate::zip::{parse_members, read_first_member, ZipWriter};
 use memmap2::Mmap;
 use motorsport_telemetry_core::{
-    AppliedPass, Channel, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata,
+    AppliedPass, Channel, Diagnostic, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata,
     SourceOrigin, Span, TelemetrySource, VideoFileRef,
 };
 use std::fs::{self, File, OpenOptions};
@@ -22,6 +22,7 @@ pub struct NativeRecording {
     affines: Vec<(f64, f64)>,
     times: Vec<Option<(usize, usize)>>,
     video_times: Option<(usize, usize)>,
+    diagnostics: Vec<Diagnostic>,
     data: Storage,
 }
 
@@ -199,26 +200,120 @@ impl NativeRecording {
             .iter()
             .map(|member| (member.name.as_str(), member))
             .collect::<std::collections::HashMap<_, _>>();
+        let mut diagnostics = Vec::new();
         let mut channels = Vec::with_capacity(catalog.channels.len());
         let mut affines = Vec::with_capacity(catalog.channels.len());
         let mut times = Vec::with_capacity(catalog.channels.len());
         for channel in &catalog.channels {
             let member = by_name.get(channel.member.as_str()).copied();
             let mut chunks = channel.chunks.clone();
+            let mut sample_count = channel.sample_count;
+            let mut duration_ns = channel.duration_ns;
             if let Some(member) = member {
-                let mut cursor = member.offset;
                 let width = channel.sample_type.byte_width() as u64;
-                for chunk in &mut chunks {
-                    chunk.data_ptr = cursor;
-                    cursor = cursor.saturating_add(chunk.sample_count.saturating_mul(width));
+                let required = chunks
+                    .iter()
+                    .map(|chunk| chunk.sample_count.saturating_mul(width))
+                    .fold(0u64, u64::saturating_add);
+                let mut cursor = member.offset;
+                if required <= member.size {
+                    for chunk in &mut chunks {
+                        chunk.data_ptr = cursor;
+                        cursor = cursor.saturating_add(chunk.sample_count.saturating_mul(width));
+                    }
+                } else {
+                    let declared_chunks = chunks.len();
+                    let mut remaining = member.size;
+                    let mut actual_count = 0u64;
+                    let mut actual_duration = 0u64;
+                    let mut available = Vec::with_capacity(chunks.len());
+                    for mut chunk in chunks {
+                        let count = chunk.sample_count.min(remaining / width);
+                        if count == 0 {
+                            break;
+                        }
+                        chunk.data_ptr = cursor;
+                        chunk.sample_base = actual_count;
+                        chunk.sample_count = count;
+                        cursor = cursor.saturating_add(count.saturating_mul(width));
+                        remaining = remaining.saturating_sub(count.saturating_mul(width));
+                        actual_count = actual_count.saturating_add(count);
+                        actual_duration = actual_duration.max(
+                            chunk
+                                .time_base_ns
+                                .saturating_add(count.saturating_mul(chunk.sample_period_ns)),
+                        );
+                        available.push(chunk);
+                    }
+                    chunks = available;
+                    sample_count = actual_count;
+                    duration_ns = actual_duration;
+                    diagnostics.push(
+                        Diagnostic::warning(
+                            "telemetry.member_truncated",
+                            format!(
+                                "channel \"{}\" needs {required} bytes across {declared_chunks} \
+                                 chunks, but member \"{}\" holds {}; retained {} complete samples",
+                                channel.name, channel.member, member.size, actual_count,
+                            ),
+                        )
+                        .with_channel(&channel.name),
+                    );
+                }
+            } else if !channel.member.is_empty() {
+                // Never leave stale pointers decodeable: offset zero is the zip
+                // header, not channel data. Keep the channel metadata but make
+                // the unavailable payload explicitly empty.
+                let dropped = chunks.len();
+                chunks.clear();
+                sample_count = 0;
+                duration_ns = 0;
+                diagnostics.push(
+                    Diagnostic::warning(
+                        "telemetry.member_missing",
+                        format!(
+                            "channel \"{}\" references member \"{}\" which is absent from the \
+                             archive; {dropped} chunks were dropped",
+                            channel.name, channel.member,
+                        ),
+                    )
+                    .with_channel(&channel.name),
+                );
+            }
+            let mut time_member = by_name
+                .get(channel.time_member.as_str())
+                .copied()
+                .map(|member| (member.offset as usize, member.size as usize));
+            if time_member.is_none() && !channel.time_member.is_empty() {
+                diagnostics.push(
+                    Diagnostic::warning(
+                        "telemetry.member_missing",
+                        format!(
+                            "channel \"{}\" references timestamp member \"{}\" which is absent \
+                             from the archive; irregular timestamps were dropped",
+                            channel.name, channel.time_member,
+                        ),
+                    )
+                    .with_channel(&channel.name),
+                );
+            } else if let Some((_, size)) = time_member {
+                let required = sample_count.saturating_mul(8);
+                if (size as u64) < required {
+                    diagnostics.push(
+                        Diagnostic::warning(
+                            "telemetry.member_truncated",
+                            format!(
+                                "channel \"{}\" needs {required} timestamp bytes, but member \
+                                 \"{}\" holds {size}; irregular timestamps were dropped",
+                                channel.name, channel.time_member,
+                            ),
+                        )
+                        .with_channel(&channel.name),
+                    );
+                    time_member = None;
                 }
             }
-            times.push(
-                by_name
-                    .get(channel.time_member.as_str())
-                    .copied()
-                    .map(|member| (member.offset as usize, member.size as usize)),
-            );
+            times.push(time_member);
             channels.push(Channel {
                 id: channel.id,
                 name: channel.name.clone(),
@@ -226,21 +321,38 @@ impl NativeRecording {
                 unit_source: channel.unit_source,
                 sample_type: channel.sample_type,
                 chunks,
-                sample_count: channel.sample_count,
-                duration_ns: channel.duration_ns,
+                sample_count,
+                duration_ns,
             });
             affines.push((channel.scale, channel.bias));
         }
-        let video_times = by_name
+        let mut video_times = by_name
             .get("video_frames.bin")
             .map(|member| (member.offset as usize, member.size as usize));
         // `catalog.source_path` keeps the original vendor path from disk; the
         // opened file's own path lives in `self.path`.
         let mut catalog = catalog;
         if let Some((_, size)) = video_times {
-            if let Some(video) = catalog.videos.first_mut() {
+            if size % 8 != 0 {
+                diagnostics.push(Diagnostic::warning(
+                    "telemetry.video_frames_unusable",
+                    format!(
+                        "video_frames.bin is {size} bytes, not a multiple of 8; \
+                         video frame linkage dropped",
+                    ),
+                ));
+                video_times = None;
+            } else if let Some(video) = catalog.videos.first_mut() {
                 video.frame_count = (size / 8) as u64;
             }
+        } else if !catalog.videos.is_empty() {
+            diagnostics.push(Diagnostic::warning(
+                "telemetry.video_frames_unusable",
+                format!(
+                    "video_frames.bin is absent; {} video handle(s) have no frame linkage",
+                    catalog.videos.len(),
+                ),
+            ));
         }
         if let Some(offset) = catalog.presentation_offset_ns {
             for video in &mut catalog.videos {
@@ -248,6 +360,26 @@ impl NativeRecording {
                     video.presentation_offset_ns = Some(offset);
                 }
             }
+        }
+        // v4+ requires utc_start_ns and timezone. If they are missing the
+        // catalog decoder silently defaulted them; report that.
+        if catalog.format_version >= 4 && catalog.utc_start_ns.is_none() {
+            diagnostics.push(Diagnostic::warning(
+                "telemetry.catalog_field_defaulted",
+                format!(
+                    "utc_start_ns is required by catalog v{} but is absent; defaulted to None",
+                    catalog.format_version
+                ),
+            ));
+        }
+        if catalog.format_version >= 4 && catalog.timezone.is_empty() {
+            diagnostics.push(Diagnostic::warning(
+                "telemetry.catalog_field_defaulted",
+                format!(
+                    "timezone is required by catalog v{} but is empty; defaulted to \"\"",
+                    catalog.format_version
+                ),
+            ));
         }
         let channel_visible = catalog.channels.iter().map(|ch| ch.visible).collect();
         Ok(Self {
@@ -258,6 +390,7 @@ impl NativeRecording {
             affines,
             times,
             video_times,
+            diagnostics,
             data,
         })
     }
@@ -289,12 +422,17 @@ impl TelemetrySource for NativeRecording {
         &self.channels
     }
 
+    fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
         let channel = &self.channels[channel_index];
         let chunk = &channel.chunks[chunk_index];
         let width = channel.sample_type.byte_width();
         let offset = chunk.data_ptr as usize + local_index as usize * width;
         let raw = match channel.sample_type {
+            SampleType::I8 => self.data[offset] as i8 as f64,
             SampleType::U8 => self.data[offset] as f64,
             SampleType::I16 => {
                 i16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as f64
@@ -342,14 +480,17 @@ impl TelemetrySource for NativeRecording {
             }
         }
         let chunk = &self.channels[channel_index].chunks[chunk_index];
-        chunk.time_base_ns + local_index * chunk.sample_period_ns
+        chunk
+            .time_base_ns
+            .saturating_add(local_index.saturating_mul(chunk.sample_period_ns))
     }
 
     fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
         let Some((start, size)) = self.times.get(channel_index).copied().flatten() else {
             return default_dense_sample_at(self, channel_index, time_ns, linear);
         };
-        let count = size / 8;
+        let count =
+            (size / 8).min(usize::try_from(self.channels.get(channel_index)?.sample_count).ok()?);
         if count == 0 {
             return None;
         }
@@ -522,8 +663,12 @@ fn default_dense_sample_at(
     if interval == 0 {
         return Some(a);
     }
-    let fraction =
-        time_ns.saturating_sub(chunk.time_base_ns + sample * interval) as f64 / interval as f64;
+    let fraction = time_ns.saturating_sub(
+        chunk
+            .time_base_ns
+            .saturating_add(sample.saturating_mul(interval)),
+    ) as f64
+        / interval as f64;
     Some(a + (source.decode(channel_index, chunk_index, sample + 1) - a) * fraction)
 }
 

@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.84"
 license = "MIT"
@@ -21,15 +21,15 @@ repository = "https://github.com/tobi/motorsport-telemetry-rs"
 homepage = "https://github.com/tobi/motorsport-telemetry-rs"
 
 [workspace.dependencies]
-motorsport-telemetry = { version = "0.1.0", path = "crates/motorsport-telemetry" }
-motorsport-telemetry-core = { version = "0.1.0", path = "crates/telemetry-core" }
-motorsport-track-atlas = { version = "0.1.0", path = "crates/motorsport-track-atlas" }
-aim-telemetry = { version = "0.1.0", path = "crates/aim-telemetry" }
-cosworth-telemetry = { version = "0.1.0", path = "crates/cosworth-telemetry" }
-motec-telemetry = { version = "0.1.0", path = "crates/motec-telemetry" }
-racelogic-telemetry = { version = "0.1.0", path = "crates/racelogic-telemetry" }
-telemetry-format = { version = "0.1.0", path = "crates/telemetry-format" }
-telemetry-passes = { version = "0.1.0", path = "crates/telemetry-passes" }
+motorsport-telemetry = { version = "1.0.0", path = "crates/motorsport-telemetry" }
+motorsport-telemetry-core = { version = "1.0.0", path = "crates/telemetry-core" }
+motorsport-track-atlas = { version = "1.0.0", path = "crates/motorsport-track-atlas" }
+aim-telemetry = { version = "1.0.0", path = "crates/aim-telemetry" }
+cosworth-telemetry = { version = "1.0.0", path = "crates/cosworth-telemetry" }
+motec-telemetry = { version = "1.0.0", path = "crates/motec-telemetry" }
+racelogic-telemetry = { version = "1.0.0", path = "crates/racelogic-telemetry" }
+telemetry-format = { version = "1.0.0", path = "crates/telemetry-format" }
+telemetry-passes = { version = "1.0.0", path = "crates/telemetry-passes" }
 memmap2 = "0.9"
 flatbuffers = "25.2.10"
 quick-xml = "0.37"

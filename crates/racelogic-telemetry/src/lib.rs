@@ -3,7 +3,7 @@
 
 use memmap2::Mmap;
 use motorsport_telemetry_core::{
-    Channel, Chunk, SampleType, TelemetrySource, UnitSource, VideoFileRef,
+    Channel, Chunk, Diagnostic, SampleType, TelemetrySource, UnitSource, VideoFileRef,
 };
 use std::fs::File;
 use std::path::Path;
@@ -107,6 +107,8 @@ pub struct RacelogicFile {
     pub videos: Vec<VideoFileRef>,
     values: Vec<Vec<f64>>,
     absolute_start_ns: u64,
+    /// Recovery diagnostics collected during parse.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 fn invalid(path: &str, message: impl Into<String>) -> RacelogicError {
@@ -277,10 +279,12 @@ impl RacelogicFile {
             }
         };
         let parsed = sections(text);
+        let mut diagnostics = Vec::new();
         if parsed.data.is_empty() {
             return Err(invalid(&display, "missing or empty [data] section"));
         }
-        let short_names: Vec<&str> = if parsed.column_names.is_empty() {
+        let column_names_missing = parsed.column_names.is_empty();
+        let short_names: Vec<&str> = if column_names_missing {
             parsed
                 .header
                 .iter()
@@ -315,8 +319,11 @@ impl RacelogicFile {
             })
             .collect::<Vec<Vec<f64>>>();
         let mut rows = 0usize;
+        let mut unparsable_counts = vec![0u32; count];
+        let mut skipped_rows = 0u32;
         for line in &parsed.data {
             if line.split_whitespace().nth(1).is_none() {
+                skipped_rows += 1;
                 continue;
             }
             rows += 1;
@@ -326,16 +333,45 @@ impl RacelogicFile {
                     tokens.next();
                     continue;
                 }
-                output.push(
-                    tokens
-                        .next()
-                        .and_then(|token| token.parse().ok())
-                        .unwrap_or(f64::NAN),
-                );
+                let token = tokens.next();
+                match token.and_then(|t| t.parse::<f64>().ok()) {
+                    Some(value) => output.push(value),
+                    None => {
+                        output.push(f64::NAN);
+                        unparsable_counts[column] += 1;
+                    }
+                }
             }
         }
         if rows == 0 {
             return Err(invalid(&display, "no valid data rows"));
+        }
+        if column_names_missing {
+            diagnostics.push(Diagnostic::warning(
+                "vbo.column_names_missing",
+                "no [column names] section; channel names fell back to [header] \
+                 or builtin defaults",
+            ));
+        }
+        for (column, &count) in unparsable_counts.iter().enumerate() {
+            if count > 0 {
+                diagnostics.push(
+                    Diagnostic::warning(
+                        "vbo.value_unparsable",
+                        format!("{count} numeric token(s) failed to parse and became NaN"),
+                    )
+                    .with_channel(short_names[column]),
+                );
+            }
+        }
+        if skipped_rows > 0 {
+            diagnostics.push(Diagnostic::warning(
+                "vbo.row_too_few_tokens",
+                format!(
+                    "{skipped_rows} data row(s) skipped for having fewer than two \
+                     whitespace-delimited tokens"
+                ),
+            ));
         }
         let time_column = short_names
             .iter()
@@ -343,26 +379,46 @@ impl RacelogicFile {
             .ok_or_else(|| invalid(&display, "no time column"))?;
         let first = time_seconds(values[time_column][0]);
         let mut time_ns = Vec::with_capacity(rows);
+        let mut rollover_corrections = 0u32;
         for value in &mut values[time_column] {
             let mut seconds = time_seconds(*value);
             if seconds < first - 43200.0 {
                 seconds += 86400.0;
+                rollover_corrections += 1;
             }
             *value = seconds - first;
             time_ns.push((*value * 1e9).round().max(0.0) as u64);
         }
-        let sample_period = short_names
+        if rollover_corrections > 0 {
+            diagnostics.push(Diagnostic::info(
+                "vbo.time_rollover_corrected",
+                format!(
+                    "{rollover_corrections} time value(s) wrapped past midnight; \
+                     +86400 s correction applied"
+                ),
+            ));
+        }
+        let tsample_period = short_names
             .iter()
             .position(|name| name.eq_ignore_ascii_case("tsample"))
             .and_then(|index| values[index].iter().copied().find(|value| *value > 0.0))
-            .map(|seconds| (seconds * 1e9).round() as u64)
-            .or_else(|| {
-                time_ns
-                    .windows(2)
-                    .map(|pair| pair[1].saturating_sub(pair[0]))
-                    .find(|delta| *delta > 0)
-            })
-            .unwrap_or(100_000_000);
+            .map(|seconds| (seconds * 1e9).round() as u64);
+        let delta_period = time_ns
+            .windows(2)
+            .map(|pair| pair[1].saturating_sub(pair[0]))
+            .find(|delta| *delta > 0);
+        let sample_period = match (tsample_period, delta_period) {
+            (Some(period), _) => period,
+            (None, Some(period)) => period,
+            (None, None) => {
+                diagnostics.push(Diagnostic::warning(
+                    "vbo.sample_period_defaulted",
+                    "no tsample column and no positive time delta found; sample \
+                     period defaulted to 100 ms",
+                ));
+                100_000_000
+            }
+        };
         let duration = time_ns
             .last()
             .copied()
@@ -427,6 +483,7 @@ impl RacelogicFile {
             videos,
             values,
             absolute_start_ns: (first * 1e9).round().max(0.0) as u64,
+            diagnostics,
         })
     }
 }
@@ -542,6 +599,10 @@ impl TelemetrySource for RacelogicFile {
         }
         let fraction = time_ns.saturating_sub(self.time_ns[lower]) as f64 / interval as f64;
         Some(a + (self.values[channel_index][upper] - a) * fraction)
+    }
+
+    fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
     }
 }
 
@@ -662,5 +723,73 @@ mod tests {
             RacelogicFile::open(no_time.path()),
             Err(RacelogicError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn clean_vbo_reports_no_diagnostics() {
+        let file = RacelogicFile::from_bytes(
+            "fixture.vbo",
+            b"[column names]\ntime velocity\n[data]\n120000.0 10\n120000.5 20\n".to_vec(),
+        )
+        .unwrap();
+        assert!(
+            file.diagnostics().is_empty(),
+            "unexpected diagnostics: {:?}",
+            file.diagnostics()
+        );
+    }
+
+    #[test]
+    fn warns_on_unparsable_numeric_token() {
+        let file = RacelogicFile::from_bytes(
+            "fixture.vbo",
+            b"[column names]\ntime velocity\n[data]\n120000.0 abc\n120000.5 20\n".to_vec(),
+        )
+        .unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "vbo.value_unparsable" && d.channel.as_deref() == Some("velocity")));
+    }
+
+    #[test]
+    fn warns_on_sample_period_defaulted() {
+        // Both rows share the same timestamp so no positive delta exists and
+        // there is no tsample column — the 100 ms default must be flagged.
+        let file = RacelogicFile::from_bytes(
+            "fixture.vbo",
+            b"[column names]\ntime velocity\n[data]\n120000.0 10\n120000.0 20\n".to_vec(),
+        )
+        .unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "vbo.sample_period_defaulted"));
+    }
+
+    #[test]
+    fn warns_on_missing_column_names() {
+        let file = RacelogicFile::from_bytes(
+            "fixture.vbo",
+            b"[header]\ntime\nvelocity\n[data]\n120000.0 10\n120000.5 20\n".to_vec(),
+        )
+        .unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "vbo.column_names_missing"));
+    }
+
+    #[test]
+    fn info_on_midnight_rollover_correction() {
+        let file = RacelogicFile::from_bytes(
+            "fixture.vbo",
+            b"[column names]\ntime Gear\n[data]\n235959.5 3\n000000.0 4\n000000.5 4\n".to_vec(),
+        )
+        .unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "vbo.time_rollover_corrected"));
     }
 }

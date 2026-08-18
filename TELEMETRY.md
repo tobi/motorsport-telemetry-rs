@@ -215,7 +215,7 @@ Field index `N` is FlatBuffers vtable slot `V(N) = 4 + 2N`.
 
 | N | Type | Content |
 |---|---|---|
-| 0 | u16 | `FORMAT_VERSION` (current **9**) |
+| 0 | u16 | `FORMAT_VERSION` (current **10**) |
 | 1 | table | Identity: V(0..6) driver, vehicle, venue, event, session, date, time |
 | 3 | `[u8]` | Packed laps |
 | 4 | `[u8]` | Packed channel metadata |
@@ -255,7 +255,7 @@ time_member, unit_raw, unit_canonical, `u8 unit_source`, `u8 dimension`,
 `u64 period`, `u64 count`, `u64 sample_base`, `u64 time_base_ns`.
 
 `kind` 0 = regular column, 1 = event (has `.time.bin`). `unit_source` 0
-unknown, 1 declared, 2 spec default. `sample_type` 1 u8, 2 i16, 3 u16,
+`unknown, 1 declared, 2 spec default. `sample_type` 0 i8, 1 u8, 2 i16, 3 u16,
 4 i32, 5 u32, 6 f32, 7 f64.
 
 **Stints (V(16))** — `u32 count`, then `i64 driver_id`, `u64 start`,

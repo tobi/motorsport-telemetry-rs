@@ -43,19 +43,16 @@ fn main() {
             println!("row {t_idx} t={t} avifile={idx} avitime={syn} ref={refer:?}");
         }
     }
-    let sample = {
-        // use facade? just print channel names for core
-        for want in [
-            "Throttle Pedal",
-            "Steering Angle",
-            "Vehicle Speed",
-            "Gear",
-            "Lap Number",
-            "DriverID",
-        ] {
-            let hit = file.channels().iter().any(|c| c.name == want);
-            println!("channel {want}: {hit}");
-        }
-    };
-    let _ = sample;
+    // use facade? just print channel names for core
+    for want in [
+        "Throttle Pedal",
+        "Steering Angle",
+        "Vehicle Speed",
+        "Gear",
+        "Lap Number",
+        "DriverID",
+    ] {
+        let hit = file.channels().iter().any(|c| c.name == want);
+        println!("channel {want}: {hit}");
+    }
 }

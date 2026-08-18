@@ -69,3 +69,30 @@ impl ChannelDisplay {
             && self.format.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plot_tokens_are_explicit() {
+        assert_eq!(ChannelPlot::parse("trace"), Some(ChannelPlot::Trace));
+        assert_eq!(ChannelPlot::parse("g"), Some(ChannelPlot::Gauge));
+        assert_eq!(ChannelPlot::parse("compass"), Some(ChannelPlot::Compass));
+        assert_eq!(ChannelPlot::parse(""), None);
+        assert_eq!(ChannelPlot::parse("speed"), None);
+        assert!(ChannelPlot::Trace.is_trace());
+        assert!(!ChannelPlot::Gauge.is_trace());
+        assert_eq!(ChannelPlot::Compass.as_str(), "compass");
+    }
+
+    #[test]
+    fn default_display_is_omitted_from_jsonl() {
+        assert!(ChannelDisplay::trace().is_default());
+        assert!(!ChannelDisplay {
+            format: "0.0°C".into(),
+            ..ChannelDisplay::trace()
+        }
+        .is_default());
+    }
+}

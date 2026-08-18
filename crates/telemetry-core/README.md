@@ -21,6 +21,36 @@ Native `open(path)` methods memory-map local files where the format supports it.
 WASM-compatible parsers. The core crate itself performs no file I/O and owns no
 format-specific parser.
 
+## Errors, recovery diagnostics, and plausibility
+
+Constructors return format-specific `Result` errors when a source cannot be
+opened safely. If a parser can recover but has to assume, clamp, substitute, or
+drop data, the opened source reports that decision through
+`TelemetrySource::diagnostics()`. Each `Diagnostic` has a stable dotted `code`,
+`Info` / `Warning` / `Error` severity, a concrete message, and optional channel
+attribution. Callers match `code`; they do not parse the message.
+
+Parsing only validates structure. `validate_source` separately stride-samples
+decoded values and reports non-finite, physically implausible, and widespread
+absurd values without refusing the recording. `validate_source_with` also
+accepts a source-file length for packed binary formats, where it can prove that
+the claimed sample footprint is impossible. Do not supply that length for text
+or packet formats that expand one stored value into several decoded channels.
+
+```rust,no_run
+use motorsport_telemetry_core::{validate_source, Severity, TelemetrySource};
+
+# fn check(source: &dyn TelemetrySource) {
+for diagnostic in source.diagnostics() {
+    eprintln!("{diagnostic}");
+}
+let findings = validate_source(source);
+if findings.max_severity() >= Some(Severity::Warning) {
+    eprintln!("{findings}");
+}
+# }
+```
+
 ## Fast metadata and sessions
 
 `read_source_metadata(&source)` returns a format-neutral `FileMetadata`

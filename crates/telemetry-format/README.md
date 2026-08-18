@@ -17,7 +17,8 @@ another folder. Sidecar groups join on integer nanoseconds; every header
 requires `utc`.
 
 `FORMAT_VERSION` is stored in the catalog (`schema_version`). Current version is
-`8` (`timespan_ms` span meta as u32le; v7 plot class / scale / rounding).
+`10` (signed `int8` sample encoding, code 0; v9 pass provenance; v8 typed span
+meta `timespan_ms` as u32le; v7 plot class / scale / rounding).
 `NativeRecording::open` rewrites a writable older file in place. Header-only
 reads do not. Clients can still call `file_needs_update` or `needs_update` for
 a read-only file.

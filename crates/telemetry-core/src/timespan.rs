@@ -127,21 +127,44 @@ mod tests {
     fn parses_racing_strings() {
         assert_eq!(parse_timespan_ms("1:50.332"), Some(110_332));
         assert_eq!(parse_timespan_ms("1:52.1"), Some(112_100));
+        assert_eq!(parse_timespan_ms("1:52.10"), Some(112_100));
         assert_eq!(parse_timespan_ms("1:30:00"), Some(5_400_000));
+        assert_eq!(parse_timespan_ms("1:30:00.000"), Some(5_400_000));
         assert_eq!(parse_timespan_ms("90:00.000"), Some(5_400_000));
+        assert_eq!(parse_timespan_ms("59:59.999"), Some(3_599_999));
         assert_eq!(parse_timespan_ms("100:00:00.000"), Some(TIMESPAN_MS_MAX));
         assert_eq!(parse_timespan_ms("0:00.000"), Some(0));
+    }
+
+    #[test]
+    fn format_then_parse_round_trips() {
+        for ms in [
+            0,
+            1,
+            32_104,
+            110_332,
+            3_599_999,
+            3_600_000,
+            5_400_000,
+            TIMESPAN_MS_MAX,
+        ] {
+            assert_eq!(parse_timespan_ms(&format_timespan_ms(ms)), Some(ms), "{ms}");
+        }
     }
 
     #[test]
     fn rejects_out_of_range_and_junk() {
         assert_eq!(parse_timespan_ms("100:00:00.001"), None);
         assert_eq!(parse_timespan_ms("101:00:00.000"), None);
+        assert_eq!(parse_timespan_ms("1:30:60.000"), None);
+        assert_eq!(parse_timespan_ms("1:60:00.000"), None);
         assert_eq!(parse_timespan_ms("IMSA"), None);
         assert_eq!(parse_timespan_ms("28"), None);
         assert_eq!(parse_timespan_ms("1:60.000"), None);
         assert_eq!(parse_timespan_ms("1:50.3320"), None);
         assert_eq!(parse_timespan_ms("1: 50.332"), None);
+        assert!(!timespan_ms_in_range(u64::from(TIMESPAN_MS_MAX) + 1));
+        assert!(timespan_ms_in_range(0));
     }
 
     #[test]
@@ -152,7 +175,7 @@ mod tests {
 
     #[test]
     fn u32_holds_100_hours() {
-        assert!(u32::try_from(u64::from(TIMESPAN_MS_MAX)).is_ok());
-        assert!(TIMESPAN_MS_MAX < u32::MAX);
+        const { assert!((TIMESPAN_MS_MAX as u64) <= (u32::MAX as u64)) };
+        const { assert!(TIMESPAN_MS_MAX < u32::MAX) };
     }
 }

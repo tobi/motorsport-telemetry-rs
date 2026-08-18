@@ -91,3 +91,38 @@ impl From<u32> for SpanMetaValue {
         Self::TimeMs(ms.min(TIMESPAN_MS_MAX))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn racing_text_becomes_integer_ms() {
+        let best = SpanMetaValue::from_stored_text("1:50.332".into());
+        assert_eq!(best, SpanMetaValue::TimeMs(110_332));
+        assert_eq!(best.display(), "1:50.332");
+        assert_eq!(best.as_timespan_ms(), Some(110_332));
+        assert_eq!(best.unit(), TIMESPAN_MS);
+    }
+
+    #[test]
+    fn license_and_counts_stay_text() {
+        let license = SpanMetaValue::from_stored_text("IMSA".into());
+        assert_eq!(license, SpanMetaValue::Text("IMSA".into()));
+        assert_eq!(license.display(), "IMSA");
+        assert_eq!(license.as_timespan_ms(), None);
+        assert_eq!(license.unit(), "");
+        assert_eq!(
+            SpanMetaValue::from_stored_text("28".into()),
+            SpanMetaValue::Text("28".into())
+        );
+    }
+
+    #[test]
+    fn from_u32_clamps_to_100_hours() {
+        assert_eq!(
+            SpanMetaValue::from(u32::MAX),
+            SpanMetaValue::TimeMs(TIMESPAN_MS_MAX)
+        );
+    }
+}

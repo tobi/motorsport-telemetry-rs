@@ -4,7 +4,7 @@
 #[cfg(not(target_os = "emscripten"))]
 use memmap2::Mmap;
 use motorsport_telemetry_core::{
-    Channel, Chunk, SampleType, SourceLapMetadata, TelemetrySource, UnitSource,
+    Channel, Chunk, Diagnostic, SampleType, SourceLapMetadata, TelemetrySource, UnitSource,
 };
 #[cfg(not(target_os = "emscripten"))]
 use std::fs::File;
@@ -127,6 +127,9 @@ pub struct MotecFile {
     pub ldx: Option<Box<LdxMetadata>>,
     encodings: Vec<Encoding>,
     data: Storage,
+    /// Recovery diagnostics collected during parse, surfaced via
+    /// [`TelemetrySource::diagnostics`].
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 fn invalid(path: &str, message: impl Into<String>) -> MotecError {
@@ -192,6 +195,23 @@ fn parse_datetime_ns(date: &str, time: &str) -> Option<u64> {
     u64::try_from(seconds).ok()?.checked_mul(1_000_000_000)
 }
 
+/// Whether [`TelemetrySource::decode`] would return 0.0 for a channel with
+/// this encoding — the silent fallback when the datatype/width combination has
+/// no interpretable decode path but the channel still carries samples.
+fn decode_would_return_zero(datatype_a: u16, width: usize) -> bool {
+    if datatype_a == 0x07 {
+        // Float type 0x07: only widths 4 and 8 are decoded; width 2 yields 0.0.
+        !matches!(width, 4 | 8)
+    } else if datatype_a == 0x08 {
+        // Type 0x08 is handled as f64 at width 8 and falls through to the
+        // integer path at widths 2/4, neither of which returns 0.0.
+        false
+    } else {
+        // Integer path: only widths 2 and 4 are decoded; width 8 yields 0.0.
+        !matches!(width, 2 | 4)
+    }
+}
+
 impl MotecFile {
     #[cfg(not(target_os = "emscripten"))]
     /// Memory-maps and parses a local MoTeC LD file.
@@ -208,10 +228,32 @@ impl MotecFile {
         })?;
         let mut parsed = Self::parse(display, Storage::Mapped(data))?;
         let sidecar = motec_sidecar_path(path);
-        if let Ok(bytes) = std::fs::read(&sidecar) {
-            parsed.ldx = parse_motec_ldx_bytes(sidecar.to_string_lossy(), &bytes)
-                .ok()
-                .map(Box::new);
+        match std::fs::read(&sidecar) {
+            Ok(bytes) => match parse_motec_ldx_bytes(sidecar.to_string_lossy(), &bytes) {
+                Ok(ldx) => {
+                    parsed.diagnostics.extend(ldx.diagnostics.iter().cloned());
+                    parsed.ldx = Some(Box::new(ldx));
+                }
+                Err(error) => {
+                    parsed.diagnostics.push(Diagnostic::warning(
+                        "ld.sidecar_unreadable",
+                        format!(
+                            "companion LDX at {} existed but could not be parsed: {error}",
+                            sidecar.display()
+                        ),
+                    ));
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                parsed.diagnostics.push(Diagnostic::warning(
+                    "ld.sidecar_unreadable",
+                    format!(
+                        "companion LDX at {} existed but could not be read: {error}",
+                        sidecar.display()
+                    ),
+                ));
+            }
         }
         Ok(parsed)
     }
@@ -230,6 +272,7 @@ impl MotecFile {
         let path = path.into();
         let ldx = parse_motec_ldx_bytes(format!("{path}x"), ldx_data)?;
         let mut parsed = Self::parse(path, Storage::Owned(data.into_boxed_slice()))?;
+        parsed.diagnostics.extend(ldx.diagnostics.iter().cloned());
         parsed.ldx = Some(Box::new(ldx));
         Ok(parsed)
     }
@@ -248,6 +291,7 @@ impl MotecFile {
 
         let mut channels = Vec::new();
         let mut encodings = Vec::new();
+        let mut diagnostics = Vec::new();
         let mut address = u32le(&data, 0x08).unwrap_or(0) as usize;
         while address > 0
             && address + CHANNEL_META_SIZE <= data.len()
@@ -309,6 +353,93 @@ impl MotecFile {
                 (_, 4) => SampleType::I32,
                 _ => SampleType::F32,
             };
+            // Report recoveries that would otherwise be silent. Each message
+            // names the concrete evidence (offset, channel, observed value).
+            if !valid_width {
+                diagnostics.push(
+                    Diagnostic::warning(
+                        "ld.invalid_width",
+                        format!(
+                            "channel at offset 0x{address:x} has width {width}; expected 2, 4, \
+                             or 8; sample count forced to 0"
+                        ),
+                    )
+                    .with_channel(&name),
+                );
+            }
+            if frequency == 0 {
+                diagnostics.push(
+                    Diagnostic::warning(
+                        "ld.zero_frequency",
+                        format!(
+                            "channel at offset 0x{address:x} has frequency 0; sample period is \
+                             zero and no samples were produced"
+                        ),
+                    )
+                    .with_channel(&name),
+                );
+            }
+            if (mul == 0 || scale == 0) && !matches!(datatype_a, 0x07 | 0x08) {
+                // Float channels (0x07/0x08) carry raw IEEE values; the
+                // affine transform is never applied, so a zero
+                // multiplier/divisor does not change engineering values.
+                let fields = match (mul == 0, scale == 0) {
+                    (true, true) => "multiplier and divisor",
+                    (true, false) => "multiplier",
+                    (false, true) => "divisor",
+                    _ => unreachable!(),
+                };
+                diagnostics.push(
+                    Diagnostic::warning(
+                        "ld.zero_scale_factor",
+                        format!(
+                            "channel at offset 0x{address:x} has {fields} of zero; affine \
+                             factor defaulted to 1.0, changing engineering values"
+                        ),
+                    )
+                    .with_channel(&name),
+                );
+            }
+            if valid_width && data_ptr < data.len() as u64 {
+                let available = (data.len() as u64 - data_ptr) / width as u64;
+                if requested_count > available {
+                    diagnostics.push(
+                        Diagnostic::warning(
+                            "ld.sample_count_clamped",
+                            format!(
+                                "channel at offset 0x{address:x} requested {requested_count} \
+                                 samples but only {available} fit before end of file; count \
+                                 clamped"
+                            ),
+                        )
+                        .with_channel(&name),
+                    );
+                }
+            }
+            if !matches!((datatype_a, width), (0x08, 8) | (0x07, _) | (_, 2) | (_, 4)) {
+                diagnostics.push(
+                    Diagnostic::warning(
+                        "ld.unknown_datatype_width",
+                        format!(
+                            "channel at offset 0x{address:x} has datatype 0x{datatype_a:02x} \
+                             with width {width}; no recognised encoding, falling back to F32"
+                        ),
+                    )
+                    .with_channel(&name),
+                );
+            }
+            if count > 0 && decode_would_return_zero(datatype_a, width) {
+                diagnostics.push(
+                    Diagnostic::warning(
+                        "ld.decode_unsupported_width",
+                        format!(
+                            "channel at offset 0x{address:x} has datatype 0x{datatype_a:02x} \
+                             with width {width}; decode returns 0.0 for this combination"
+                        ),
+                    )
+                    .with_channel(&name),
+                );
+            }
             channels.push(Channel {
                 id: channels.len() as u32,
                 name,
@@ -338,13 +469,24 @@ impl MotecFile {
         } else {
             (String::new(), String::new(), String::new())
         };
+        let date = text(&data, 0x5e, 16);
+        let time = text(&data, 0x7e, 16);
+        if (!date.is_empty() || !time.is_empty()) && parse_datetime_ns(&date, &time).is_none() {
+            diagnostics.push(Diagnostic::info(
+                "ld.datetime_unparsable",
+                format!(
+                    "recording date \"{date}\" time \"{time}\" could not be parsed; no absolute \
+                     time range will be reported"
+                ),
+            ));
+        }
         Ok(Self {
             path: display,
             driver: text(&data, 0x9e, 64),
             vehicle: text(&data, 0xde, 64),
             venue: text(&data, 0x15e, 64),
-            date: text(&data, 0x5e, 16),
-            time: text(&data, 0x7e, 16),
+            date,
+            time,
             event,
             session,
             comment,
@@ -352,6 +494,7 @@ impl MotecFile {
             ldx: None,
             encodings,
             data,
+            diagnostics,
         })
     }
 }
@@ -458,6 +601,10 @@ impl TelemetrySource for MotecFile {
         };
         raw.mul_add(encoding.factor, encoding.offset)
     }
+
+    fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
 }
 
 #[cfg(test)]
@@ -474,7 +621,7 @@ mod tests {
     fn u32_at(data: &mut [u8], at: usize, value: u32) {
         data[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
-    fn fixture() -> tempfile::NamedTempFile {
+    fn fixture_bytes() -> Vec<u8> {
         let mut data = vec![0u8; 0x500];
         u32_at(&mut data, 0, MAGIC);
         u32_at(&mut data, 8, 0x200);
@@ -499,12 +646,18 @@ mod tests {
         u16_at(&mut data, brake + 0x12, 0x03);
         u16_at(&mut data, brake + 0x14, 2);
         u16_at(&mut data, brake + 0x16, 1);
+        i16_at(&mut data, brake + 0x1a, 1);
         i16_at(&mut data, brake + 0x1c, 1);
         i16_at(&mut data, brake + 0x1e, 1);
         data[brake + 0x20..brake + 0x29].copy_from_slice(b"P_F_BRAKE");
         data[brake + 0x48..brake + 0x4b].copy_from_slice(b"bar");
         i16_at(&mut data, 0x3a0, 423);
         i16_at(&mut data, 0x3a2, -10);
+        data
+    }
+
+    fn fixture() -> tempfile::NamedTempFile {
+        let data = fixture_bytes();
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&data).unwrap();
         file
@@ -576,5 +729,79 @@ mod tests {
 
         let file = MotecFile::open(&ld_path).unwrap();
         assert_eq!(file.ldx.unwrap().marker_times_ns, [500_000_000]);
+    }
+
+    #[test]
+    fn clean_fixture_reports_no_diagnostics() {
+        let file = MotecFile::from_bytes("fixture.ld", fixture_bytes()).unwrap();
+        assert!(
+            file.diagnostics().is_empty(),
+            "unexpected diagnostics: {:?}",
+            file.diagnostics()
+        );
+    }
+
+    #[test]
+    fn warns_on_zero_frequency_channel() {
+        let mut data = fixture_bytes();
+        // Speed channel starts at 0x200; frequency is at offset 0x16.
+        u16_at(&mut data, 0x200 + 0x16, 0);
+        let file = MotecFile::from_bytes("fixture.ld", data).unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "ld.zero_frequency" && d.channel.as_deref() == Some("Speed")));
+    }
+
+    #[test]
+    fn warns_on_zero_scale_factor() {
+        let mut data = fixture_bytes();
+        // Brake channel starts at 0x27c; scale (divisor) is at offset 0x1c.
+        i16_at(&mut data, 0x27c + 0x1c, 0);
+        let file = MotecFile::from_bytes("fixture.ld", data).unwrap();
+        assert!(
+            file.diagnostics()
+                .iter()
+                .any(|d| d.code == "ld.zero_scale_factor"
+                    && d.channel.as_deref() == Some("P_F_BRAKE"))
+        );
+    }
+
+    #[test]
+    fn warns_on_invalid_width() {
+        let mut data = fixture_bytes();
+        // Speed channel starts at 0x200; width is at offset 0x14.  Set to 3,
+        // which is not 2/4/8.
+        u16_at(&mut data, 0x200 + 0x14, 3);
+        let file = MotecFile::from_bytes("fixture.ld", data).unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "ld.invalid_width" && d.channel.as_deref() == Some("Speed")));
+    }
+
+    #[test]
+    fn ldx_warns_on_unparsable_marker_time() {
+        let ldx = br#"<LDXFile><Marker ClassName="BCN" Time="not-a-number"/></LDXFile>"#;
+        let parsed = parse_motec_ldx_bytes("synthetic.ldx", ldx).unwrap();
+        assert!(parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "ldx.marker_time_unparsable"));
+    }
+
+    #[test]
+    fn ldx_clean_sidecar_reports_no_diagnostics() {
+        let ldx = br#"<LDXFile><Layers><Layer><MarkerBlock><MarkerGroup>
+            <Marker ClassName="BCN" Time="7.5e+05"/>
+            </MarkerGroup></MarkerBlock></Layer><Details>
+            <String Id="Total Laps" Value="2"/>
+            </Details></Layers></LDXFile>"#;
+        let parsed = parse_motec_ldx_bytes("synthetic.ldx", ldx).unwrap();
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            parsed.diagnostics
+        );
     }
 }

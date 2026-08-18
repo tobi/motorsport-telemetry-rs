@@ -11,7 +11,9 @@ use thiserror::Error;
 
 pub mod units;
 
-use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
+use motorsport_telemetry_core::{
+    Channel, Chunk, Diagnostic, Diagnostics, SampleType, TelemetrySource, UnitSource,
+};
 use units::DefLayout;
 
 /// Duration of one native PDS clock tick in nanoseconds.
@@ -80,6 +82,8 @@ pub struct CosworthFile {
     pub path: String,
     /// Source-exact telemetry channel metadata.
     pub channels: Vec<Channel>,
+    /// Problems recovered from while parsing the source.
+    pub diagnostics: Vec<Diagnostic>,
     data: Storage,
 }
 
@@ -98,6 +102,15 @@ struct Layout {
     chunk_offset: usize,
     next_offset: usize,
     chunk_count: usize,
+}
+
+#[derive(Clone)]
+struct RawChannelDef<'a> {
+    id: u32,
+    name: String,
+    unit: String,
+    unit_source: UnitSource,
+    record: &'a [u8],
 }
 
 #[derive(Clone)]
@@ -292,7 +305,7 @@ fn find_layout(
     Err(invalid(path, "no valid definitions/chunk layout found"))
 }
 
-fn marker_defs(data: &[u8], layout: Layout) -> Vec<ChannelDef> {
+fn marker_defs<'a>(data: &'a [u8], layout: Layout) -> Vec<RawChannelDef<'a>> {
     let scan_end = layout
         .chunk_offset
         .min(layout.defs_offset.saturating_add(8192))
@@ -313,9 +326,8 @@ fn marker_defs(data: &[u8], layout: Layout) -> Vec<ChannelDef> {
         return Vec::new();
     }
 
-    // Pass 1: collect the raw records so the unit field offsets can be
-    // detected from the file itself rather than assumed. Record layouts vary
-    // between logger firmware and Toolbox versions.
+    // Pass 1: collect records so the unit and sample-type fields can both be
+    // detected from the file. Their offsets vary with logger firmware.
     let mut raw: Vec<(u32, String, &[u8])> = Vec::new();
     let mut pos = first;
     while pos + 0xdc <= layout.chunk_offset.min(data.len()) {
@@ -330,25 +342,23 @@ fn marker_defs(data: &[u8], layout: Layout) -> Vec<ChannelDef> {
         pos += record_size;
     }
 
-    // Pass 2: locate the quantity/unit fields, then resolve each channel.
     let records: Vec<&[u8]> = raw.iter().map(|(_, _, record)| *record).collect();
     let def_layout = DefLayout::detect(&records, 0x10);
-
     raw.into_iter()
         .map(|(id, name, record)| {
             let (unit, unit_source) = def_layout.resolve(record);
-            ChannelDef {
+            RawChannelDef {
                 id,
                 name,
                 unit,
                 unit_source,
-                sample_type: SampleType::from_pds_code(u32le(record, 0xd8).unwrap_or(6)),
+                record,
             }
         })
         .collect()
 }
 
-fn markerless_defs(data: &[u8], layout: Layout, is_export: bool) -> Vec<ChannelDef> {
+fn markerless_defs(data: &[u8], layout: Layout) -> Vec<RawChannelDef<'_>> {
     if layout.defs_count == 0 {
         return Vec::new();
     }
@@ -357,7 +367,6 @@ fn markerless_defs(data: &[u8], layout: Layout, is_export: bool) -> Vec<ChannelD
     if !(100..=1024).contains(&record_size) {
         return Vec::new();
     }
-    // Pass 1: gather records so unit field offsets can be detected per file.
     let mut raw: Vec<(u32, String, &[u8])> = Vec::new();
     for i in 0..layout.defs_count {
         let pos = layout.defs_offset + i * record_size;
@@ -373,31 +382,179 @@ fn markerless_defs(data: &[u8], layout: Layout, is_export: bool) -> Vec<ChannelD
         raw.push((id, name, &data[pos..end]));
     }
 
-    // Pass 2: detect where the quantity code and unit string live, then
-    // resolve. This is what lets Toolbox exports (no unit strings) still get
-    // correct SI units from the quantity code alone.
+    // Toolbox exports can drop the human-readable unit but retain its quantity
+    // code. Resolving it dynamically is already the established pattern; the
+    // sample-type detector below applies the same rule to type codes.
     let records: Vec<&[u8]> = raw.iter().map(|(_, _, record)| *record).collect();
     let def_layout = DefLayout::detect(&records, 8);
-
     raw.into_iter()
         .map(|(id, name, record)| {
             let (unit, unit_source) = def_layout.resolve(record);
-            let code = if !is_export && record_size >= 0xd4 {
-                u32le(record, 0xd0)
-                    .filter(|v| (1..=7).contains(v))
-                    .unwrap_or(7)
-            } else {
-                7
-            };
-            ChannelDef {
+            RawChannelDef {
                 id,
                 name,
                 unit,
                 unit_source,
-                sample_type: SampleType::from_pds_code(code),
+                record,
             }
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TypeLayoutScore {
+    past_eof: usize,
+    continuity_error: u64,
+    unknown_codes: usize,
+    offset: usize,
+}
+#[derive(Clone, Copy)]
+struct TypeChunk {
+    def_index: usize,
+    data_ptr: u64,
+    sample_count: u64,
+}
+
+fn type_layout_score(
+    defs: &[RawChannelDef<'_>],
+    chunks: &[TypeChunk],
+    data_len: usize,
+    offset: usize,
+) -> Option<TypeLayoutScore> {
+    let mut has_type_code = false;
+    let mut unknown_codes = 0usize;
+    for def in defs {
+        let code = u32le(def.record, offset)?;
+        if code > u8::MAX.into() {
+            return None;
+        }
+        unknown_codes += usize::from(code > 7);
+        has_type_code = true;
+    }
+    if !has_type_code || chunks.is_empty() {
+        return None;
+    }
+
+    // `chunks` is sorted once by data pointer in `resolve_sample_types`.
+    // Candidate scoring is the hot path (up to 256 offsets over 1400
+    // channels); it must not allocate or sort per candidate.
+    let mut past_eof = 0usize;
+    let mut continuity_error = 0u64;
+    let mut previous_end = None::<u64>;
+    for chunk in chunks {
+        let code = u32le(defs[chunk.def_index].record, offset)?;
+        let width = SampleType::from_pds_code(code).byte_width() as u64;
+        let end = chunk
+            .sample_count
+            .checked_mul(width)
+            .and_then(|bytes| chunk.data_ptr.checked_add(bytes));
+        let Some(end) = end else {
+            past_eof += 1;
+            continue;
+        };
+        if end > data_len as u64 {
+            past_eof += 1;
+        }
+        if let Some(previous) = previous_end {
+            continuity_error = continuity_error.saturating_add(chunk.data_ptr.abs_diff(previous));
+            previous_end = Some(previous.max(end));
+        } else {
+            previous_end = Some(end);
+        }
+    }
+    Some(TypeLayoutScore {
+        past_eof,
+        continuity_error,
+        unknown_codes,
+        offset,
+    })
+}
+
+fn resolve_sample_types(
+    defs: Vec<RawChannelDef<'_>>,
+    chunks: &[RawChunk],
+    data_len: usize,
+    is_export: bool,
+    path: &str,
+    diagnostics: &mut Diagnostics,
+) -> Result<Vec<ChannelDef>, CosworthError> {
+    let record_len = defs.iter().map(|def| def.record.len()).min().unwrap_or(0);
+    let mut indexes: Vec<(u32, usize)> = defs
+        .iter()
+        .enumerate()
+        .map(|(index, def)| (def.id, index))
+        .collect();
+    indexes.sort_unstable_by_key(|(id, _)| *id);
+    let mut type_chunks = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let Ok(at) = indexes.binary_search_by_key(&chunk.channel_id, |(id, _)| *id) else {
+            continue;
+        };
+        type_chunks.push(TypeChunk {
+            def_index: indexes[at].1,
+            data_ptr: chunk.data_ptr,
+            sample_count: chunk.sample_count,
+        });
+    }
+    type_chunks.sort_unstable_by_key(|chunk| chunk.data_ptr);
+
+    // Compact Toolbox exports define one representation for the whole export:
+    // float64. Their small records contain unrelated low-valued fields that
+    // can look like type codes, so applying native-layout detection to them is
+    // both unnecessary and unsafe.
+    let best = (!is_export)
+        .then(|| {
+            (0..record_len.saturating_sub(3))
+                .step_by(4)
+                .filter_map(|offset| type_layout_score(&defs, &type_chunks, data_len, offset))
+                .min()
+        })
+        .flatten();
+
+    let codes = if let Some(score) = best {
+        if score.past_eof > 0 {
+            diagnostics.warning(
+                "pds.sample_data_truncated",
+                format!(
+                    "{} chunk payloads extend past the {}-byte file using the type field at \
+                     offset 0x{:x}; their sample counts will be clamped",
+                    score.past_eof, data_len, score.offset
+                ),
+            );
+        }
+        if score.unknown_codes > 0 {
+            diagnostics.warning(
+                "pds.type_code_unrecognized",
+                format!(
+                    "{} channel definitions carry unsupported sample type codes at offset \
+                     0x{:x}; those channels are decoded as float32",
+                    score.unknown_codes, score.offset
+                ),
+            );
+        }
+        defs.iter()
+            .map(|def| u32le(def.record, score.offset).unwrap_or(0))
+            .collect::<Vec<_>>()
+    } else if is_export {
+        vec![7; defs.len()]
+    } else {
+        return Err(invalid(
+            path,
+            "no sample-type field agrees with the channel definition and chunk layout",
+        ));
+    };
+
+    Ok(defs
+        .into_iter()
+        .zip(codes)
+        .map(|(def, code)| ChannelDef {
+            id: def.id,
+            name: def.name,
+            unit: def.unit,
+            unit_source: def.unit_source,
+            sample_type: SampleType::from_pds_code(code),
+        })
+        .collect())
 }
 
 fn parse_chunks(data: &[u8], layout: Layout, is_export: bool) -> Vec<RawChunk> {
@@ -513,15 +670,27 @@ impl CosworthFile {
         let layout = find_layout(&entries, data.len(), &display)?;
         let marked = marker_defs(&data, layout);
         let is_export = marked.is_empty() && layout.defs_count <= 200;
-        let defs = if marked.is_empty() {
-            markerless_defs(&data, layout, is_export)
+        let raw_defs = if marked.is_empty() {
+            markerless_defs(&data, layout)
         } else {
             marked
         };
-        if defs.is_empty() {
+        if raw_defs.is_empty() {
             return Err(invalid(&display, "no channel definitions found"));
         }
         let raw_chunks = parse_chunks(&data, layout, is_export);
+        if raw_chunks.is_empty() {
+            return Err(invalid(&display, "no readable sample chunks found"));
+        }
+        let mut diagnostics = Diagnostics::new();
+        let defs = resolve_sample_types(
+            raw_defs,
+            &raw_chunks,
+            data.len(),
+            is_export,
+            &display,
+            &mut diagnostics,
+        )?;
 
         let mut channels = defs
             .into_iter()
@@ -541,15 +710,23 @@ impl CosworthFile {
         // are not temporal keys in interrupted native logs. Convert each raw
         // descriptor directly into its final channel instead of building and
         // then copying through a second set of per-channel vectors.
+        let mut unknown_chunks = 0usize;
+        let mut clamped_chunks = 0usize;
+        let mut empty_chunks = 0usize;
         for raw in raw_chunks {
             let Some(index) = by_id.get(raw.channel_id) else {
+                unknown_chunks += 1;
                 continue;
             };
             let channel = &mut channels[index];
             let width = channel.sample_type.byte_width() as u64;
             let max_count = (data.len() as u64).saturating_sub(raw.data_ptr) / width;
             let count = raw.sample_count.min(max_count);
+            if count < raw.sample_count {
+                clamped_chunks += 1;
+            }
             if count == 0 {
+                empty_chunks += 1;
                 continue;
             }
             channel.chunks.push(Chunk {
@@ -566,9 +743,37 @@ impl CosworthFile {
                     .saturating_mul(TICK_NS),
             );
         }
+        if unknown_chunks > 0 {
+            diagnostics.warning(
+                "pds.chunk_channel_unknown",
+                format!(
+                    "{unknown_chunks} chunk descriptors name channel ids absent from the \
+                     definition table; those chunks were dropped"
+                ),
+            );
+        }
+        if clamped_chunks > 0 {
+            diagnostics.warning(
+                "pds.sample_count_clamped",
+                format!(
+                    "{clamped_chunks} chunk sample counts exceeded the remaining file bytes \
+                     and were clamped"
+                ),
+            );
+        }
+        if empty_chunks > 0 {
+            diagnostics.warning(
+                "pds.chunk_empty_after_clamp",
+                format!(
+                    "{empty_chunks} chunks contained no complete samples after bounds checking \
+                     and were dropped"
+                ),
+            );
+        }
         Ok(Self {
             path: display,
             channels,
+            diagnostics: diagnostics.into_items(),
             data,
         })
     }
@@ -585,6 +790,10 @@ impl TelemetrySource for CosworthFile {
 
     fn channels(&self) -> &[Channel] {
         &self.channels
+    }
+
+    fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
     }
 
     fn chunk_bytes(&self, channel_index: usize, chunk_index: usize) -> Option<&[u8]> {
@@ -605,6 +814,7 @@ impl TelemetrySource for CosworthFile {
         let offset =
             chunk.data_ptr as usize + local_index as usize * channel.sample_type.byte_width();
         match channel.sample_type {
+            SampleType::I8 => self.data[offset] as i8 as f64,
             SampleType::U8 => self.data[offset] as f64,
             SampleType::I16 => {
                 i16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as f64
@@ -648,6 +858,26 @@ mod tests {
         u32_at(data, at + 0x14, class_b);
         u32_at(data, at + 0x18, next);
     }
+    fn write_chunk_table(
+        data: &mut [u8],
+        chunks: usize,
+        table: &[(u32, u32, &[f64])],
+        mut ptr: usize,
+    ) {
+        for (index, (order, id, values)) in table.iter().enumerate() {
+            let at = chunks + index * 0x40;
+            u32_at(data, at, *order);
+            u32_at(data, at + 4, *id);
+            u32_at(data, at + 8, *id);
+            u32_at(data, at + 0x18, 10_000_000);
+            u32_at(data, at + 0x1c, values.len() as u32);
+            u32_at(data, at + 0x38, ptr as u32);
+            for value in *values {
+                data[ptr..ptr + 8].copy_from_slice(&value.to_le_bytes());
+                ptr += 8;
+            }
+        }
+    }
     fn fixture() -> tempfile::NamedTempFile {
         let mut data = vec![0u8; 0x700];
         let defs = 0x200;
@@ -660,30 +890,57 @@ mod tests {
             u32_at(&mut data, at, id);
             utf16_at(&mut data, at + 8, name);
         }
-        for (index, (order, id, values)) in [
-            (100, 1, [10.0_f64, 11.0]),
-            (200, 2, [3.0, 3.0]),
-            (1, 1, [12.0, 13.0]),
-            (2, 2, [4.0, 4.0]),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let at = chunks as usize + index * 0x40;
-            let ptr = 0x580 + index * 0x20;
-            u32_at(&mut data, at, order);
-            u32_at(&mut data, at + 4, id);
-            u32_at(&mut data, at + 8, id);
-            u32_at(&mut data, at + 0x18, 10_000_000);
-            u32_at(&mut data, at + 0x1c, 2);
-            u32_at(&mut data, at + 0x38, ptr as u32);
-            for (sample, value) in values.into_iter().enumerate() {
-                data[ptr + sample * 8..ptr + sample * 8 + 8].copy_from_slice(&value.to_le_bytes());
-            }
-        }
+        write_chunk_table(
+            &mut data,
+            chunks as usize,
+            &[
+                (100, 1, &[10.0, 11.0]),
+                (200, 2, &[3.0, 3.0]),
+                (1, 1, &[12.0, 13.0]),
+                (2, 2, &[4.0, 4.0]),
+            ],
+            0x580,
+        );
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&data).unwrap();
         file
+    }
+    fn unequal_chunks_fixture() -> tempfile::NamedTempFile {
+        let mut data = vec![0u8; 0x800];
+        let defs = 0x200;
+        let chunks = 0x380;
+        let next = 0x4c0;
+        directory(&mut data, 0x80, defs, 2, 1, 5);
+        directory(&mut data, 0xa0, chunks, 5, 3, 0);
+        directory(&mut data, 0xc0, next, 0, 1, 0);
+        for (index, (id, name)) in [(1, "Speed"), (2, "Gear")].into_iter().enumerate() {
+            let at = defs as usize + index * 0xc0;
+            u32_at(&mut data, at, id);
+            utf16_at(&mut data, at + 8, name);
+        }
+        // Five descriptors, three Speed chunks with unequal counts. `order`
+        // is not monotonic so a sort would scramble decode order.
+        write_chunk_table(
+            &mut data,
+            chunks as usize,
+            &[
+                (50, 1, &[1.0, 2.0, 3.0]),
+                (90, 2, &[10.0, 11.0]),
+                (5, 1, &[4.0]),
+                (1, 2, &[12.0, 13.0, 14.0, 15.0]),
+                (80, 1, &[5.0, 6.0]),
+            ],
+            0x580,
+        );
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file
+    }
+    fn channel_index(file: &CosworthFile, name: &str) -> usize {
+        file.channels()
+            .iter()
+            .position(|channel| channel.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
     }
 
     #[test]
@@ -705,6 +962,52 @@ mod tests {
         assert_eq!(values, [10.0, 11.0, 12.0, 13.0]);
         assert_eq!(file.sample_at(0, 1_500_000_000, true), Some(11.5));
         assert_eq!(file.sample_at(1, 2_500_000_000, true), Some(4.0));
+    }
+
+    #[test]
+    fn preserves_more_than_two_unequal_chunks_in_table_order() {
+        let fixture = unequal_chunks_fixture();
+        let file = CosworthFile::open(fixture.path()).unwrap();
+        assert_eq!(file.channels.len(), 2);
+        assert_eq!(file.channels[0].chunks.len(), 3);
+        assert_eq!(file.channels[1].chunks.len(), 2);
+        assert_eq!(
+            file.channels[0]
+                .chunks
+                .iter()
+                .map(|chunk| chunk.sample_count)
+                .collect::<Vec<_>>(),
+            [3, 1, 2]
+        );
+        assert_eq!(
+            file.channels[1]
+                .chunks
+                .iter()
+                .map(|chunk| chunk.sample_count)
+                .collect::<Vec<_>>(),
+            [2, 4]
+        );
+        let period = 10_000_000u64 * TICK_NS;
+        assert_eq!(file.channels[0].chunks[0].time_base_ns, 0);
+        assert_eq!(file.channels[0].chunks[1].time_base_ns, 3 * period);
+        assert_eq!(file.channels[0].chunks[2].time_base_ns, 4 * period);
+        assert_eq!(file.channels[1].chunks[1].time_base_ns, 2 * period);
+        let mut speed = Vec::new();
+        for chunk in 0..3 {
+            for local in 0..file.channels[0].chunks[chunk].sample_count {
+                speed.push(file.decode(0, chunk, local));
+            }
+        }
+        assert_eq!(speed, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut gear = Vec::new();
+        for chunk in 0..2 {
+            for local in 0..file.channels[1].chunks[chunk].sample_count {
+                gear.push(file.decode(1, chunk, local));
+            }
+        }
+        assert_eq!(gear, [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]);
+        assert_eq!(file.channels[0].sample_count, 6);
+        assert_eq!(file.channels[1].sample_count, 6);
     }
 
     #[test]
@@ -762,5 +1065,273 @@ mod tests {
             CosworthFile::open(file.path()),
             Err(CosworthError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn committed_fixture_has_three_complete_flying_laps() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/synthetic_cosworth.pds");
+        let file = CosworthFile::open(&path).unwrap();
+        let metadata = motorsport_telemetry_core::read_source_metadata(&file);
+        assert_eq!(file.channels.len(), 10);
+        assert_eq!(file.channels()[0].name, "Speed");
+        assert_eq!(file.channels()[0].chunks[0].sample_period_ns, 200_000_000);
+        assert!(file.channels()[0].sample_count > 1_000);
+        assert_eq!(metadata.driver_ids, [7]);
+        assert_eq!(metadata.laps.len(), 5);
+        assert_eq!(metadata.valid_laps, 3u32);
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(|lap| (lap.number, lap.complete))
+                .collect::<Vec<_>>(),
+            [(1, false), (2, true), (3, true), (4, true), (5, false)]
+        );
+        for lap in metadata.laps.iter().filter(|lap| lap.complete) {
+            assert!(
+                lap.duration_ns >= 10_000_000_000,
+                "flying lap {} is too short",
+                lap.number
+            );
+        }
+        let fastest = metadata.fastest_lap.expect("flying laps should rank");
+        assert_eq!(fastest.number, 2);
+        let mid = file
+            .sample_at(8, fastest.start_ns + fastest.duration_ns / 2, false)
+            .unwrap();
+        let lon = file
+            .sample_at(9, fastest.start_ns + fastest.duration_ns / 2, false)
+            .unwrap();
+        assert!((43.78..=43.82).contains(&mid), "lat={mid}");
+        assert!((-88.02..=-87.97).contains(&lon), "lon={lon}");
+        let speeds: Vec<f64> = (0..file.channels()[0].sample_count)
+            .map(|i| file.decode(0, 0, i))
+            .collect();
+        let min_v = speeds.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_v = speeds.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(min_v > 5.0 && max_v < 80.0, "speed {min_v}..{max_v}");
+        assert!(max_v - min_v > 15.0);
+
+        let speed_ch = channel_index(&file, "Speed");
+        let throttle_ch = channel_index(&file, "Throttle Pos");
+        let brake_ch = channel_index(&file, "Brake Pedal Pos");
+        let distance_ch = channel_index(&file, "Lap Distance");
+        let lap_ch = channel_index(&file, "Lap Number");
+        let lat_ch = channel_index(&file, "GPS Latitude");
+        let lon_ch = channel_index(&file, "GPS Longitude");
+        let count = file.channels()[speed_ch].sample_count;
+        assert_eq!(
+            file.channels()[speed_ch].chunks[0].sample_period_ns,
+            200_000_000
+        );
+        let mut early_throttle = Vec::new();
+        let mut late_throttle = Vec::new();
+        let mut late_brake = Vec::new();
+        let mut max_distance = [0.0_f64; 8];
+        for local in 0..count {
+            let lap = file.decode(lap_ch, 0, local) as usize;
+            if lap < max_distance.len() {
+                max_distance[lap] = max_distance[lap].max(file.decode(distance_ch, 0, local));
+            }
+            let lat = file.decode(lat_ch, 0, local);
+            let lon = file.decode(lon_ch, 0, local);
+            assert!((43.78..=43.82).contains(&lat), "lat={lat} at {local}");
+            assert!((-88.02..=-87.97).contains(&lon), "lon={lon} at {local}");
+        }
+        for local in 0..count {
+            let lap = file.decode(lap_ch, 0, local);
+            if !matches!(lap, 2.0 | 3.0 | 4.0) {
+                continue;
+            }
+            let distance = file.decode(distance_ch, 0, local);
+            let throttle = file.decode(throttle_ch, 0, local);
+            if distance < 200.0 {
+                early_throttle.push(throttle);
+            }
+            let lap_max = max_distance[lap as usize];
+            if lap_max > 0.0 && distance > 0.96 * lap_max {
+                late_throttle.push(throttle);
+                late_brake.push(file.decode(brake_ch, 0, local));
+            }
+        }
+        assert!(!early_throttle.is_empty());
+        assert!(
+            early_throttle.iter().all(|value| *value > 80.0),
+            "front-straight throttle after lap-distance reset {early_throttle:?}"
+        );
+        assert!(!late_throttle.is_empty());
+        assert!(
+            late_throttle.iter().all(|value| *value >= 50.0)
+                && late_brake.iter().all(|value| *value == 0.0),
+            "late-lap front straight throttle={late_throttle:?} brake={late_brake:?}"
+        );
+
+        for complete in metadata.laps.iter().filter(|lap| lap.complete) {
+            let members: Vec<u64> = (0..count)
+                .filter(|&local| file.decode(lap_ch, 0, local) == complete.number as f64)
+                .collect();
+            let slowest = *members
+                .iter()
+                .min_by(|a, b| {
+                    file.decode(speed_ch, 0, **a)
+                        .total_cmp(&file.decode(speed_ch, 0, **b))
+                })
+                .expect("flying lap samples");
+            let window: Vec<f64> = members
+                .iter()
+                .copied()
+                .filter(|local| *local < slowest && slowest - *local <= 20)
+                .map(|local| file.decode(brake_ch, 0, local))
+                .collect();
+            assert!(
+                !window.is_empty(),
+                "no pre-corner samples on lap {}",
+                complete.number
+            );
+            let peak = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                peak > 40.0 && peak > window[0],
+                "lap {} brake should rise before the slowest corner (first={} peak={})",
+                complete.number,
+                window[0],
+                peak
+            );
+        }
+    }
+
+    #[test]
+    fn detects_type_field_in_wide_native_records() {
+        // Real DPi/IMSA logs use 0x228-byte definitions with the sample type
+        // at 0x48 (and a mirror at 0x104), not the old hard-coded 0xd0.
+        // Reading 0xd0 yields zero for every channel and used to default all
+        // 1399 channels to F64: 120 MB of claimed samples in a 40 MB file.
+        let defs = 0x200usize;
+        let stride = 0x228usize;
+        let definition_count = 201usize;
+        let chunks = defs + stride * definition_count;
+        let next = chunks + 0x80;
+        let data_start = next + 0x40;
+        let mut data = vec![0u8; data_start + 0x40];
+        directory(&mut data, 0x80, defs as u32, definition_count as u32, 1, 2);
+        directory(&mut data, 0xa0, chunks as u32, 2, 3, 0);
+        directory(&mut data, 0xc0, next as u32, 0, 1, 0);
+
+        for (index, (id, name, type_code)) in [(1, "Speed_Wspd_App", 6u32), (2, "Alarm", 3u32)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = defs + index * stride;
+            u32_at(&mut data, at, id);
+            utf16_at(&mut data, at + 8, name);
+            u32_at(&mut data, at + 0x48, type_code);
+            // Match the duplicate field present in the observed layout.
+            u32_at(&mut data, at + 0x104, type_code);
+
+            let chunk = chunks + index * 0x40;
+            let ptr = data_start + index * 0x20;
+            u32_at(&mut data, chunk, index as u32);
+            u32_at(&mut data, chunk + 4, id);
+            u32_at(&mut data, chunk + 8, id);
+            u32_at(&mut data, chunk + 0x18, 200_000);
+            u32_at(&mut data, chunk + 0x1c, 2);
+            u32_at(&mut data, chunk + 0x38, ptr as u32);
+            if type_code == 6 {
+                for (sample, value) in [0.0_f32, 83.6].into_iter().enumerate() {
+                    data[ptr + sample * 4..ptr + sample * 4 + 4]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            } else {
+                for (sample, value) in [0u16, 2].into_iter().enumerate() {
+                    data[ptr + sample * 2..ptr + sample * 2 + 2]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
+        let file = CosworthFile::from_bytes("wide.pds", data).unwrap();
+        assert_eq!(file.channels[0].sample_type, SampleType::F32);
+        assert_eq!(file.channels[1].sample_type, SampleType::U16);
+        assert!((file.decode(0, 0, 1) - 83.6).abs() < 1e-4);
+        assert_eq!(file.decode(1, 0, 1), 2.0);
+        assert!(
+            motorsport_telemetry_core::validate_source(&file).is_empty(),
+            "{}",
+            motorsport_telemetry_core::validate_source(&file)
+        );
+        assert!(file.diagnostics().is_empty(), "{:?}", file.diagnostics());
+    }
+
+    #[test]
+    fn decodes_signed_byte_type_code_zero() {
+        let defs = 0x200usize;
+        let stride = 0xe0usize;
+        let chunks = defs + stride * 201;
+        let next = chunks + 0x80;
+        let ptr = next + 0x40;
+        let mut data = vec![0u8; ptr + 0x20];
+        directory(&mut data, 0x80, defs as u32, 201, 1, 2);
+        directory(&mut data, 0xa0, chunks as u32, 2, 3, 0);
+        directory(&mut data, 0xc0, next as u32, 0, 1, 0);
+        for (index, (id, name, code)) in [(1, "Float", 6u32), (2, "TPMS_RSSI", 0u32)]
+            .into_iter()
+            .enumerate()
+        {
+            let def = defs + index * stride;
+            u32_at(&mut data, def, id);
+            utf16_at(&mut data, def + 8, name);
+            u32_at(&mut data, def + 0xd0, code);
+            let chunk = chunks + index * 0x40;
+            u32_at(&mut data, chunk + 4, id);
+            u32_at(&mut data, chunk + 8, id);
+            u32_at(&mut data, chunk + 0x18, 10_000);
+            u32_at(&mut data, chunk + 0x1c, 1);
+            u32_at(&mut data, chunk + 0x38, (ptr + index * 8) as u32);
+        }
+        data[ptr..ptr + 4].copy_from_slice(&1.0f32.to_le_bytes());
+        data[ptr + 8] = (-73i8) as u8;
+
+        let file = CosworthFile::from_bytes("signed-byte.pds", data).unwrap();
+        assert_eq!(file.channels[1].sample_type, SampleType::I8);
+        assert_eq!(file.decode(1, 0, 0), -73.0);
+        assert!(file.diagnostics().is_empty(), "{:?}", file.diagnostics());
+    }
+
+    #[test]
+    fn reports_unsupported_type_code_fallback() {
+        let defs = 0x200usize;
+        let stride = 0xe0usize;
+        let chunks = defs + stride * 201;
+        let next = chunks + 0x80;
+        let ptr = next + 0x40;
+        let mut data = vec![0u8; ptr + 0x20];
+        directory(&mut data, 0x80, defs as u32, 201, 1, 2);
+        directory(&mut data, 0xa0, chunks as u32, 2, 3, 0);
+        directory(&mut data, 0xc0, next as u32, 0, 1, 0);
+        for (index, (id, name, code)) in [(1, "Known", 6u32), (2, "Future", 8u32)]
+            .into_iter()
+            .enumerate()
+        {
+            let def = defs + index * stride;
+            u32_at(&mut data, def, id);
+            utf16_at(&mut data, def + 8, name);
+            u32_at(&mut data, def + 0xd0, code);
+            let chunk = chunks + index * 0x40;
+            u32_at(&mut data, chunk + 4, id);
+            u32_at(&mut data, chunk + 8, id);
+            u32_at(&mut data, chunk + 0x18, 10_000);
+            u32_at(&mut data, chunk + 0x1c, 1);
+            u32_at(&mut data, chunk + 0x38, (ptr + index * 8) as u32);
+            data[ptr + index * 8..ptr + index * 8 + 4].copy_from_slice(&1.0f32.to_le_bytes());
+        }
+        let file = CosworthFile::from_bytes("future-type.pds", data).unwrap();
+        assert_eq!(file.channels[1].sample_type, SampleType::F32);
+        assert!(
+            file.diagnostics()
+                .iter()
+                .any(|item| item.code == "pds.type_code_unrecognized"),
+            "{:?}",
+            file.diagnostics()
+        );
     }
 }

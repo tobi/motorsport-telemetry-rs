@@ -2625,6 +2625,8 @@ mod tests {
         videos: Vec<VideoFileRef>,
         video_times: Vec<u64>,
         video_offset_ns: Option<i128>,
+        sample_times: Vec<Vec<u64>>,
+        spans: Vec<Span>,
     }
 
     impl TelemetrySource for TinySource {
@@ -2641,6 +2643,23 @@ mod tests {
             let base = self.channels[channel_index].chunks[chunk_index].sample_base;
             self.values[channel_index][(base + local_index) as usize]
         }
+        fn sample_time_ns(
+            &self,
+            channel_index: usize,
+            chunk_index: usize,
+            local_index: u64,
+        ) -> u64 {
+            let chunk = &self.channels[channel_index].chunks[chunk_index];
+            let index = (chunk.sample_base + local_index) as usize;
+            if let Some(&time) = self
+                .sample_times
+                .get(channel_index)
+                .and_then(|times| times.get(index))
+            {
+                return time;
+            }
+            chunk.time_base_ns + local_index * chunk.sample_period_ns
+        }
         fn identity(&self) -> SourceIdentity {
             self.identity.clone()
         }
@@ -2649,6 +2668,9 @@ mod tests {
         }
         fn timezone(&self) -> String {
             self.timezone.clone()
+        }
+        fn spans(&self) -> &[Span] {
+            &self.spans
         }
         fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
             Some(SourceLapMetadata {
@@ -2718,6 +2740,8 @@ mod tests {
             videos: Vec::new(),
             video_times: Vec::new(),
             video_offset_ns: None,
+            sample_times: Vec::new(),
+            spans: Vec::new(),
             laps: vec![LapMetadata {
                 number: 1,
                 start_ns: 0,
@@ -2727,6 +2751,47 @@ mod tests {
                 first_video_frame: None,
             }],
         }
+    }
+
+    fn jittered_times(period_ns: u64, count: u64, t0_ns: u64, jitter_ns: i64) -> Vec<u64> {
+        (0..count)
+            .map(|index| {
+                let expected = t0_ns + index * period_ns;
+                let signed = if index % 2 == 0 {
+                    jitter_ns
+                } else {
+                    -jitter_ns
+                };
+                u64::try_from(i128::from(expected) + i128::from(signed)).unwrap()
+            })
+            .collect()
+    }
+
+    fn alignment_span(name: &str, start_ns: u64, end_ns: u64) -> Span {
+        Span {
+            name: name.into(),
+            start_ns,
+            end_ns,
+            visible: true,
+            color: String::new(),
+            primary: SpanPrimary::default(),
+            meta: Vec::new(),
+        }
+    }
+
+    fn write_alignment_jsonl(source: &TinySource) -> (Vec<u8>, JsonlRecording) {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("align.telemetry.jsonl");
+        write_jsonl_from_source_with(source, &dest, false).unwrap();
+        let bytes = std::fs::read(&dest).unwrap();
+        assert_eq!(bytes.first().copied(), Some(b'{'));
+        let opened = JsonlRecording::open(&dest).unwrap();
+        let from_bytes = JsonlRecording::from_bytes("align.telemetry.jsonl", &bytes).unwrap();
+        assert_eq!(from_bytes.quantum_ns(), opened.quantum_ns());
+        assert_eq!(from_bytes.origin_ns(), opened.origin_ns());
+        assert_eq!(from_bytes.duration_ns(), opened.duration_ns());
+        assert_eq!(from_bytes.channels().len(), opened.channels().len());
+        (bytes, opened)
     }
 
     #[test]
@@ -3519,5 +3584,262 @@ mod tests {
         );
         let err = JsonlRecording::from_bytes("bad.ext.jsonl", text.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("folder records are not used"));
+    }
+
+    #[test]
+    fn alignment_jitter_accepts_inside_window_and_drops_outside() {
+        assert_eq!(ALIGN_JITTER_NS, 2_000_000);
+        let period_ns = 10_000_000u64;
+        let cases = [(500_000_i64, true), (3_000_000_i64, false)];
+        for (jitter_ns, keep) in cases {
+            let mut source = tiny();
+            source.sample_times = vec![jittered_times(period_ns, 4, 0, jitter_ns)];
+            assert_eq!(
+                collect_aligned(&source, 0, &source.channels[0]).is_some(),
+                keep,
+                "jitter_ns={jitter_ns}"
+            );
+            assert!(collect_aligned(&source, 1, &source.channels[1]).is_some());
+
+            let (bytes, opened) = write_alignment_jsonl(&source);
+            let names: Vec<&str> = opened
+                .channels()
+                .iter()
+                .map(|ch| ch.name.as_str())
+                .collect();
+            if keep {
+                assert_eq!(names, ["Speed", "GPS Speed"], "jitter_ns={jitter_ns}");
+                assert_eq!(opened.quantum_ns(), period_ns);
+                assert_eq!(opened.origin_ns(), 0);
+                assert_eq!(opened.duration_ns(), 40_000_000);
+                assert_eq!(opened.channels()[0].sample_count, 4);
+                assert_eq!(opened.channels()[0].chunks[0].sample_period_ns, period_ns);
+                assert_eq!(opened.decode(0, 0, 0), 10.0);
+                assert_eq!(opened.decode(0, 0, 2), 12.5);
+                assert_eq!(opened.decode(0, 0, 3), 13.0);
+                for index in 0..4u64 {
+                    assert_eq!(opened.sample_time_ns(0, 0, index), index * period_ns);
+                }
+                let text = String::from_utf8(bytes).unwrap();
+                assert!(text.contains("\"n\":\"Speed\""));
+                assert!(text.contains("\"hz\":100"));
+            } else {
+                assert_eq!(names, ["GPS Speed"], "jitter_ns={jitter_ns}");
+                assert_eq!(opened.quantum_ns(), 40_000_000);
+                assert_eq!(opened.origin_ns(), 0);
+                let text = String::from_utf8(bytes).unwrap();
+                assert!(!text.contains("\"n\":\"Speed\""));
+            }
+        }
+    }
+
+    #[test]
+    fn alignment_mixed_period_chunks_are_omitted() {
+        let mut source = tiny();
+        source.channels.push(Channel {
+            id: 3,
+            name: "Beacon".into(),
+            unit: String::new(),
+            unit_source: UnitSource::Unknown,
+            sample_type: SampleType::F64,
+            chunks: vec![
+                Chunk {
+                    sample_period_ns: 10_000_000,
+                    sample_count: 2,
+                    data_ptr: 0,
+                    sample_base: 0,
+                    time_base_ns: 0,
+                },
+                Chunk {
+                    sample_period_ns: 20_000_000,
+                    sample_count: 2,
+                    data_ptr: 0,
+                    sample_base: 2,
+                    time_base_ns: 20_000_000,
+                },
+            ],
+            sample_count: 4,
+            duration_ns: 60_000_000,
+        });
+        source.values.push(vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(collect_aligned(&source, 2, &source.channels[2]).is_none());
+
+        let (bytes, opened) = write_alignment_jsonl(&source);
+        assert_eq!(opened.channels().len(), 2);
+        assert!(opened.channels().iter().all(|ch| ch.name != "Beacon"));
+        assert_eq!(opened.channels()[0].name, "Speed");
+        assert_eq!(opened.channels()[1].name, "GPS Speed");
+        assert_eq!(opened.quantum_ns(), 10_000_000);
+        assert_eq!(opened.origin_ns(), 0);
+        assert_eq!(opened.decode(0, 0, 0), 10.0);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("\"n\":\"Beacon\""));
+    }
+
+    #[test]
+    fn alignment_two_holes_fill_null_and_keep_indexes() {
+        let period_ns = 10_000_000u64;
+        let t0_ns = 10_000_000u64;
+        let mut source = tiny();
+        source.channels[0].chunks = vec![
+            Chunk {
+                sample_period_ns: period_ns,
+                sample_count: 2,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: t0_ns,
+            },
+            Chunk {
+                sample_period_ns: period_ns,
+                sample_count: 1,
+                data_ptr: 0,
+                sample_base: 2,
+                time_base_ns: t0_ns + 3 * period_ns,
+            },
+            Chunk {
+                sample_period_ns: period_ns,
+                sample_count: 1,
+                data_ptr: 0,
+                sample_base: 3,
+                time_base_ns: t0_ns + 5 * period_ns,
+            },
+        ];
+        source.channels[0].sample_count = 4;
+        source.channels[0].duration_ns = t0_ns + 6 * period_ns;
+        source.values[0] = vec![10.0, 11.0, 13.0, 15.0];
+
+        let (bytes, opened) = write_alignment_jsonl(&source);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"v\":[10,11,null,13,null,15]"));
+        assert!(text.contains("\"t0\":10000000"));
+        assert_eq!(opened.quantum_ns(), period_ns);
+        assert_eq!(opened.origin_ns(), 0);
+        assert_eq!(opened.channels()[0].name, "Speed");
+        assert_eq!(opened.channels()[0].sample_count, 6);
+        assert_eq!(opened.channels()[0].chunks[0].sample_period_ns, period_ns);
+        assert_eq!(opened.channels()[0].chunks[0].time_base_ns, t0_ns);
+        let count = opened.channels()[0].sample_count;
+        for index in 0..count {
+            assert_eq!(
+                opened.sample_time_ns(0, 0, index),
+                t0_ns + index * period_ns
+            );
+        }
+        assert_eq!(opened.decode(0, 0, 0), 10.0);
+        assert_eq!(opened.decode(0, 0, 1), 11.0);
+        assert!(opened.decode(0, 0, 2).is_nan());
+        assert_eq!(opened.decode(0, 0, 3), 13.0);
+        assert!(opened.decode(0, 0, 4).is_nan());
+        assert_eq!(opened.decode(0, 0, 5), 15.0);
+    }
+
+    #[test]
+    fn alignment_snap_laps_and_spans_to_lattice() {
+        let quantum_ns = 10_000_000u64;
+        let lap_cases = [
+            (0, 40_000_000, 0, 40_000_000),
+            (2_000_000, 38_000_000, 0, 40_000_000),
+            (8_000_000, 42_000_000, 10_000_000, 40_000_000),
+            (12_000_000, 13_000_000, 10_000_000, 20_000_000),
+        ];
+        for (start_ns, end_ns, expect_start, expect_end) in lap_cases {
+            let snapped = snap_laps(
+                &[LapMetadata {
+                    number: 1,
+                    start_ns,
+                    end_ns,
+                    duration_ns: end_ns - start_ns,
+                    complete: true,
+                    first_video_frame: None,
+                }],
+                quantum_ns,
+            );
+            assert_eq!(snapped[0].start_ns, expect_start, "lap start {start_ns}");
+            assert_eq!(snapped[0].end_ns, expect_end, "lap end {end_ns}");
+            assert_eq!(snapped[0].duration_ns, expect_end - expect_start);
+        }
+
+        let span_cases = [
+            (0, 40_000_000, 0, 40_000_000),
+            (1_000_000, 22_000_000, 0, 20_000_000),
+            (8_000_000, 42_000_000, 10_000_000, 40_000_000),
+            (12_000_000, 13_000_000, 10_000_000, 20_000_000),
+        ];
+        for (start_ns, end_ns, expect_start, expect_end) in span_cases {
+            let snapped = snap_spans(&[alignment_span("pit", start_ns, end_ns)], quantum_ns);
+            assert_eq!(snapped[0].start_ns, expect_start, "span start {start_ns}");
+            assert_eq!(snapped[0].end_ns, expect_end, "span end {end_ns}");
+        }
+
+        let mut source = tiny();
+        source.laps = vec![
+            LapMetadata {
+                number: 1,
+                start_ns: 2_000_000,
+                end_ns: 38_000_000,
+                duration_ns: 36_000_000,
+                complete: false,
+                first_video_frame: None,
+            },
+            LapMetadata {
+                number: 2,
+                start_ns: 12_000_000,
+                end_ns: 13_000_000,
+                duration_ns: 1_000_000,
+                complete: true,
+                first_video_frame: None,
+            },
+        ];
+        source.spans = vec![
+            alignment_span("near", 1_000_000, 22_000_000),
+            alignment_span("collapse", 12_000_000, 13_000_000),
+        ];
+        let (bytes, opened) = write_alignment_jsonl(&source);
+        assert_eq!(opened.quantum_ns(), quantum_ns);
+        assert_eq!(opened.origin_ns(), 0);
+        assert_eq!(opened.metadata().laps[0].start_ns, 0);
+        assert_eq!(opened.metadata().laps[0].end_ns, 40_000_000);
+        assert_eq!(opened.metadata().laps[0].duration_ns, 40_000_000);
+        assert_eq!(opened.metadata().laps[1].start_ns, 10_000_000);
+        assert_eq!(opened.metadata().laps[1].end_ns, 20_000_000);
+        assert_eq!(opened.metadata().laps[1].duration_ns, 10_000_000);
+        assert_eq!(opened.spans()[0].name, "near");
+        assert_eq!(opened.spans()[0].start_ns, 0);
+        assert_eq!(opened.spans()[0].end_ns, 20_000_000);
+        assert_eq!(opened.spans()[1].name, "collapse");
+        assert_eq!(opened.spans()[1].start_ns, 10_000_000);
+        assert_eq!(opened.spans()[1].end_ns, 20_000_000);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("[[1,0,40000000,0],[2,10000000,20000000,1]]"));
+        assert!(text.contains("\"s\":0,\"e\":20000000"));
+        assert!(text.contains("\"s\":10000000,\"e\":20000000"));
+    }
+
+    #[test]
+    fn alignment_snap_up_duration_to_lattice() {
+        let quantum_ns = 10_000_000u64;
+        let cases = [
+            (0, 0),
+            (10_000_000, 10_000_000),
+            (10_000_001, 20_000_000),
+            (45_000_000, 50_000_000),
+            (7, 7),
+        ];
+        for (value, expect) in cases {
+            let q = if value == 7 { 1 } else { quantum_ns };
+            assert_eq!(snap_up(value, q), expect, "snap_up({value}, {q})");
+        }
+
+        let mut source = tiny();
+        source.channels[0].duration_ns = 45_000_000;
+        source.laps.clear();
+        let (bytes, opened) = write_alignment_jsonl(&source);
+        assert_eq!(opened.quantum_ns(), quantum_ns);
+        assert_eq!(opened.origin_ns(), 0);
+        assert_eq!(opened.duration_ns(), 50_000_000);
+        assert_eq!(opened.channels()[0].name, "Speed");
+        assert_eq!(opened.channels()[0].sample_count, 4);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"dur\":50000000"));
     }
 }

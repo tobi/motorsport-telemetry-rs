@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aim-telemetry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "memmap2",
  "motorsport-telemetry-core",
@@ -74,7 +74,7 @@ checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
 name = "cosworth-telemetry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "memmap2",
  "motorsport-telemetry-core",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "motec-telemetry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cosworth-telemetry",
  "memmap2",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "motorsport-telemetry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aim-telemetry",
  "cosworth-telemetry",
@@ -300,11 +300,11 @@ dependencies = [
 
 [[package]]
 name = "motorsport-telemetry-core"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "motorsport-track-atlas"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -372,7 +372,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "racelogic-telemetry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "memmap2",
  "motorsport-telemetry-core",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry-format"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "cosworth-telemetry",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry-passes"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "motorsport-telemetry-core",
  "telemetry-format",

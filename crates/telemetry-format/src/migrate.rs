@@ -18,6 +18,7 @@ pub fn apply(catalog: &mut Catalog) {
             6 => v6_to_v7(catalog),
             7 => v7_to_v8(catalog),
             8 => v8_to_v9(catalog),
+            9 => v9_to_v10(catalog),
             _ => break,
         }
         if catalog.format_version <= before {
@@ -106,6 +107,14 @@ fn v8_to_v9(catalog: &mut Catalog) {
     // whose source_path was lost to a pre-v9 rewrite stays as it is.
     catalog.passes.clear();
     catalog.format_version = 9;
+}
+
+fn v9_to_v10(catalog: &mut Catalog) {
+    // v10 adds signed int8 (SampleType::I8, sample-type code 0). No schema
+    // fields or zip members change. v1–v9 writers never emitted code 0, so
+    // there is nothing to reinterpret — the step only advances the version
+    // so the rewrite packs code 0 for any I8 channel the source exposes.
+    catalog.format_version = 10;
 }
 
 #[cfg(test)]

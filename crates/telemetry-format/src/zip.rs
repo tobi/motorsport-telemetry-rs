@@ -152,7 +152,11 @@ pub(crate) fn parse_members(data: &[u8]) -> Result<Vec<Member>, ZipError> {
     let mut members = Vec::new();
     let mut cursor = 0usize;
     while cursor + 4 <= data.len() {
-        let sig = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+        let sig = u32::from_le_bytes(
+            data.get(cursor..cursor + 4)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0; 4]),
+        );
         if sig != LOCAL_SIG {
             break;
         }
@@ -170,26 +174,70 @@ pub(crate) fn parse_members(data: &[u8]) -> Result<Vec<Member>, ZipError> {
 }
 
 /// Reads only the first STORE member. Independent of archive length.
-pub(crate) fn read_first_member(reader: &mut impl Read) -> Result<(String, Vec<u8>), ZipError> {
+///
+/// Requires `Seek` so the declared member size can be checked against the
+/// actual remaining bytes before any allocation — a 16-byte hostile file
+/// can otherwise request a multi-gigabyte buffer via the header u32.
+pub(crate) fn read_first_member(
+    reader: &mut (impl Read + Seek),
+) -> Result<(String, Vec<u8>), ZipError> {
+    use std::io::SeekFrom;
     let mut header = [0u8; 30];
     reader.read_exact(&mut header).map_err(io)?;
-    let sig = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let sig = u32::from_le_bytes(
+        header
+            .get(0..4)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 4]),
+    );
     if sig != LOCAL_SIG {
         return Err(ZipError("not a zip local header".into()));
     }
-    let method = u16::from_le_bytes(header[8..10].try_into().unwrap());
+    let method = u16::from_le_bytes(
+        header
+            .get(8..10)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 2]),
+    );
     if method != 0 {
         return Err(ZipError("only STORE zip members are allowed".into()));
     }
-    let name_len = u16::from_le_bytes(header[26..28].try_into().unwrap()) as usize;
-    let extra_len = u16::from_le_bytes(header[28..30].try_into().unwrap()) as usize;
+    let name_len = u16::from_le_bytes(
+        header
+            .get(26..28)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 2]),
+    ) as usize;
+    let extra_len = u16::from_le_bytes(
+        header
+            .get(28..30)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 2]),
+    ) as usize;
     let mut name = vec![0u8; name_len];
     reader.read_exact(&mut name).map_err(io)?;
     let mut extra = vec![0u8; extra_len];
     reader.read_exact(&mut extra).map_err(io)?;
-    let mut size = u32::from_le_bytes(header[22..26].try_into().unwrap()) as u64;
+    let mut size = u32::from_le_bytes(
+        header
+            .get(22..26)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 4]),
+    ) as u64;
     if size == u32::MAX as u64 {
         size = zip64_size(&extra)?;
+    }
+    // The true upper bound on a member is the remaining bytes in the file.
+    // A hostile header can declare gigabytes in a 16-byte file; reject that
+    // before allocating.
+    let pos = reader.stream_position().map_err(io)?;
+    let end = reader.seek(SeekFrom::End(0)).map_err(io)?;
+    reader.seek(SeekFrom::Start(pos)).map_err(io)?;
+    let available = end - pos;
+    if size > available {
+        return Err(ZipError(format!(
+            "declared member size {size} exceeds remaining file bytes {available}"
+        )));
     }
     let mut data =
         vec![0u8; usize::try_from(size).map_err(|_| ZipError("member too large".into()))?];
@@ -199,24 +247,47 @@ pub(crate) fn read_first_member(reader: &mut impl Read) -> Result<(String, Vec<u
 }
 
 fn parse_local(data: &[u8], at: usize) -> Result<(Member, usize), ZipError> {
-    if at + 30 > data.len() {
+    let at_end = at
+        .checked_add(30)
+        .ok_or_else(|| ZipError("local header offset overflow".into()))?;
+    if at_end > data.len() {
         return Err(ZipError("truncated local header".into()));
     }
-    let method = u16::from_le_bytes(data[at + 8..at + 10].try_into().unwrap());
+    let method = u16::from_le_bytes(
+        data.get(at + 8..at + 10)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 2]),
+    );
     if method != 0 {
         return Err(ZipError("only STORE zip members are allowed".into()));
     }
-    let name_len = u16::from_le_bytes(data[at + 26..at + 28].try_into().unwrap()) as usize;
-    let extra_len = u16::from_le_bytes(data[at + 28..at + 30].try_into().unwrap()) as usize;
+    let name_len = u16::from_le_bytes(
+        data.get(at + 26..at + 28)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 2]),
+    ) as usize;
+    let extra_len = u16::from_le_bytes(
+        data.get(at + 28..at + 30)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 2]),
+    ) as usize;
     let name_at = at + 30;
-    let extra_at = name_at + name_len;
-    let data_at = extra_at + extra_len;
+    let extra_at = name_at
+        .checked_add(name_len)
+        .ok_or_else(|| ZipError("zip member name length overflows".into()))?;
+    let data_at = extra_at
+        .checked_add(extra_len)
+        .ok_or_else(|| ZipError("zip member extra length overflows".into()))?;
     if data_at > data.len() {
         return Err(ZipError("truncated zip member header".into()));
     }
-    let mut size = u32::from_le_bytes(data[at + 22..at + 26].try_into().unwrap()) as u64;
+    let mut size = u32::from_le_bytes(
+        data.get(at + 22..at + 26)
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0; 4]),
+    ) as u64;
     if size == u32::MAX as u64 {
-        size = zip64_size(&data[extra_at..data_at])?;
+        size = zip64_size(data.get(extra_at..data_at).unwrap_or(&[]))?;
     }
     let end = data_at
         .checked_add(usize::try_from(size).map_err(|_| ZipError("member too large".into()))?)
@@ -227,7 +298,7 @@ fn parse_local(data: &[u8], at: usize) -> Result<(Member, usize), ZipError> {
     if data_at as u64 % ALIGN != 0 {
         return Err(ZipError("zip payload is not 64-byte aligned".into()));
     }
-    let name = std::str::from_utf8(&data[name_at..extra_at])
+    let name = std::str::from_utf8(data.get(name_at..extra_at).unwrap_or(&[]))
         .map_err(|_| ZipError("member name is not utf-8".into()))?
         .to_owned();
     Ok((
@@ -243,8 +314,18 @@ fn parse_local(data: &[u8], at: usize) -> Result<(Member, usize), ZipError> {
 fn zip64_size(extra: &[u8]) -> Result<u64, ZipError> {
     let mut cursor = 0;
     while cursor + 4 <= extra.len() {
-        let tag = u16::from_le_bytes(extra[cursor..cursor + 2].try_into().unwrap());
-        let len = u16::from_le_bytes(extra[cursor + 2..cursor + 4].try_into().unwrap()) as usize;
+        let tag = u16::from_le_bytes(
+            extra
+                .get(cursor..cursor + 2)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0; 2]),
+        );
+        let len = u16::from_le_bytes(
+            extra
+                .get(cursor + 2..cursor + 4)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0; 2]),
+        ) as usize;
         let start = cursor + 4;
         let end = start.saturating_add(len);
         if end > extra.len() {
@@ -252,7 +333,10 @@ fn zip64_size(extra: &[u8]) -> Result<u64, ZipError> {
         }
         if tag == ZIP64_EXTRA && len >= 8 {
             return Ok(u64::from_le_bytes(
-                extra[start..start + 8].try_into().unwrap(),
+                extra
+                    .get(start..start + 8)
+                    .and_then(|b| b.try_into().ok())
+                    .unwrap_or([0; 8]),
             ));
         }
         cursor = end;

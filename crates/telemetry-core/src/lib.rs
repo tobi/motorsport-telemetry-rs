@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+/// Errors, warnings, and notes reported while reading a recording.
+pub mod diag;
 /// How a channel should be drawn.
 pub mod display;
 /// Format-neutral file and session metadata derivation.
@@ -14,7 +16,10 @@ pub mod span;
 /// Race-time durations stored as integer milliseconds.
 pub mod timespan;
 pub mod units;
+/// Physical plausibility checks over a loaded source.
+pub mod validate;
 
+pub use diag::{Diagnostic, Diagnostics, Severity};
 pub use display::{ChannelDisplay, ChannelPlot};
 pub use metadata::{
     driver_histogram, group_sessions, read_source_metadata, schema_hash, AbsoluteTimeRange,
@@ -31,10 +36,13 @@ pub use units::{
     can_convert, convert, lookup as lookup_unit, normalize as normalize_unit, ConvertError,
     Dimension, UnitDef, UNITS,
 };
+pub use validate::{implies_decode_fault, validate_source, validate_source_with, ValidateOptions};
 
 /// Native scalar representation used by a telemetry channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleType {
+    /// Signed 8-bit integer.
+    I8,
     /// Unsigned 8-bit integer.
     U8,
     /// Signed 16-bit integer.
@@ -58,6 +66,7 @@ impl SampleType {
     /// reader's compatibility behavior.
     pub fn from_pds_code(code: u32) -> Self {
         match code {
+            0 => Self::I8,
             1 => Self::U8,
             2 => Self::I16,
             3 => Self::U16,
@@ -71,6 +80,7 @@ impl SampleType {
     /// Returns the stable numeric code used by schema hashing and PDS types.
     pub fn code(self) -> u32 {
         match self {
+            Self::I8 => 0,
             Self::U8 => 1,
             Self::I16 => 2,
             Self::U16 => 3,
@@ -84,7 +94,7 @@ impl SampleType {
     /// Returns the encoded width of one native sample in bytes.
     pub fn byte_width(self) -> usize {
         match self {
-            Self::U8 => 1,
+            Self::I8 | Self::U8 => 1,
             Self::I16 | Self::U16 => 2,
             Self::I32 | Self::U32 | Self::F32 => 4,
             Self::F64 => 8,
@@ -94,6 +104,7 @@ impl SampleType {
     /// Returns a stable lowercase display name such as `float32`.
     pub fn name(self) -> &'static str {
         match self {
+            Self::I8 => "int8",
             Self::U8 => "uint8",
             Self::I16 => "int16",
             Self::U16 => "uint16",
@@ -305,6 +316,21 @@ pub trait TelemetrySource: Send + Sync {
         &[]
     }
 
+    /// Problems this source recovered from while it was read, in the order
+    /// they were encountered.
+    ///
+    /// A reader that assumed, clamped, substituted, or dropped anything MUST
+    /// report it here. An empty slice is a positive claim: everything returned
+    /// is what the file stated. Recovery that is not reported here is
+    /// indistinguishable from correct data, which is how a misread sample
+    /// width once turned into speeds of 1.5e308 m/s.
+    ///
+    /// This reports what *reading* found. Physical plausibility of the values
+    /// is a separate judgement made by [`crate::validate::validate_source`].
+    fn diagnostics(&self) -> &[crate::Diagnostic] {
+        &[]
+    }
+
     /// Interval annotations on the file-relative timeline. Empty when none.
     fn spans(&self) -> &[crate::Span] {
         &[]
@@ -440,7 +466,9 @@ pub trait TelemetrySource: Send + Sync {
     /// Returns the file-relative timestamp for one native sample.
     fn sample_time_ns(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> u64 {
         let chunk = &self.channels()[channel_index].chunks[chunk_index];
-        chunk.time_base_ns + local_index * chunk.sample_period_ns
+        chunk
+            .time_base_ns
+            .saturating_add(local_index.saturating_mul(chunk.sample_period_ns))
     }
 
     /// Samples a channel at a file-relative timestamp.
@@ -462,6 +490,9 @@ pub trait TelemetrySource: Send + Sync {
                 <= time_ns
         });
         let chunk = channel.chunks.get(chunk_index)?;
+        if chunk.sample_count == 0 || chunk.sample_period_ns == 0 {
+            return None;
+        }
         let relative = time_ns.saturating_sub(chunk.time_base_ns);
         let sample = (relative / chunk.sample_period_ns).min(chunk.sample_count - 1);
         let a = self.decode(channel_index, chunk_index, sample);
@@ -469,11 +500,14 @@ pub trait TelemetrySource: Send + Sync {
             return Some(a);
         }
 
-        let sample_time = chunk.time_base_ns + sample * chunk.sample_period_ns;
-        let (b, next_time) = if sample + 1 < chunk.sample_count {
+        let sample_time = chunk
+            .time_base_ns
+            .saturating_add(sample.saturating_mul(chunk.sample_period_ns));
+        let next_sample = sample.saturating_add(1);
+        let (b, next_time) = if next_sample < chunk.sample_count {
             (
-                self.decode(channel_index, chunk_index, sample + 1),
-                sample_time + chunk.sample_period_ns,
+                self.decode(channel_index, chunk_index, next_sample),
+                sample_time.saturating_add(chunk.sample_period_ns),
             )
         } else if let Some(next_chunk) = channel.chunks.get(chunk_index + 1) {
             (
@@ -555,12 +589,22 @@ mod tests {
     }
 
     #[test]
+    fn pds_type_code_zero_is_signed_byte() {
+        let sample_type = SampleType::from_pds_code(0);
+        assert_eq!(sample_type, SampleType::I8);
+        assert_eq!(sample_type.code(), 0);
+        assert_eq!(sample_type.byte_width(), 1);
+        assert_eq!(sample_type.name(), "int8");
+    }
+
+    #[test]
     fn discrete_channels_use_step_interpolation_even_when_stored_as_float() {
         assert!(channel("Gear_Pos", SampleType::F32).uses_step_interpolation());
         assert!(channel("Lap Beacon", SampleType::F32).uses_step_interpolation());
         assert!(!channel("Speed_Ref", SampleType::F32).uses_step_interpolation());
         assert!(!channel("Speed_Ref", SampleType::F64).uses_step_interpolation());
         for sample_type in [
+            SampleType::I8,
             SampleType::U8,
             SampleType::I16,
             SampleType::U16,
@@ -577,5 +621,23 @@ mod tests {
         let float = two_sample_source(SampleType::F32);
         assert_eq!(integer.sample_at(0, 500_000_000, true), Some(10.0));
         assert_eq!(float.sample_at(0, 500_000_000, true), Some(15.0));
+    }
+    #[test]
+    fn corrupt_zero_period_and_count_do_not_panic_sampling() {
+        let mut zero_period = two_sample_source(SampleType::F32);
+        zero_period.channel.chunks[0].sample_period_ns = 0;
+        assert_eq!(zero_period.sample_at(0, 0, true), None);
+
+        let mut zero_count = two_sample_source(SampleType::F32);
+        zero_count.channel.chunks[0].sample_count = 0;
+        assert_eq!(zero_count.sample_at(0, 0, true), None);
+    }
+
+    #[test]
+    fn corrupt_sample_timestamp_arithmetic_saturates() {
+        let mut source = two_sample_source(SampleType::F32);
+        source.channel.chunks[0].time_base_ns = u64::MAX - 5;
+        source.channel.chunks[0].sample_period_ns = 10;
+        assert_eq!(source.sample_time_ns(0, 0, u64::MAX), u64::MAX);
     }
 }

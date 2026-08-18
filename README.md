@@ -24,6 +24,19 @@ provides offline circuit metadata and GPS-to-track matching.
 [`telemetry-passes`](crates/telemetry-passes) is the registry of named,
 versioned, lossless processing passes applied at conversion time.
 
+## CLI
+
+Install the release CLI for the current user:
+
+```sh
+make install
+```
+
+This writes `motorsport-telemetry` to `~/.local/bin`. Override `PREFIX` for a
+different installation root, for example
+`make install PREFIX=/usr/local` (normally with `sudo`) or use `DESTDIR` when
+staging a package.
+
 The facade crate includes a CLI. It memory-maps native recordings and
 does not decode video payloads:
 
@@ -75,6 +88,25 @@ println!("speed={:?} m/s", sample.speed_mps);
 Every format crate also exposes `Type::open(path)` for memory-mapped native
 input, `Type::from_bytes(name, bytes)` for owned input, and `read_metadata` /
 `read_metadata_from_bytes` when only the session summary is needed.
+
+Hard parse failures remain typed `Result` errors. Recoverable damage and every
+assumption/clamp/drop made by a reader are available through
+`recording.diagnostics()`. `recording.validate()` combines those findings with
+format-neutral checks for non-finite values, physically implausible values, and
+impossible packed sample footprints:
+
+```rust,no_run
+# use motorsport_telemetry::open;
+# let recording = open("run.pds")?;
+for diagnostic in recording.validate() {
+    eprintln!("{diagnostic}");
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The CLI prints the same report under `diagnostics:` in `inspect` (and as a JSON
+array under `--json`). `verify` returns non-zero for a proven decode-layout
+fault; ordinary warnings keep the file usable.
 
 `TelemetryFile::normalizer()` is intended for sampling loops. It resolves
 signal roles and track context once, and lazily computes lap metadata at most

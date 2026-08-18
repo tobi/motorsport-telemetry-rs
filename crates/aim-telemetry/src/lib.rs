@@ -11,7 +11,9 @@
 
 #[cfg(not(target_os = "emscripten"))]
 use memmap2::Mmap;
-use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
+use motorsport_telemetry_core::{
+    Channel, Chunk, Diagnostic, SampleType, TelemetrySource, UnitSource,
+};
 use std::collections::HashSet;
 #[cfg(not(target_os = "emscripten"))]
 use std::{fs::File, path::Path};
@@ -288,6 +290,21 @@ fn parse_track(
         child(data, stbl, b"stsc").ok_or_else(|| invalid(path, "aimd track has no stsc"))?;
     let stsc_count =
         be32(data, stsc_box.payload + 4).ok_or_else(|| invalid(path, "truncated stsc"))? as usize;
+    // Validate the declared entry count fits inside the stsc box before
+    // reserving. A mutated count of u32::MAX would otherwise reserve an
+    // out-of-memory vector before the read loop can reject it.
+    let stsc_entries_end = stsc_box
+        .payload
+        .checked_add(8)
+        .and_then(|start| {
+            stsc_count
+                .checked_mul(12)
+                .and_then(|size| start.checked_add(size))
+        })
+        .ok_or_else(|| invalid(path, "stsc entries overflow"))?;
+    if stsc_entries_end > stsc_box.end {
+        return Err(invalid(path, "truncated stsc entries"));
+    }
     let mut stsc = Vec::with_capacity(stsc_count);
     for i in 0..stsc_count {
         let at = stsc_box.payload + 8 + i * 12;
@@ -407,6 +424,17 @@ fn video_frame_times_ns(data: &[u8], path: &str) -> Result<Vec<u64>, AimError> {
                 be32(data, at).ok_or_else(|| invalid(path, "truncated video stts entries"))?;
             let delta =
                 be32(data, at + 4).ok_or_else(|| invalid(path, "truncated video stts entries"))?;
+            // Each video frame occupies at least one byte, so the frame count
+            // cannot exceed the file size. A mutated stts entry claiming
+            // billions of frames would otherwise reserve and fill an unbounded
+            // vector (denial of service / out of memory).
+            let next = decode_times.len().checked_add(samples as usize);
+            if next.is_none_or(|total| total > data.len()) {
+                return Err(invalid(
+                    path,
+                    "video stts declares more frames than the file can hold",
+                ));
+            }
             decode_times.reserve(samples as usize);
             for _ in 0..samples {
                 decode_times.push(time);
@@ -604,6 +632,8 @@ pub struct AimFile {
     video_frame_times_ns: Vec<u64>,
     presentation_offset_ns: Option<i128>,
     videos: Vec<motorsport_telemetry_core::VideoFileRef>,
+    /// Recovery diagnostics collected during parse.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Copy)]
@@ -631,8 +661,15 @@ fn tagged_blocks(sample: &[u8], tag: [u8; 3]) -> impl Iterator<Item = &[u8]> {
         let size = le32(sample, start + 6)? as usize;
         let payload = start.checked_add(12)?;
         let end = payload.checked_add(size)?;
+        // Bound the slice before indexing: `then_some` evaluates its argument
+        // eagerly, so the range check must gate the slice in a branch. A
+        // mutated `<h...>` block can advertise a size far past the sample end;
+        // stop at the first such block instead of slicing out of range.
+        if end > sample.len() {
+            return None;
+        }
         at = end;
-        (end <= sample.len()).then_some(&sample[payload..end])
+        Some(&sample[payload..end])
     })
 }
 
@@ -707,15 +744,21 @@ fn gps_channels(first_id: u32) -> Vec<(Channel, AimChannel)> {
     .collect()
 }
 
-fn schema(sample: &[u8], path: &str) -> Result<Vec<(Channel, AimChannel)>, AimError> {
+fn schema(
+    sample: &[u8],
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Vec<(Channel, AimChannel)>, AimError> {
     if sample.get(6..10) != Some(b"amv0") {
         return Err(invalid(path, "first aimd sample has no amv0 signature"));
     }
     let mut result = Vec::new();
     let mut seen = HashSet::new();
     let mut gps_record = None;
+    let mut chs_skipped = 0u32;
     for payload in tagged_blocks(sample, *b"CHS") {
         if payload.len() < 100 {
+            chs_skipped += 1;
             continue;
         }
         let record_id = le32(payload, 0).unwrap_or(u32::MAX);
@@ -727,6 +770,7 @@ fn schema(sample: &[u8], path: &str) -> Result<Vec<(Channel, AimChannel)>, AimEr
             continue;
         }
         if record_id > u16::MAX as u32 || name.is_empty() || !matches!(width, 1 | 4) {
+            chs_skipped += 1;
             continue;
         }
         if !seen.insert(record_id as u16) {
@@ -784,6 +828,15 @@ fn schema(sample: &[u8], path: &str) -> Result<Vec<(Channel, AimChannel)>, AimEr
         return Err(invalid(
             path,
             "aimd schema contains no supported scalar CHS records",
+        ));
+    }
+    if chs_skipped > 0 {
+        diagnostics.push(Diagnostic::warning(
+            "aim.chs_block_skipped",
+            format!(
+                "{chs_skipped} CHS schema block(s) skipped: payload too short, \
+                 record id past u16, empty name, or width not 1 or 4"
+            ),
         ));
     }
     Ok(result)
@@ -883,15 +936,38 @@ fn gps_record_start(packet: &[u8], mut at: usize) -> Option<usize> {
     None
 }
 
+/// Counters for repetitive recoveries during packet ingestion, aggregated
+/// into diagnostics after all packets are processed.
+#[derive(Default)]
+struct IngestStats {
+    /// Scalar records whose record id matched no defined channel.
+    unknown_record_id: u32,
+    /// Scalar records whose value was not terminated with `)` as expected.
+    value_unterminated: u32,
+    /// GPS records skipped for wrong size or truncation.
+    gps_skipped: u32,
+}
+
+struct IngestContext<'a> {
+    display: &'a str,
+    by_record: &'a RecordDispatch,
+    aim_channels: &'a mut [AimChannel],
+    stats: &'a mut IngestStats,
+}
+
 fn ingest_packet(
     data: &[u8],
     sample: (u64, u32),
-    display: &str,
-    by_record: &RecordDispatch,
-    aim_channels: &mut [AimChannel],
+    context: &mut IngestContext<'_>,
     has_gps: bool,
     gps_samples: &mut Vec<SampleRef>,
 ) -> Result<(), AimError> {
+    let IngestContext {
+        display,
+        by_record,
+        aim_channels,
+        stats,
+    } = context;
     let (offset, size) = sample;
     let packet = &data[offset as usize..offset as usize + size as usize];
     if be16(packet, 0).map(usize::from) != Some(packet.len().saturating_sub(2)) {
@@ -910,12 +986,14 @@ fn ingest_packet(
         let record_id = le16(packet, start + 6)
             .ok_or_else(|| invalid(display, "truncated AiM sample record"))?;
         let Some(index) = by_record.get(record_id) else {
+            stats.unknown_record_id += 1;
             at = start + 2;
             continue;
         };
         let width = aim_channels[index].width;
         let value = start + 8;
         if packet.get(value + width) != Some(&b')') {
+            stats.value_unterminated += 1;
             at = start + 2;
             continue;
         }
@@ -939,6 +1017,8 @@ fn ingest_packet(
                     time_ns: timestamp as u64 * 1_000_000,
                 });
             }
+        } else {
+            stats.gps_skipped += 1;
         }
         gps_at = end.max(header + 5);
     }
@@ -983,11 +1063,15 @@ fn ingest_lap_metadata_packet(
     data: &[u8],
     offset: u64,
     size: u32,
-    display: &str,
-    by_record: &RecordDispatch,
+    context: &mut IngestContext<'_>,
     lap_channels: &[bool],
-    aim_channels: &mut [AimChannel],
 ) -> Result<(), AimError> {
+    let IngestContext {
+        display,
+        by_record,
+        aim_channels,
+        stats,
+    } = context;
     let packet = &data[offset as usize..offset as usize + size as usize];
     if be16(packet, 0).map(usize::from) != Some(packet.len().saturating_sub(2)) {
         return Err(invalid(
@@ -1005,6 +1089,7 @@ fn ingest_lap_metadata_packet(
         let record_id = le16(packet, start + 6)
             .ok_or_else(|| invalid(display, "truncated AiM sample record"))?;
         let Some(index) = by_record.get(record_id) else {
+            stats.unknown_record_id += 1;
             at = start + 2;
             continue;
         };
@@ -1021,6 +1106,7 @@ fn ingest_lap_metadata_packet(
             });
             at = value + width + 1;
         } else {
+            stats.value_unterminated += 1;
             at = start + 2;
         }
     }
@@ -1120,7 +1206,8 @@ impl AimFile {
                 "aimd packet length does not match MP4 sample size",
             ));
         }
-        let definitions = schema(first_bytes, &display)?;
+        let mut diagnostics = Vec::new();
+        let definitions = schema(first_bytes, &display, &mut diagnostics)?;
         let (mut channels, mut aim_channels): (Vec<_>, Vec<_>) = definitions.into_iter().unzip();
         let available_samples = track.samples.len().saturating_sub(1);
         let preview_capacity = available_samples.min(INDEX_PACKET_SAMPLES);
@@ -1147,50 +1234,82 @@ impl AimFile {
             ParseMode::Full => available_samples,
             ParseMode::Index => preview_capacity,
         });
-
-        match mode {
-            ParseMode::Full => {
-                for &(offset, size) in track.samples.iter().skip(1) {
-                    ingest_packet(
-                        &data,
-                        (offset, size),
-                        &display,
-                        &by_record,
-                        &mut aim_channels,
-                        has_gps,
-                        &mut gps_samples,
-                    )?;
-                }
-            }
-            ParseMode::Index => {
-                let selected = index_packet_indexes(available_samples);
-                for &sample_index in &selected {
-                    let (offset, size) = track.samples[sample_index];
-                    ingest_packet(
-                        &data,
-                        (offset, size),
-                        &display,
-                        &by_record,
-                        &mut aim_channels,
-                        has_gps,
-                        &mut gps_samples,
-                    )?;
-                }
-                for (sample_index, &(offset, size)) in track.samples.iter().enumerate().skip(1) {
-                    if selected.binary_search(&sample_index).is_ok() {
-                        continue;
+        let mut stats = IngestStats::default();
+        {
+            let mut ingest = IngestContext {
+                display: &display,
+                by_record: &by_record,
+                aim_channels: &mut aim_channels,
+                stats: &mut stats,
+            };
+            match mode {
+                ParseMode::Full => {
+                    for &(offset, size) in track.samples.iter().skip(1) {
+                        ingest_packet(
+                            &data,
+                            (offset, size),
+                            &mut ingest,
+                            has_gps,
+                            &mut gps_samples,
+                        )?;
                     }
-                    ingest_lap_metadata_packet(
-                        &data,
-                        offset,
-                        size,
-                        &display,
-                        &by_record,
-                        &lap_channels,
-                        &mut aim_channels,
-                    )?;
+                }
+                ParseMode::Index => {
+                    let selected = index_packet_indexes(available_samples);
+                    for &sample_index in &selected {
+                        let (offset, size) = track.samples[sample_index];
+                        ingest_packet(
+                            &data,
+                            (offset, size),
+                            &mut ingest,
+                            has_gps,
+                            &mut gps_samples,
+                        )?;
+                    }
+                    for (sample_index, &(offset, size)) in track.samples.iter().enumerate().skip(1)
+                    {
+                        if selected.binary_search(&sample_index).is_ok() {
+                            continue;
+                        }
+                        ingest_lap_metadata_packet(
+                            &data,
+                            offset,
+                            size,
+                            &mut ingest,
+                            &lap_channels,
+                        )?;
+                    }
                 }
             }
+        }
+        if stats.unknown_record_id > 0 {
+            diagnostics.push(Diagnostic::warning(
+                "aim.unknown_record_id",
+                format!(
+                    "{} scalar record(s) matched no defined channel and were \
+                     skipped",
+                    stats.unknown_record_id
+                ),
+            ));
+        }
+        if stats.value_unterminated > 0 {
+            diagnostics.push(Diagnostic::warning(
+                "aim.value_unterminated",
+                format!(
+                    "{} scalar record value(s) were not terminated with ')' as \
+                     expected and were skipped",
+                    stats.value_unterminated
+                ),
+            ));
+        }
+        if stats.gps_skipped > 0 {
+            diagnostics.push(Diagnostic::warning(
+                "aim.gps_record_skipped",
+                format!(
+                    "{} GPS record(s) skipped for wrong size or truncation",
+                    stats.gps_skipped
+                ),
+            ));
         }
         if aim_channels
             .iter()
@@ -1253,6 +1372,7 @@ impl AimFile {
             video_frame_times_ns,
             presentation_offset_ns: track.presentation_offset_ns,
             videos,
+            diagnostics,
         })
     }
 }
@@ -1415,11 +1535,78 @@ impl TelemetrySource for AimFile {
     fn video_presentation_offset_ns(&self) -> Option<i128> {
         self.presentation_offset_ns
     }
+
+    fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn samples_at(times_ns: &[u64]) -> Vec<SampleRef> {
+        times_ns
+            .iter()
+            .copied()
+            .map(|time_ns| SampleRef {
+                value_offset: 0,
+                time_ns,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn period_chunks_keeps_millisecond_jitter_as_one_chunk() {
+        const PERIOD_NS: u64 = 10_000_000;
+        // Modal delta is 10 ms. ±1 ms logger jitter stays below 2×period.
+        let times = [
+            0,
+            10_000_000,
+            21_000_000,
+            31_000_000,
+            40_000_000,
+            50_000_000,
+            61_000_000,
+            71_000_000,
+            80_000_000,
+            90_000_000,
+            99_000_000,
+            109_000_000,
+        ];
+        let chunks = period_chunks(&samples_at(&times));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].sample_period_ns, PERIOD_NS);
+        assert_eq!(chunks[0].sample_count, times.len() as u64);
+        assert_eq!(chunks[0].time_base_ns, 0);
+        assert_eq!(chunks[0].sample_base, 0);
+    }
+
+    #[test]
+    fn period_chunks_splits_on_real_acquisition_gap() {
+        const PERIOD_NS: u64 = 10_000_000;
+        let times = [
+            0,
+            10_000_000,
+            20_000_000,
+            30_000_000,
+            40_000_000,
+            90_000_000,
+            100_000_000,
+            110_000_000,
+            120_000_000,
+        ];
+        let chunks = period_chunks(&samples_at(&times));
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].sample_period_ns, PERIOD_NS);
+        assert_eq!(chunks[0].sample_count, 5);
+        assert_eq!(chunks[0].time_base_ns, 0);
+        assert_eq!(chunks[0].sample_base, 0);
+        assert_eq!(chunks[1].sample_period_ns, PERIOD_NS);
+        assert_eq!(chunks[1].sample_count, 4);
+        assert_eq!(chunks[1].time_base_ns, 90_000_000);
+        assert_eq!(chunks[1].sample_base, 5);
+    }
 
     #[test]
     fn record_dispatch_handles_present_and_missing_ids_without_underflow() {
@@ -1759,7 +1946,8 @@ mod tests {
         sample.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         sample.extend_from_slice(&[1, b'>']);
         sample.extend_from_slice(&payload);
-        let parsed = schema(&sample, "fixture.mp4").unwrap();
+        let mut diag = Vec::new();
+        let parsed = schema(&sample, "fixture.mp4", &mut diag).unwrap();
         assert_eq!(parsed[0].0.name, "RPM");
         assert_eq!(parsed[0].1.record_id, 42);
         assert_eq!(parsed[0].1.width, 4);
@@ -1864,5 +2052,94 @@ mod tests {
             .unwrap();
         assert!(file.decode(latitude, 0, 0).is_nan());
         assert!(file.sample_at(latitude, 0, true).unwrap().is_nan());
+    }
+
+    #[test]
+    fn clean_fixture_reports_no_diagnostics() {
+        let bytes = fixture_mp4(true);
+        let file = AimFile::from_bytes("fixture.mp4", bytes).unwrap();
+        assert!(
+            file.diagnostics().is_empty(),
+            "unexpected diagnostics: {:?}",
+            file.diagnostics()
+        );
+    }
+
+    #[test]
+    fn warns_on_skipped_chs_block() {
+        let mut sample = vec![0, 0, 0x40, 0, 0, 0];
+        sample.extend_from_slice(b"amv0s1");
+        // A valid RPM block (width 4).
+        let mut payload = vec![0; 112];
+        payload[0..4].copy_from_slice(&42u32.to_le_bytes());
+        payload[24..27].copy_from_slice(b"RPM");
+        payload[32..35].copy_from_slice(b"RPM");
+        payload[72..76].copy_from_slice(&4u32.to_le_bytes());
+        sample.extend_from_slice(b"<hCHS\0");
+        sample.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        sample.extend_from_slice(&[1, b'>']);
+        sample.extend_from_slice(&payload);
+        // A block with width 3 — not 1 or 4, so it must be skipped.
+        let mut bad = vec![0; 112];
+        bad[0..4].copy_from_slice(&43u32.to_le_bytes());
+        bad[32..35].copy_from_slice(b"BAD");
+        bad[72..76].copy_from_slice(&3u32.to_le_bytes());
+        sample.extend_from_slice(b"<hCHS\0");
+        sample.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        sample.extend_from_slice(&[1, b'>']);
+        sample.extend_from_slice(&bad);
+        let mut diag = Vec::new();
+        let _ = schema(&sample, "fixture.mp4", &mut diag).unwrap();
+        assert!(diag.iter().any(|d| d.code == "aim.chs_block_skipped"));
+    }
+
+    #[test]
+    fn warns_on_unknown_record_id() {
+        let mut bytes = fixture_mp4(true);
+        let track = aimd_track(&bytes, "fixture.mp4").unwrap();
+        let vp = track.samples[1];
+        let packet = &bytes[vp.0 as usize..][..vp.1 as usize];
+        let start = scalar_record_start(packet, 10).unwrap();
+        // Replace record id 42 with 99, which matches no defined channel.
+        bytes[vp.0 as usize + start + 6..vp.0 as usize + start + 8]
+            .copy_from_slice(&99u16.to_le_bytes());
+        let file = AimFile::from_bytes("fixture.mp4", bytes).unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "aim.unknown_record_id"));
+    }
+
+    #[test]
+    fn warns_on_unterminated_value() {
+        let mut bytes = fixture_mp4(true);
+        let track = aimd_track(&bytes, "fixture.mp4").unwrap();
+        let vp = track.samples[1];
+        let packet = &bytes[vp.0 as usize..][..vp.1 as usize];
+        let start = scalar_record_start(packet, 10).unwrap();
+        // Replace the ')' terminator after the 4-byte f32 value with 'X'.
+        bytes[vp.0 as usize + start + 12] = b'X';
+        let file = AimFile::from_bytes("fixture.mp4", bytes).unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "aim.value_unterminated"));
+    }
+
+    #[test]
+    fn warns_on_gps_record_wrong_size() {
+        let mut bytes = fixture_mp4(true);
+        let track = aimd_track(&bytes, "fixture.mp4").unwrap();
+        let vp = track.samples[1];
+        let packet = &bytes[vp.0 as usize..][..vp.1 as usize];
+        let header = gps_record_start(packet, 0).unwrap();
+        // Change the GPS payload size from 56 to 55 so the record is skipped.
+        bytes[vp.0 as usize + header + 6..vp.0 as usize + header + 10]
+            .copy_from_slice(&55u32.to_le_bytes());
+        let file = AimFile::from_bytes("fixture.mp4", bytes).unwrap();
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "aim.gps_record_skipped"));
     }
 }

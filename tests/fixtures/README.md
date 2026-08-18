@@ -2,6 +2,13 @@
 
 Small deterministic files are committed for every supported format.
 
+`synthetic_cosworth.pds` is a 5 Hz Cosworth log driven along the Road
+America Full Course centerline from the offline `motorsport-track-atlas`
+dataset (`crates/motorsport-track-atlas/data/tracks.jsonl`). It has an
+out-lap from pit exit, three flying laps (lap 2 fastest), and an in-lap
+that peels off toward pit entry. Speed, throttle, brake, and g-force
+follow the straights and apexes; GPS is on that centerline.
+
 `synthetic_motec_multilap.ld` and its `.ldx` companion exercise realistic
 multi-rate lap telemetry: 100 Hz lap progression, 2 Hz lap state, partial
 opening/closing laps, an invalidated lap, sidecar beacons, and a shutdown
