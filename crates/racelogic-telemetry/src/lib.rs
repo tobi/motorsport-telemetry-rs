@@ -1,11 +1,10 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
-use memmap2::Mmap;
 use motorsport_telemetry_core::{
-    Channel, Chunk, Diagnostic, SampleType, TelemetrySource, UnitSource, VideoFileRef,
+    names, Channel, Chunk, Diagnostic, SampleTimes, SampleType, Storage, TelemetrySource,
+    UnitSource, VideoFileRef,
 };
-use std::fs::File;
 use std::path::Path;
 use thiserror::Error;
 
@@ -171,9 +170,7 @@ fn builtin_unit(name: &str) -> &'static str {
 
 fn metadata_channel(name: &str) -> bool {
     matches!(
-        name.to_ascii_lowercase()
-            .replace([' ', '_', '-'], "")
-            .as_str(),
+        names::normalize(name).as_str(),
         "time"
             | "tsample"
             | "latitude"
@@ -213,7 +210,6 @@ fn metadata_channel(name: &str) -> bool {
             | "competitionclass"
     )
 }
-
 impl RacelogicFile {
     /// Memory-maps the file and parses straight out of the mapping.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RacelogicError> {
@@ -231,17 +227,11 @@ impl RacelogicFile {
     fn open_mode(path: impl AsRef<Path>, metadata_only: bool) -> Result<Self, RacelogicError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
-        let file = File::open(path).map_err(|source| RacelogicError::Io {
+        let storage = Storage::open(path).map_err(|source| RacelogicError::Io {
             path: display.clone(),
             source,
         })?;
-        // SAFETY: the read-only mapping remains valid for this parse and
-        // callers must not truncate or rewrite the file concurrently.
-        let mapping = unsafe { Mmap::map(&file) }.map_err(|source| RacelogicError::Io {
-            path: display.clone(),
-            source,
-        })?;
-        Self::from_slice_mode(display, &mapping, metadata_only)
+        Self::from_slice_mode(display, &storage, metadata_only)
     }
 
     /// Parses VBO telemetry from an owned byte buffer.
@@ -375,9 +365,16 @@ impl RacelogicFile {
         }
         let time_column = short_names
             .iter()
-            .position(|name| name.eq_ignore_ascii_case("time"))
+            .position(|name| names::eq(name, "time"))
             .ok_or_else(|| invalid(&display, "no time column"))?;
-        let first = time_seconds(values[time_column][0]);
+        let first_raw = values[time_column][0];
+        if !first_raw.is_finite() {
+            return Err(invalid(
+                &display,
+                "first time value is not a finite number; cannot establish a timeline",
+            ));
+        }
+        let first = time_seconds(first_raw);
         let mut time_ns = Vec::with_capacity(rows);
         let mut rollover_corrections = 0u32;
         for value in &mut values[time_column] {
@@ -400,7 +397,7 @@ impl RacelogicFile {
         }
         let tsample_period = short_names
             .iter()
-            .position(|name| name.eq_ignore_ascii_case("tsample"))
+            .position(|name| names::eq(name, "tsample"))
             .and_then(|index| values[index].iter().copied().find(|value| *value > 0.0))
             .map(|seconds| (seconds * 1e9).round() as u64);
         let delta_period = time_ns
@@ -473,7 +470,7 @@ impl RacelogicFile {
                 duration_ns: if sampled { duration } else { 0 },
             });
         }
-        let videos = discover_videos(&display, &parsed.avi, &short_names, &values);
+        let videos = discover_videos(&parsed.avi, &short_names, &values);
         Ok(Self {
             path: display,
             channels,
@@ -488,12 +485,7 @@ impl RacelogicFile {
     }
 }
 
-fn discover_videos(
-    path: &str,
-    avi: &[&str],
-    short_names: &[&str],
-    values: &[Vec<f64>],
-) -> Vec<VideoFileRef> {
+fn discover_videos(avi: &[&str], short_names: &[&str], values: &[Vec<f64>]) -> Vec<VideoFileRef> {
     let prefix = avi.first().copied().unwrap_or("");
     let ext = avi
         .get(1)
@@ -501,11 +493,10 @@ fn discover_videos(
         .unwrap_or("avi")
         .trim_start_matches('.')
         .to_ascii_lowercase();
-    let parent = Path::new(path).parent();
     let mut indices = std::collections::BTreeSet::new();
     if let Some(column) = short_names
         .iter()
-        .position(|name| name.eq_ignore_ascii_case("avifileindex"))
+        .position(|name| names::eq(name, "avifileindex"))
     {
         for value in &values[column] {
             if value.is_finite() && *value >= 0.0 {
@@ -525,10 +516,6 @@ fn discover_videos(
             } else {
                 format!("{prefix}{index:04}.{ext}")
             };
-            let present = parent
-                .map(|dir| dir.join(&filename).is_file())
-                .unwrap_or(false);
-            let _ = present;
             VideoFileRef {
                 filename,
                 index,
@@ -554,7 +541,13 @@ impl TelemetrySource for RacelogicFile {
         &self.videos
     }
     fn decode(&self, channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
-        self.values[channel_index][local_index as usize]
+        let Some(values) = self.values.get(channel_index) else {
+            return f64::NAN;
+        };
+        let Some(index) = usize::try_from(local_index).ok() else {
+            return f64::NAN;
+        };
+        values.get(index).copied().unwrap_or(f64::NAN)
     }
     fn absolute_time_range(&self) -> Option<motorsport_telemetry_core::AbsoluteTimeRange> {
         let duration_ns = self
@@ -577,28 +570,15 @@ impl TelemetrySource for RacelogicFile {
             ..Default::default()
         }
     }
-    fn sample_time_ns(&self, _channel_index: usize, _chunk_index: usize, local_index: u64) -> u64 {
-        self.time_ns[local_index as usize]
-    }
-    fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
-        if time_ns >= self.channels[channel_index].duration_ns {
-            return None;
-        }
-        let upper = self.time_ns.partition_point(|time| *time <= time_ns);
-        let lower = upper.saturating_sub(1).min(self.time_ns.len() - 1);
-        let a = self.values[channel_index][lower];
-        if !linear
-            || self.channels[channel_index].uses_step_interpolation()
-            || upper >= self.time_ns.len()
+    fn sample_times(&self, channel_index: usize) -> SampleTimes<'_> {
+        if self
+            .channels
+            .get(channel_index)
+            .map_or(true, |c| c.sample_count == 0)
         {
-            return Some(a);
+            return SampleTimes::Explicit(&[]);
         }
-        let interval = self.time_ns[upper].saturating_sub(self.time_ns[lower]);
-        if interval == 0 {
-            return Some(a);
-        }
-        let fraction = time_ns.saturating_sub(self.time_ns[lower]) as f64 / interval as f64;
-        Some(a + (self.values[channel_index][upper] - a) * fraction)
+        SampleTimes::Explicit(&self.time_ns)
     }
 
     fn diagnostics(&self) -> &[Diagnostic] {

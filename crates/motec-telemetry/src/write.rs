@@ -74,6 +74,12 @@ pub enum MotecWriteError {
         /// Value rejected by the writer.
         value: String,
     },
+    /// A sample value cannot be encoded losslessly in the target LD type.
+    #[error("channel {channel:?}: value out of range for lossless encoding")]
+    ValueOutOfRange {
+        /// Source channel name.
+        channel: String,
+    },
     /// The source contains no sampled channels.
     #[error("nothing to write: source has no channels with samples")]
     Empty,
@@ -158,14 +164,44 @@ impl Encoded {
         }
     }
 
-    fn encode(self, value: f64, out: &mut Vec<u8>) {
+    fn encode(self, value: f64, channel: &str, out: &mut Vec<u8>) -> Result<(), MotecWriteError> {
         match (self.datatype_a, self.width) {
             (0x08, 8) => out.extend_from_slice(&value.to_le_bytes()),
-            (0x07, 4) => out.extend_from_slice(&(value as f32).to_le_bytes()),
-            (_, 2) => out.extend_from_slice(&(value as i16).to_le_bytes()),
-            (_, 4) => out.extend_from_slice(&(value as i32).to_le_bytes()),
+            (0x07, 4) => {
+                if !value.is_finite() || f64::from(value as f32) != value {
+                    return Err(MotecWriteError::ValueOutOfRange {
+                        channel: channel.to_owned(),
+                    });
+                }
+                out.extend_from_slice(&(value as f32).to_le_bytes());
+            }
+            (_, 2) => {
+                if !value.is_finite()
+                    || value.round() != value
+                    || value < i16::MIN as f64
+                    || value > i16::MAX as f64
+                {
+                    return Err(MotecWriteError::ValueOutOfRange {
+                        channel: channel.to_owned(),
+                    });
+                }
+                out.extend_from_slice(&(value as i16).to_le_bytes());
+            }
+            (_, 4) => {
+                if !value.is_finite()
+                    || value.round() != value
+                    || value < i32::MIN as f64
+                    || value > i32::MAX as f64
+                {
+                    return Err(MotecWriteError::ValueOutOfRange {
+                        channel: channel.to_owned(),
+                    });
+                }
+                out.extend_from_slice(&(value as i32).to_le_bytes());
+            }
             _ => unreachable!("unsupported encoding {self:?}"),
         }
+        Ok(())
     }
 }
 
@@ -270,11 +306,30 @@ fn flatten(
         }
         expected_time += chunk.sample_count * chunk.sample_period_ns;
     }
-
     let mut values = Vec::with_capacity(channel.sample_count as usize);
+    let (factor, bias) = source.sample_affine(index);
+    let width = channel.sample_type.byte_width();
+    let is_float = channel.sample_type.is_float();
     for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
-        for sample in 0..chunk.sample_count {
-            values.push(source.decode(index, chunk_index, sample));
+        if let Some(chunk_data) = source.chunk_bytes(index, chunk_index) {
+            for local in 0..chunk.sample_count {
+                let start = local as usize * width;
+                let raw = channel
+                    .sample_type
+                    .decode_le(&chunk_data[start..])
+                    .ok_or_else(|| {
+                        channel_error(name, "sample bytes shorter than the native width")
+                    })?;
+                values.push(if is_float {
+                    raw
+                } else {
+                    raw.mul_add(factor, bias)
+                });
+            }
+        } else {
+            for local in 0..chunk.sample_count {
+                values.push(source.decode(index, chunk_index, local));
+            }
         }
     }
     if values.len() as u64 != channel.sample_count {
@@ -358,11 +413,25 @@ pub fn write_motec_bytes(
         16,
     )?;
 
-    let data_ptr = META_PTR + channels.len() * CHANNEL_META_SIZE;
-    let data_bytes: usize = channels
-        .iter()
-        .map(|c| c.values.len() * c.encoding.width as usize)
-        .sum();
+    let data_ptr = META_PTR
+        .checked_add(
+            channels
+                .len()
+                .checked_mul(CHANNEL_META_SIZE)
+                .ok_or(MotecWriteError::TooLarge)?,
+        )
+        .ok_or(MotecWriteError::TooLarge)?;
+    let mut data_bytes = 0usize;
+    for channel in &channels {
+        let channel_bytes = channel
+            .values
+            .len()
+            .checked_mul(channel.encoding.width as usize)
+            .ok_or(MotecWriteError::TooLarge)?;
+        data_bytes = data_bytes
+            .checked_add(channel_bytes)
+            .ok_or(MotecWriteError::TooLarge)?;
+    }
     let total = data_ptr
         .checked_add(data_bytes)
         .ok_or(MotecWriteError::TooLarge)?;
@@ -446,7 +515,7 @@ pub fn write_motec_bytes(
     buffer.reserve(data_bytes);
     for channel in &channels {
         for &value in &channel.values {
-            channel.encoding.encode(value, &mut buffer);
+            channel.encoding.encode(value, &channel.name, &mut buffer)?;
         }
     }
     debug_assert_eq!(buffer.len(), total);

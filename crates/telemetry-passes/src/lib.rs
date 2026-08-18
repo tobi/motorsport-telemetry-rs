@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
-use motorsport_telemetry_core::{Channel, SampleType, TelemetrySource};
+use motorsport_telemetry_core::{SampleType, TelemetrySource};
 
 mod gps_clean;
 mod gps_quality;
@@ -10,7 +10,7 @@ mod speed_distance;
 
 pub use gps_clean::GpsClean;
 pub use gps_quality::GpsQuality;
-pub use source::PassedSource;
+pub use motorsport_telemetry_core::ViewSource;
 pub use speed_distance::SpeedDistance;
 
 /// Whether a pass can run against a given source.
@@ -26,7 +26,7 @@ pub enum Applicability {
 }
 
 /// One derived channel produced by a pass, before it is attached to a
-/// [`PassedSource`].
+/// [`ViewSource`].
 ///
 /// A derived channel mirrors an existing channel: it copies that channel's
 /// chunk layout and sample times exactly and supplies one new value per
@@ -172,6 +172,16 @@ pub enum PassError {
         /// Number of channels in the source.
         channel_count: usize,
     },
+    /// A derived channel has the same name as a channel that already
+    /// exists in the view. The pass is malformed; correct the output
+    /// channel names.
+    #[error("pass {pass} produced a channel named {name:?} that already exists in the source")]
+    DuplicateName {
+        /// Pass label.
+        pass: String,
+        /// Colliding channel name.
+        name: String,
+    },
     /// `derive` was called on a source that does not satisfy the pass's
     /// preconditions.
     #[error("pass {pass} precondition failed: {reason}")]
@@ -289,7 +299,7 @@ pub fn registry() -> Vec<Box<dyn TelemetryPass>> {
 /// re-derivation.
 pub fn apply_registry(
     source: &dyn TelemetrySource,
-) -> Result<(PassedSource<'_>, Vec<PassReport>), PassError> {
+) -> Result<(ViewSource<'_>, Vec<PassReport>), PassError> {
     apply_passes(source, &registry())
 }
 
@@ -301,8 +311,8 @@ pub fn apply_registry(
 pub fn apply_passes<'a>(
     source: &'a dyn TelemetrySource,
     passes: &[Box<dyn TelemetryPass>],
-) -> Result<(PassedSource<'a>, Vec<PassReport>), PassError> {
-    let mut passed = PassedSource::new(source);
+) -> Result<(ViewSource<'a>, Vec<PassReport>), PassError> {
+    let mut passed = ViewSource::new(source);
     let mut reports = Vec::with_capacity(passes.len());
     for pass in passes {
         let mut report = PassReport {
@@ -354,30 +364,41 @@ pub fn apply_passes<'a>(
             reports.push(report);
             continue;
         }
-        let outputs = passed.push(pass.name(), pass.version(), output)?;
+        let outputs = source::push_pass(&mut passed, pass.name(), pass.version(), output)?;
         report.outcome = PassOutcome::Applied { outputs };
         reports.push(report);
     }
     Ok((passed, reports))
 }
 
-/// Lowercase alphanumeric projection used for channel-name matching,
-/// mirroring the facade crate's `normalized_eq`.
-fn normalized(name: &str) -> String {
-    name.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|character| character.to_ascii_lowercase())
-        .collect()
-}
-
-/// Finds the first channel whose normalized name matches any of `names`,
-/// in `names` priority order.
-pub(crate) fn find_channel(channels: &[Channel], names: &[&str]) -> Option<usize> {
-    names.iter().find_map(|want| {
-        channels
-            .iter()
-            .position(|channel| normalized(&channel.name) == *want)
-    })
+/// Verifies that one channel's sample times are non-decreasing.
+///
+/// Passes that integrate over time or compare consecutive fixes treat a
+/// backwards timestamp as a precondition failure rather than silently
+/// integrating a zero interval. `check` calls this so `derive` can rely on
+/// monotonicity and use checked subtraction without special-casing the
+/// non-monotonic input.
+pub(crate) fn sample_times_monotonic(
+    source: &dyn TelemetrySource,
+    channel_index: usize,
+) -> Result<(), String> {
+    let channel = &source.channels()[channel_index];
+    let mut previous: Option<u64> = None;
+    for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
+        for local in 0..chunk.sample_count {
+            let time_ns = source.sample_time_ns(channel_index, chunk_index, local);
+            if previous.is_some_and(|earlier| time_ns < earlier) {
+                return Err(format!(
+                    "channel {:?} has non-monotonic sample times \
+                     (timestamp decreased at chunk {chunk_index} local {local}); \
+                     source timestamps must be non-decreasing",
+                    channel.name
+                ));
+            }
+            previous = Some(time_ns);
+        }
+    }
+    Ok(())
 }
 
 /// Checks that a latitude channel is plausibly decimal degrees.

@@ -5,11 +5,24 @@ use std::io::{Read, Seek, Write};
 const LOCAL_SIG: u32 = 0x0403_4b50;
 const CENTRAL_SIG: u32 = 0x0201_4b50;
 const EOCD_SIG: u32 = 0x0605_4b50;
+/// ZIP64 end-of-central-directory record signature.
+const ZIP64_EOCD_SIG: u32 = 0x0606_4b50;
+/// ZIP64 end-of-central-directory locator signature.
+const ZIP64_EOCD_LOC_SIG: u32 = 0x0706_4b50;
+/// Header ID for the ZIP64 extended information extra field.
 const ZIP64_EXTRA: u16 = 0x0001;
 const ALIGN: u64 = 64;
 
 #[derive(Debug)]
 pub(crate) struct ZipError(pub String);
+
+impl std::fmt::Display for ZipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ZipError {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Member {
@@ -131,21 +144,77 @@ impl<W: Write + Seek> ZipWriter<W> {
             self.inner.write_all(&extra).map_err(io)?;
         }
         let cd_size = self.inner.stream_position().map_err(io)? - cd_start;
-        let count = u16::try_from(self.entries.len()).unwrap_or(u16::MAX);
-        self.inner.write_all(&EOCD_SIG.to_le_bytes()).map_err(io)?;
-        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
-        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
-        self.inner.write_all(&count.to_le_bytes()).map_err(io)?;
-        self.inner.write_all(&count.to_le_bytes()).map_err(io)?;
-        self.inner
-            .write_all(&(cd_size as u32).to_le_bytes())
-            .map_err(io)?;
-        self.inner
-            .write_all(&(cd_start as u32).to_le_bytes())
-            .map_err(io)?;
-        self.inner.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        write_eocd(&mut self.inner, self.entries.len(), cd_size, cd_start)?;
         Ok(self.inner)
     }
+}
+/// Writes the end-of-central-directory record, emitting a ZIP64 EOCD record
+/// and locator (followed by the classic EOCD with sentinel values) when the
+/// archive exceeds the u16 entry count or the u32 central-directory size or
+/// offset. Otherwise the classic EOCD is written alone.
+fn write_eocd(
+    writer: &mut impl Write,
+    entries_len: usize,
+    cd_size: u64,
+    cd_start: u64,
+) -> Result<(), ZipError> {
+    let need_zip64 =
+        entries_len > u16::MAX as usize || cd_size > u32::MAX as u64 || cd_start > u32::MAX as u64;
+    if need_zip64 {
+        // The ZIP64 EOCD record sits immediately after the central directory.
+        let zip64_eocd_offset = cd_start
+            .checked_add(cd_size)
+            .ok_or_else(|| ZipError("central directory offset overflows u64".into()))?;
+        // ZIP64 EOCD record. The size field counts the bytes after itself
+        // (44): two version u16s, two disk u32s, two entry-count u64s, the
+        // central-directory size u64, and its offset u64.
+        writer
+            .write_all(&ZIP64_EOCD_SIG.to_le_bytes())
+            .map_err(io)?;
+        writer.write_all(&44u64.to_le_bytes()).map_err(io)?;
+        writer.write_all(&45u16.to_le_bytes()).map_err(io)?;
+        writer.write_all(&45u16.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0u32.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0u32.to_le_bytes()).map_err(io)?;
+        let total = u64::try_from(entries_len).map_err(|_| ZipError("too many entries".into()))?;
+        writer.write_all(&total.to_le_bytes()).map_err(io)?;
+        writer.write_all(&total.to_le_bytes()).map_err(io)?;
+        writer.write_all(&cd_size.to_le_bytes()).map_err(io)?;
+        writer.write_all(&cd_start.to_le_bytes()).map_err(io)?;
+        // ZIP64 EOCD locator.
+        writer
+            .write_all(&ZIP64_EOCD_LOC_SIG.to_le_bytes())
+            .map_err(io)?;
+        writer.write_all(&0u32.to_le_bytes()).map_err(io)?;
+        writer
+            .write_all(&zip64_eocd_offset.to_le_bytes())
+            .map_err(io)?;
+        writer.write_all(&1u32.to_le_bytes()).map_err(io)?;
+        // Classic EOCD with sentinel values pointing at the ZIP64 record.
+        writer.write_all(&EOCD_SIG.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0xFFFFu16.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0xFFFFu16.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0xFFFFu16.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0xFFFFu16.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0xFFFFFFFFu32.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0xFFFFFFFFu32.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0u16.to_le_bytes()).map_err(io)?;
+    } else {
+        let count = u16::try_from(entries_len).expect("checked by need_zip64");
+        writer.write_all(&EOCD_SIG.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        writer.write_all(&0u16.to_le_bytes()).map_err(io)?;
+        writer.write_all(&count.to_le_bytes()).map_err(io)?;
+        writer.write_all(&count.to_le_bytes()).map_err(io)?;
+        writer
+            .write_all(&(cd_size as u32).to_le_bytes())
+            .map_err(io)?;
+        writer
+            .write_all(&(cd_start as u32).to_le_bytes())
+            .map_err(io)?;
+        writer.write_all(&0u16.to_le_bytes()).map_err(io)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_members(data: &[u8]) -> Result<Vec<Member>, ZipError> {
@@ -383,5 +452,144 @@ mod tests {
         let (name, data) = read_first_member(&mut reader).unwrap();
         assert_eq!(name, "metadata.fb");
         assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn classic_eocd_records_count_and_offsets() {
+        // Two small entries: the central directory fits in u32 and the entry
+        // count fits in u16, so the classic EOCD is written without ZIP64.
+        let mut buf = Vec::new();
+        write_eocd(&mut buf, 2, 100, 200).unwrap();
+        // EOCD: 4 (sig) + 2 + 2 + 2 + 2 + 4 + 4 + 2 = 22 bytes, no ZIP64.
+        assert_eq!(buf.len(), 22);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), EOCD_SIG);
+        assert_eq!(u16::from_le_bytes(buf[4..6].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(buf[6..8].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(buf[8..10].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(buf[10..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(buf[12..16].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 200);
+        assert_eq!(u16::from_le_bytes(buf[20..22].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn zip64_eocd_emitted_when_entries_exceed_u16() {
+        // Mocked sizes: more than u16::MAX entries forces the ZIP64 path
+        // even though the central directory itself is small.
+        let cd_start = 200u64;
+        let cd_size = 100u64;
+        let mut buf = Vec::new();
+        write_eocd(&mut buf, u16::MAX as usize + 1, cd_size, cd_start).unwrap();
+        let zip64_eocd_offset = cd_start + cd_size;
+
+        // ZIP64 EOCD record (56 bytes).
+        let mut cursor = 0usize;
+        assert_eq!(
+            u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()),
+            ZIP64_EOCD_SIG
+        );
+        cursor += 4;
+        assert_eq!(
+            u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap()),
+            44
+        );
+        cursor += 8;
+        // version made by / needed.
+        assert_eq!(
+            u16::from_le_bytes(buf[cursor..cursor + 2].try_into().unwrap()),
+            45
+        );
+        cursor += 4;
+        // two disk u32s.
+        cursor += 8;
+        let total = u16::MAX as u64 + 1;
+        assert_eq!(
+            u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap()),
+            total
+        );
+        cursor += 8;
+        assert_eq!(
+            u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap()),
+            total
+        );
+        cursor += 8;
+        assert_eq!(
+            u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap()),
+            cd_size
+        );
+        cursor += 8;
+        assert_eq!(
+            u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap()),
+            cd_start
+        );
+        cursor += 8;
+        // ZIP64 EOCD locator (20 bytes).
+        assert_eq!(
+            u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()),
+            ZIP64_EOCD_LOC_SIG
+        );
+        cursor += 4;
+        cursor += 4; // disk number
+        assert_eq!(
+            u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap()),
+            zip64_eocd_offset
+        );
+        cursor += 8;
+        assert_eq!(
+            u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()),
+            1
+        );
+        cursor += 4;
+        // Classic EOCD with sentinel values.
+        assert_eq!(
+            u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()),
+            EOCD_SIG
+        );
+        cursor += 4;
+        assert_eq!(
+            u16::from_le_bytes(buf[cursor..cursor + 2].try_into().unwrap()),
+            0xFFFF
+        );
+        cursor += 8; // four u16 sentinels (disk/disk/entries/entries)
+        assert_eq!(
+            u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()),
+            0xFFFFFFFF
+        );
+        cursor += 4;
+        assert_eq!(
+            u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()),
+            0xFFFFFFFF
+        );
+        cursor += 4;
+        assert_eq!(
+            u16::from_le_bytes(buf[cursor..cursor + 2].try_into().unwrap()),
+            0
+        );
+        cursor += 2;
+        assert_eq!(cursor, buf.len());
+    }
+
+    #[test]
+    fn classic_path_still_round_trips() {
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(&mut cursor);
+        writer.write_member("metadata.fb", b"hello").unwrap();
+        writer
+            .write_member("channels/0000.bin", &[1, 2, 3, 4])
+            .unwrap();
+        writer.finish().unwrap();
+        let bytes = cursor.into_inner();
+        // The archive ends with a classic EOCD (no ZIP64) and parses back.
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[bytes.len() - 22..bytes.len() - 18]
+                    .try_into()
+                    .unwrap()
+            ),
+            EOCD_SIG
+        );
+        let members = parse_members(&bytes).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[1].size, 4);
     }
 }

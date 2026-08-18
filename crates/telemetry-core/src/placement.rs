@@ -5,7 +5,7 @@
 //! absolute axis: `utc_epoch_ns = file_relative_ns + utc_start_ns`.
 //! Timezone is for civil display only. It is never a join key.
 
-use motorsport_telemetry_core::{FileMetadata, TelemetrySource};
+use crate::{FileMetadata, TelemetrySource};
 use motorsport_track_atlas::timezone_for_venue;
 
 /// Resolves the IANA venue timezone without inventing one.
@@ -31,7 +31,7 @@ pub fn resolve_utc_start_ns(source: &dyn TelemetrySource, timezone: &str) -> Opt
     if let Some(utc) = source.utc_start_ns() {
         return Some(utc);
     }
-    let metadata = motorsport_telemetry_core::read_source_metadata(source);
+    let metadata = crate::read_source_metadata(source);
     utc_from_metadata(&metadata, timezone)
 }
 
@@ -47,11 +47,12 @@ pub fn utc_from_metadata(metadata: &FileMetadata, timezone: &str) -> Option<u64>
     )
 }
 
-pub(crate) fn utc_from_clock(
-    clock: Option<&str>,
-    start_ns: Option<u64>,
-    timezone: &str,
-) -> Option<u64> {
+/// Interprets one absolute clock's start nanoseconds as true UTC epoch ns.
+///
+/// `"gps"` is already Unix epoch. `"utc"` is civil time pretending to be UTC
+/// and is converted to true UTC only when `timezone` is known. All other
+/// (or missing) clocks return `None`.
+pub fn utc_from_clock(clock: Option<&str>, start_ns: Option<u64>, timezone: &str) -> Option<u64> {
     let start_ns = start_ns?;
     match clock? {
         "gps" => Some(start_ns),

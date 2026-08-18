@@ -1,20 +1,20 @@
 use motorsport_telemetry::motorsport_telemetry_core::{
-    validate::implies_decode_fault, validate_source_with, Diagnostic, Diagnostics, FileMetadata,
-    Severity, TelemetrySource, ValidateOptions,
+    names, Diagnostic, Diagnostics, FileMetadata, Severity, TelemetrySource,
 };
-use motorsport_telemetry::{open, TelemetryError, TelemetryFile};
-use racelogic_telemetry::RacelogicFile;
+use motorsport_telemetry::{
+    open, open_metadata, verify, SourceExt, TelemetryError, TelemetryFile, VerifyError, VerifyKind,
+    VerifyReport,
+};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use telemetry_format::{
     is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, needs_update, write_from_source,
     write_from_source_stripped, write_jsonl_extension_from_source_with,
-    write_jsonl_from_source_with, JsonlRecording, NativeRecording, FORMAT_VERSION,
+    write_jsonl_from_source_with, FORMAT_VERSION,
 };
 use telemetry_passes::{apply_registry, PassOutcome};
 
@@ -207,7 +207,15 @@ fn main() {
             let mut failed = 0usize;
             for path in &paths {
                 match verify(path) {
-                    Ok(report) => println!("{report}"),
+                    Ok(report) => println!("{}", format_verify_report(path, &report)),
+                    Err(VerifyError::DecodeFault(diagnostics)) => {
+                        failed += 1;
+                        eprintln!(
+                            "{}: FAIL  {}",
+                            path.display(),
+                            decode_fault_message(&diagnostics)
+                        );
+                    }
                     Err(error) => {
                         failed += 1;
                         eprintln!("{}: FAIL  {error}", path.display());
@@ -736,121 +744,51 @@ fn is_native_telemetry(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("telemetry"))
 }
 
-fn starts_with_zstd(path: &Path) -> bool {
-    let mut magic = [0u8; 4];
-    File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .is_ok()
-        && magic == [0x28, 0xB5, 0x2F, 0xFD]
-}
-
-fn verify(path: &Path) -> Result<String, String> {
-    if is_jsonl_path(path) {
-        verify_jsonl(path)
-    } else if is_native_telemetry(path) {
-        verify_native(path)
-    } else {
-        Err(
-            "verify accepts .telemetry, .telemetry.jsonl, and .zstd (not vendor source files)"
-                .into(),
-        )
-    }
-}
-
-fn verify_native(path: &Path) -> Result<String, String> {
-    let opened = NativeRecording::open_unchanged(path).map_err(|error| error.to_string())?;
-    let metadata = opened.metadata();
-    probe_samples(&opened)?;
-    let diagnostics = source_diagnostics(&opened, fs::metadata(path).ok().map(|meta| meta.len()));
-    if implies_decode_fault(&diagnostics) {
-        return Err(decode_fault_message(&diagnostics));
-    }
-    let stale = needs_update(metadata.format_version.unwrap_or(0));
-    let mut report = format!(
-        "{}: ok  native v{}  channels={} laps={} utc={}{}",
-        path.display(),
-        metadata.format_version.unwrap_or(0),
-        metadata.channel_count,
-        metadata.laps.len(),
-        metadata
-            .utc_start_ns
-            .map(|utc| utc.to_string())
-            .unwrap_or_else(|| "none".into()),
-        if stale {
-            format!("  needs_update (current v{FORMAT_VERSION})")
-        } else {
-            String::new()
+/// Formats a [`VerifyReport`] as the one-line `verify` success message.
+fn format_verify_report(path: &Path, report: &VerifyReport) -> String {
+    let utc = report
+        .utc_start_ns
+        .map(|utc| utc.to_string())
+        .unwrap_or_else(|| "none".into());
+    let mut out = match report.kind {
+        VerifyKind::Native => format!(
+            "{}: ok  native v{}  channels={} laps={} utc={}{}",
+            path.display(),
+            report.format_version.unwrap_or(0),
+            report.channels,
+            report.laps,
+            utc,
+            if report.needs_update {
+                format!("  needs_update (current v{FORMAT_VERSION})")
+            } else {
+                String::new()
+            }
+        ),
+        VerifyKind::Mtj | VerifyKind::Mtx => {
+            let kind = match report.kind {
+                VerifyKind::Mtj => "mtj",
+                _ => "mtx",
+            };
+            let extra = if matches!(report.kind, VerifyKind::Mtx) {
+                format!("  groups={}", report.sidecar_groups)
+            } else {
+                format!("  laps={}", report.laps)
+            };
+            format!(
+                "{}: ok  {kind}:{}{}  channels={} spans={} utc={} q={}{}",
+                path.display(),
+                report.jsonl_version.unwrap_or(0),
+                if report.compressed { "  zstd" } else { "" },
+                report.channels,
+                report.spans,
+                utc,
+                report.quantum_ns,
+                extra
+            )
         }
-    );
-    report.push_str(&format_diagnostics_block(diagnostics.items()));
-    Ok(report)
-}
-
-fn verify_jsonl(path: &Path) -> Result<String, String> {
-    let opened = JsonlRecording::open(path).map_err(|error| error.to_string())?;
-    probe_samples(&opened)?;
-    // JSONL is text: a sample is many bytes of text, not `byte_width`, so the
-    // file length bears no relation to the decoded footprint and the footprint
-    // check is skipped.
-    let diagnostics = source_diagnostics(&opened, None);
-    if implies_decode_fault(&diagnostics) {
-        return Err(decode_fault_message(&diagnostics));
-    }
-    let compressed = is_jsonl_zstd_path(path) || starts_with_zstd(path);
-    let kind = if opened.is_extension() { "mtx" } else { "mtj" };
-    let extra = if opened.is_extension() {
-        format!("  groups={}", opened.sidecar_groups().len())
-    } else {
-        format!("  laps={}", opened.metadata().laps.len())
     };
-    let mut report = format!(
-        "{}: ok  {kind}:{}{}  channels={} spans={} utc={} q={}{extra}",
-        path.display(),
-        if opened.is_extension() {
-            telemetry_format::JSONL_EXT_VERSION
-        } else {
-            telemetry_format::JSONL_VERSION
-        },
-        if compressed { "  zstd" } else { "" },
-        opened.channels().len(),
-        opened.spans().len(),
-        opened
-            .utc_start_ns()
-            .map(|utc| utc.to_string())
-            .unwrap_or_else(|| "none".into()),
-        opened.quantum_ns(),
-    );
-    report.push_str(&format_diagnostics_block(diagnostics.items()));
-    Ok(report)
-}
-
-fn probe_samples(source: &impl TelemetrySource) -> Result<(), String> {
-    for (index, channel) in source.channels().iter().enumerate() {
-        if channel.sample_count == 0 || channel.chunks.is_empty() {
-            continue;
-        }
-        let _ = source.decode(index, 0, 0);
-    }
-    Ok(())
-}
-
-/// Combines a source's reader diagnostics with the plausibility validator's
-/// findings.
-///
-/// `file_len` is the backing file's byte length for binary formats whose
-/// decoded samples correspond one-to-one to packed file bytes (native
-/// `.telemetry`); `None` for text formats such as JSONL, where the file
-/// length bears no relation to the decoded footprint and the footprint
-/// check would falsely fire on compact text.
-fn source_diagnostics(source: &dyn TelemetrySource, file_len: Option<u64>) -> Diagnostics {
-    let mut combined = Diagnostics::new();
-    combined.extend(source.diagnostics().iter().cloned());
-    let options = ValidateOptions {
-        file_len,
-        ..ValidateOptions::default()
-    };
-    combined.append(validate_source_with(source, options));
-    combined
+    out.push_str(&format_diagnostics_block(report.diagnostics.items()));
+    out
 }
 
 /// One-line count of diagnostics by severity, or `none` when empty.
@@ -915,15 +853,8 @@ fn decode_fault_message(diagnostics: &Diagnostics) -> String {
 fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryError> {
     let file = open_for_inspection(path)?;
     let metadata = file.metadata();
-    let gps_candidates = average_gps_candidates(&file);
-    let matched_gps = gps_candidates.iter().find_map(|&(latitude, longitude)| {
-        motorsport_telemetry::motorsport_track_atlas::match_track(latitude, longitude, 50_000.0)
-            .map(|matched| ((latitude, longitude), matched))
-    });
-    let track_gps = matched_gps
-        .map(|(gps, _)| gps)
-        .or_else(|| gps_candidates.first().copied());
-    let matched = matched_gps.map(|(_, matched)| matched);
+    let track = file.match_track();
+    let track_gps = track.as_ref().map(|context| context.gps);
     let (video_included, video_file_indices) = video_info(&file, &metadata);
     let video_filenames = if !metadata.videos.is_empty() {
         // Linked files recorded in the catalog (or header): the actual video
@@ -991,11 +922,14 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
         car_number,
         car_class,
         track_gps,
-        track_name: matched
-            .map(|matched| matched.track.name.to_owned())
+        track_name: track
+            .as_ref()
+            .map(|context| context.matched.track.name.to_owned())
             .or_else(|| nonempty(&identity.venue)),
-        layout: matched.map(|matched| matched.layout.name.to_owned()),
-        track_length_m: matched.and_then(|matched| matched.layout.length_m),
+        layout: track
+            .as_ref()
+            .map(|context| context.matched.layout.name.to_owned()),
+        track_length_m: track.and_then(|context| context.matched.layout.length_m),
         event_date: event_date.selected.map(|date| date.to_string()),
         event_date_source: event_date.source,
         event_date_warning: event_date.warning,
@@ -1188,9 +1122,7 @@ fn open_for_inspection(path: &Path) -> Result<TelemetryFile, motorsport_telemetr
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("vbo"))
     {
-        Ok(TelemetryFile::Racelogic(RacelogicFile::open_metadata(
-            path,
-        )?))
+        open_metadata(path)
     } else {
         open(path)
     }
@@ -1200,21 +1132,13 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_owned())
 }
 
-fn normalized_eq(value: &str, wanted: &str) -> bool {
-    value
-        .bytes()
-        .filter(u8::is_ascii_alphanumeric)
-        .map(|byte| byte.to_ascii_lowercase())
-        .eq(wanted.bytes())
-}
-
-fn first_semantic_value(file: &TelemetryFile, names: &[&str]) -> Option<String> {
-    let index = file.channels().iter().position(|channel| {
-        channel.sample_count > 0
-            && names
-                .iter()
-                .any(|wanted| normalized_eq(&channel.name, wanted))
-    })?;
+fn first_semantic_value(file: &TelemetryFile, candidates: &[&str]) -> Option<String> {
+    let channels = file.channels();
+    let index = names::find(channels, candidates)?;
+    let channel = &channels[index];
+    if channel.sample_count == 0 || channel.chunks.is_empty() {
+        return None;
+    }
     let value = file.decode(index, 0, 0);
     if !value.is_finite() {
         return None;
@@ -1226,112 +1150,8 @@ fn first_semantic_value(file: &TelemetryFile, names: &[&str]) -> Option<String> 
     })
 }
 
-fn coordinate(value: f64, unit: &str) -> Option<f64> {
-    match unit.trim().to_ascii_lowercase().as_str() {
-        "deg" | "degree" | "degrees" | "°" => Some(value),
-        "rad" | "radian" | "radians" => Some(value.to_degrees()),
-        _ => None,
-    }
-}
-
-fn packed_coordinate(value: f64, maximum_degrees: f64, reverse_sign: bool) -> Option<f64> {
-    let absolute = value.abs();
-    let degrees = (absolute / 100.0).floor();
-    let minutes = absolute - degrees * 100.0;
-    if !value.is_finite() || degrees > maximum_degrees || minutes >= 60.0 {
-        return None;
-    }
-    let sign = if value.is_sign_negative() { -1.0 } else { 1.0 };
-    Some((degrees + minutes / 60.0) * sign * if reverse_sign { -1.0 } else { 1.0 })
-}
-
-fn average_gps_candidates(file: &TelemetryFile) -> Vec<(f64, f64)> {
-    let roles = file.signal_roles();
-    let Some((latitude_index, longitude_index)) = roles.latitude.zip(roles.longitude) else {
-        return Vec::new();
-    };
-    let duration_ns = file.channels()[latitude_index]
-        .duration_ns
-        .min(file.channels()[longitude_index].duration_ns);
-    let mut latitude_sum = 0.0;
-    let mut longitude_sum = 0.0;
-    let mut count = 0u32;
-    for sample in 0..32u64 {
-        let time_ns = duration_ns.saturating_mul(sample) / 32;
-        let latitude = file.sample_at(latitude_index, time_ns, true);
-        let longitude = file.sample_at(longitude_index, time_ns, true);
-        if let Some((latitude, longitude)) = latitude.zip(longitude) {
-            if latitude.is_finite()
-                && longitude.is_finite()
-                && (latitude != 0.0 || longitude != 0.0)
-            {
-                latitude_sum += latitude;
-                longitude_sum += longitude;
-                count += 1;
-            }
-        }
-    }
-    if count == 0 {
-        return Vec::new();
-    }
-    let raw = (
-        latitude_sum / f64::from(count),
-        longitude_sum / f64::from(count),
-    );
-    let latitude_unit = file.channels()[latitude_index]
-        .unit
-        .trim()
-        .to_ascii_lowercase();
-    let longitude_unit = file.channels()[longitude_index]
-        .unit
-        .trim()
-        .to_ascii_lowercase();
-    let minutes = matches!(latitude_unit.as_str(), "min" | "arcmin" | "arcminute")
-        && matches!(longitude_unit.as_str(), "min" | "arcmin" | "arcminute");
-    let mut candidates = Vec::new();
-    if minutes {
-        if let Some(packed) =
-            packed_coordinate(raw.0, 90.0, false).zip(packed_coordinate(raw.1, 180.0, true))
-        {
-            candidates.push(packed);
-        } else {
-            let continuous = (raw.0 / 60.0, -raw.1 / 60.0);
-            if valid_gps(continuous) {
-                candidates.push(continuous);
-            }
-            // Some conversion tools export VBOX columns as decimal degrees
-            // while retaining the native column names. Keep that as a
-            // conservative fallback only when packed coordinates are invalid.
-            if valid_gps(raw) {
-                candidates.push(raw);
-            }
-        }
-    } else if let Some(converted) = coordinate(raw.0, &latitude_unit)
-        .zip(coordinate(raw.1, &longitude_unit))
-        .filter(|candidate| valid_gps(*candidate))
-    {
-        candidates.push(converted);
-    }
-    candidates.dedup_by(|left, right| {
-        (left.0 - right.0).abs() < 1e-10 && (left.1 - right.1).abs() < 1e-10
-    });
-    candidates
-}
-
-fn valid_gps((latitude, longitude): (f64, f64)) -> bool {
-    latitude.is_finite()
-        && longitude.is_finite()
-        && latitude.abs() <= 90.0
-        && longitude.abs() <= 180.0
-        && (latitude != 0.0 || longitude != 0.0)
-}
-
-fn channel_values(file: &TelemetryFile, names: &[&str]) -> Vec<f64> {
-    let Some(index) = file.channels().iter().position(|channel| {
-        names
-            .iter()
-            .any(|wanted| normalized_eq(&channel.name, wanted))
-    }) else {
+fn channel_values(file: &TelemetryFile, candidates: &[&str]) -> Vec<f64> {
+    let Some(index) = names::find(file.channels(), candidates) else {
         return Vec::new();
     };
     let mut values = Vec::new();
@@ -1735,16 +1555,6 @@ mod tests {
     fn formats_lap_time() {
         assert_eq!(format_duration(83_456_789_000), "1:23.456");
     }
-
-    #[test]
-    fn decodes_vbox_packed_coordinates_before_other_conventions() {
-        let latitude = packed_coordinate(3119.09973, 90.0, false).unwrap();
-        let longitude = packed_coordinate(58.49277, 180.0, true).unwrap();
-        assert!((latitude - 31.318_328_833_333_335).abs() < 1e-12);
-        assert!((longitude - -0.974_879_5).abs() < 1e-12);
-        assert_eq!(packed_coordinate(3190.0, 90.0, false), None);
-    }
-
     #[test]
     fn converts_unix_days_and_source_dates() {
         let date = CivilDate {

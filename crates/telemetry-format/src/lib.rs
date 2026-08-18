@@ -5,7 +5,6 @@ mod catalog;
 mod file;
 mod jsonl;
 mod migrate;
-mod placement;
 mod write;
 mod zip;
 
@@ -18,10 +17,7 @@ pub use jsonl::{
     write_jsonl_timeline_with, write_jsonl_to, HeaderChrome, JsonlRecording, SidecarGroup,
     SidecarHeader, Span, SpanPrimary, JSONL_EXT_VERSION, JSONL_VERSION, JSONL_ZSTD_LEVEL,
 };
-pub use migrate::apply as apply_migrations;
-pub use placement::{
-    civil_ns_to_utc_ns, resolve_timezone, resolve_utc_start_ns, utc_from_metadata,
-};
+pub use migrate::{apply as apply_migrations, MigrateError};
 pub use write::{
     write_from_source, write_from_source_stripped, write_from_source_version, TelemetryFormatError,
 };
@@ -369,16 +365,16 @@ mod tests {
             assert_eq!(opened.sample_affine(index), source.sample_affine(index));
         }
         let meta = opened.metadata();
-        let venue_tz = motorsport_track_atlas::timezone_for_venue(&source.identity().venue);
+        let venue_tz = motorsport_telemetry_core::placement::resolve_timezone(&source);
         assert_eq!(
             meta.timezone.as_str(),
-            venue_tz.unwrap_or(""),
+            venue_tz.as_str(),
             "timezone should come from the venue atlas, never invented"
         );
         if source.absolute_time_range().is_some() {
             // Motec stamps a civil "utc" clock; GPS clocks copy through.
             // Either way, a known zone or a gps clock should produce utc.
-            if venue_tz.is_some()
+            if !venue_tz.is_empty()
                 || source
                     .absolute_time_range()
                     .is_some_and(|clock| clock.clock == "gps")

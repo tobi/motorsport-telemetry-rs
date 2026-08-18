@@ -178,20 +178,32 @@ pub fn encode(catalog: &Catalog) -> Result<Vec<u8>, ZipError> {
         builder.end_table(start)
     };
 
-    let laps = builder.create_vector(&pack_laps(&catalog.laps, catalog.format_version));
-    let channels = builder.create_vector(&pack_channels(&catalog.channels));
-    let stints = builder.create_vector(&pack_stints(&catalog.driver_stints));
-    let videos = builder.create_vector(&pack_videos(&catalog.videos, catalog.format_version));
+    let laps = builder.create_vector(&pack_laps(&catalog.laps, catalog.format_version)?);
+    let channels = builder.create_vector(&pack_channels(&catalog.channels)?);
+    let stints = builder.create_vector(&pack_stints(&catalog.driver_stints)?);
+    let videos = builder.create_vector(&pack_videos(&catalog.videos, catalog.format_version)?);
     let visibility = (catalog.format_version >= 5)
         .then(|| builder.create_vector(&pack_visibility(&catalog.channels)));
-    let spans =
-        (catalog.format_version >= 5).then(|| builder.create_vector(&pack_spans(&catalog.spans)));
-    let labels = (catalog.format_version >= 6)
-        .then(|| builder.create_vector(&pack_labels(&catalog.channels)));
-    let display = (catalog.format_version >= 7)
-        .then(|| builder.create_vector(&pack_display(&catalog.channels)));
-    let passes = (catalog.format_version >= 9 && !catalog.passes.is_empty())
-        .then(|| builder.create_vector(&pack_passes(&catalog.passes)));
+    let spans = if catalog.format_version >= 5 {
+        Some(builder.create_vector(&pack_spans(&catalog.spans)?))
+    } else {
+        None
+    };
+    let labels = if catalog.format_version >= 6 {
+        Some(builder.create_vector(&pack_labels(&catalog.channels)?))
+    } else {
+        None
+    };
+    let display = if catalog.format_version >= 7 {
+        Some(builder.create_vector(&pack_display(&catalog.channels)?))
+    } else {
+        None
+    };
+    let passes = if catalog.format_version >= 9 && !catalog.passes.is_empty() {
+        Some(builder.create_vector(&pack_passes(&catalog.passes)?))
+    } else {
+        None
+    };
 
     let source_format = builder.create_string(&catalog.source_format);
     let source_path = builder.create_string(&catalog.source_path);
@@ -277,7 +289,7 @@ pub fn decode_valid_laps(bytes: &[u8]) -> Result<u32, ZipError> {
 /// Reads only the lap list from a catalog buffer. Does not unpack channels.
 pub fn decode_laps(bytes: &[u8]) -> Result<Vec<LapMetadata>, ZipError> {
     let table = root_table(bytes)?;
-    Ok(unpack_laps(&table.u8s(3), table.u16_field(0)))
+    unpack_laps(&table.u8s(3), table.u16_field(0))
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
@@ -295,18 +307,18 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         })
         .unwrap_or_default();
     let format_version = table.u16_field(0);
-    let laps = unpack_laps(&table.u8s(3), format_version);
-    let mut channels = unpack_channels(&table.u8s(4));
+    let laps = unpack_laps(&table.u8s(3), format_version)?;
+    let mut channels = unpack_channels(&table.u8s(4))?;
     if format_version >= 5 {
-        apply_visibility(&mut channels, &table.u8s(26));
+        apply_visibility(&mut channels, &table.u8s(26))?;
     }
     if format_version >= 6 {
-        apply_labels(&mut channels, &table.u8s(28));
+        apply_labels(&mut channels, &table.u8s(28))?;
     }
     if format_version >= 7 {
-        apply_display(&mut channels, &table.u8s(29));
+        apply_display(&mut channels, &table.u8s(29))?;
     }
-    let driver_stints = unpack_stints(&table.u8s(16));
+    let driver_stints = unpack_stints(&table.u8s(16))?;
     let clock = table.string(17).and_then(|name| {
         if name.is_empty() {
             None
@@ -319,6 +331,18 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
             })
         }
     });
+    let videos = unpack_videos(&table.u8s(20), format_version)?;
+    let spans = if format_version >= 5 {
+        unpack_spans(&table.u8s(27), format_version)?
+    } else {
+        Vec::new()
+    };
+    let passes_bytes = table.u8s(30);
+    let passes = if format_version >= 9 && !passes_bytes.is_empty() {
+        unpack_passes(&passes_bytes)?
+    } else {
+        Vec::new()
+    };
     Ok(Catalog {
         format_version,
         identity,
@@ -338,18 +362,10 @@ pub fn decode(bytes: &[u8]) -> Result<Catalog, ZipError> {
         utc_start_ns: (table.u32(23) != 0).then(|| table.u64(24)),
         timezone: table.string(25).unwrap_or_default(),
         driver_stints,
-        videos: unpack_videos(&table.u8s(20), format_version),
+        videos,
         presentation_offset_ns: (table.u32(21) != 0).then(|| i128::from(table.i64_field(22))),
-        spans: if format_version >= 5 {
-            unpack_spans(&table.u8s(27), format_version)
-        } else {
-            Vec::new()
-        },
-        passes: if format_version >= 9 {
-            unpack_passes(&table.u8s(30))
-        } else {
-            Vec::new()
-        },
+        spans,
+        passes,
     })
 }
 
@@ -535,11 +551,11 @@ impl<'a> Table<'a> {
     }
 }
 
-fn pack_videos(videos: &[VideoFileRef], format_version: u16) -> Vec<u8> {
+fn pack_videos(videos: &[VideoFileRef], format_version: u16) -> Result<Vec<u8>, ZipError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(videos.len() as u32).to_le_bytes());
+    pack_count(&mut out, videos.len())?;
     for video in videos {
-        pack_string(&mut out, &video.filename);
+        pack_string(&mut out, &video.filename)?;
         out.extend_from_slice(&video.index.to_le_bytes());
         match video.blake3 {
             Some(hash) => {
@@ -559,56 +575,58 @@ fn pack_videos(videos: &[VideoFileRef], format_version: u16) -> Vec<u8> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
-fn unpack_videos(bytes: &[u8], format_version: u16) -> Vec<VideoFileRef> {
-    let Some(count) = le_u32(bytes, 0) else {
-        return Vec::new();
-    };
-    let mut cursor = 4;
-    // Each video entry is at least 17 bytes (filename len + index + hashed
-    // flag + frame count), so a valid count never exceeds the remaining bytes
-    // divided by 17. Bounding the count prevents a mutated u32::MAX from
-    // driving an unbounded allocation or iteration; the read loop also
-    // bounds-breaks on missing bytes.
-    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 17);
-    let mut videos = Vec::with_capacity(count);
+fn unpack_videos(bytes: &[u8], format_version: u16) -> Result<Vec<VideoFileRef>, ZipError> {
+    let count = le_u32(bytes, 0).ok_or_else(|| ZipError("truncated video count".into()))? as usize;
+    let mut cursor = 4usize;
+    // Capacity is bounded for allocation safety; the loop iterates the
+    // declared count and errors on the first short read rather than silently
+    // truncating.
+    let mut videos = Vec::with_capacity(count.min(bytes.len().saturating_sub(cursor) / 17));
     for _ in 0..count {
-        let filename = unpack_string(bytes, &mut cursor);
-        let Some(index) = le_u32(bytes, cursor) else {
-            break;
-        };
-        cursor += 4;
-        let Some(hashed) = byte_at(bytes, cursor) else {
-            break;
-        };
-        cursor += 1;
+        let filename = unpack_string(bytes, &mut cursor)?;
+        let index =
+            le_u32(bytes, cursor).ok_or_else(|| ZipError("truncated video index".into()))?;
+        cursor = cursor
+            .checked_add(4)
+            .ok_or_else(|| ZipError("video cursor overflow".into()))?;
+        let hashed =
+            byte_at(bytes, cursor).ok_or_else(|| ZipError("truncated video hash flag".into()))?;
+        cursor = cursor
+            .checked_add(1)
+            .ok_or_else(|| ZipError("video cursor overflow".into()))?;
         let blake3 = if hashed != 0 {
-            let Some(bytes_slice) = bytes.get(cursor..cursor + 32) else {
-                break;
-            };
+            let bytes_slice = bytes
+                .get(cursor..cursor + 32)
+                .ok_or_else(|| ZipError("truncated video blake3".into()))?;
             let mut hash = [0u8; 32];
             hash.copy_from_slice(bytes_slice);
-            cursor += 32;
+            cursor = cursor
+                .checked_add(32)
+                .ok_or_else(|| ZipError("video cursor overflow".into()))?;
             Some(hash)
         } else {
             None
         };
-        let Some(frame_count) = le_u64(bytes, cursor) else {
-            break;
-        };
-        cursor += 8;
+        let frame_count =
+            le_u64(bytes, cursor).ok_or_else(|| ZipError("truncated video frame count".into()))?;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| ZipError("video cursor overflow".into()))?;
         let presentation_offset_ns = if format_version >= 3 {
-            let Some(present) = byte_at(bytes, cursor) else {
-                break;
-            };
-            cursor += 1;
+            let present = byte_at(bytes, cursor)
+                .ok_or_else(|| ZipError("truncated video offset flag".into()))?;
+            cursor = cursor
+                .checked_add(1)
+                .ok_or_else(|| ZipError("video cursor overflow".into()))?;
             if present != 0 {
-                let Some(offset) = le_i64(bytes, cursor) else {
-                    break;
-                };
-                cursor += 8;
+                let offset = le_i64(bytes, cursor)
+                    .ok_or_else(|| ZipError("truncated video offset".into()))?;
+                cursor = cursor
+                    .checked_add(8)
+                    .ok_or_else(|| ZipError("video cursor overflow".into()))?;
                 Some(i128::from(offset))
             } else {
                 None
@@ -624,12 +642,12 @@ fn unpack_videos(bytes: &[u8], format_version: u16) -> Vec<VideoFileRef> {
             presentation_offset_ns,
         });
     }
-    videos
+    Ok(videos)
 }
 
-fn pack_laps(laps: &[LapMetadata], format_version: u16) -> Vec<u8> {
+fn pack_laps(laps: &[LapMetadata], format_version: u16) -> Result<Vec<u8>, ZipError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(laps.len() as u32).to_le_bytes());
+    pack_count(&mut out, laps.len())?;
     for lap in laps {
         out.extend_from_slice(&lap.number.to_le_bytes());
         out.extend_from_slice(&lap.start_ns.to_le_bytes());
@@ -646,48 +664,43 @@ fn pack_laps(laps: &[LapMetadata], format_version: u16) -> Vec<u8> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
-fn unpack_laps(bytes: &[u8], format_version: u16) -> Vec<LapMetadata> {
-    let Some(count) = le_u32(bytes, 0) else {
-        return Vec::new();
-    };
-    let mut cursor = 4;
-    // Each lap entry is at least 33 bytes (number + start + end + duration +
-    // complete flag), so a valid count never exceeds the remaining bytes
-    // divided by 33. Bounds the allocation and iteration against a mutated
-    // u32::MAX; the read loop also bounds-breaks on missing bytes.
-    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 33);
-    let mut laps = Vec::with_capacity(count);
+fn unpack_laps(bytes: &[u8], format_version: u16) -> Result<Vec<LapMetadata>, ZipError> {
+    let count = le_u32(bytes, 0).ok_or_else(|| ZipError("truncated lap count".into()))? as usize;
+    let mut cursor = 4usize;
+    // Each lap entry is at least 33 bytes; the capacity is bounded for
+    // allocation safety, but the loop iterates the declared count and errors
+    // on the first short read instead of silently truncating.
+    let mut laps = Vec::with_capacity(count.min(bytes.len().saturating_sub(cursor) / 33));
     for _ in 0..count {
-        let Some(number) = le_i64(bytes, cursor) else {
-            break;
-        };
-        let Some(start_ns) = le_u64(bytes, cursor + 8) else {
-            break;
-        };
-        let Some(end_ns) = le_u64(bytes, cursor + 16) else {
-            break;
-        };
-        let Some(duration_ns) = le_u64(bytes, cursor + 24) else {
-            break;
-        };
-        let Some(complete_byte) = byte_at(bytes, cursor + 32) else {
-            break;
-        };
+        let number =
+            le_i64(bytes, cursor).ok_or_else(|| ZipError("truncated lap number".into()))?;
+        let start_ns =
+            le_u64(bytes, cursor + 8).ok_or_else(|| ZipError("truncated lap start".into()))?;
+        let end_ns =
+            le_u64(bytes, cursor + 16).ok_or_else(|| ZipError("truncated lap end".into()))?;
+        let duration_ns =
+            le_u64(bytes, cursor + 24).ok_or_else(|| ZipError("truncated lap duration".into()))?;
+        let complete_byte =
+            byte_at(bytes, cursor + 32).ok_or_else(|| ZipError("truncated lap complete".into()))?;
         let complete = complete_byte != 0;
-        cursor += 33;
+        cursor = cursor
+            .checked_add(33)
+            .ok_or_else(|| ZipError("lap cursor overflow".into()))?;
         let first_video_frame = if format_version >= 3 {
-            let Some(present) = byte_at(bytes, cursor) else {
-                break;
-            };
-            cursor += 1;
+            let present = byte_at(bytes, cursor)
+                .ok_or_else(|| ZipError("truncated lap video flag".into()))?;
+            cursor = cursor
+                .checked_add(1)
+                .ok_or_else(|| ZipError("lap cursor overflow".into()))?;
             if present != 0 {
-                let Some(frame) = le_u64(bytes, cursor) else {
-                    break;
-                };
-                cursor += 8;
+                let frame = le_u64(bytes, cursor)
+                    .ok_or_else(|| ZipError("truncated lap video frame".into()))?;
+                cursor = cursor
+                    .checked_add(8)
+                    .ok_or_else(|| ZipError("lap cursor overflow".into()))?;
                 Some(frame)
             } else {
                 None
@@ -704,81 +717,95 @@ fn unpack_laps(bytes: &[u8], format_version: u16) -> Vec<LapMetadata> {
             first_video_frame,
         });
     }
-    laps
+    Ok(laps)
 }
 
-fn pack_stints(stints: &[DriverStint]) -> Vec<u8> {
+fn pack_stints(stints: &[DriverStint]) -> Result<Vec<u8>, ZipError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(stints.len() as u32).to_le_bytes());
+    pack_count(&mut out, stints.len())?;
     for stint in stints {
         out.extend_from_slice(&stint.driver_id.to_le_bytes());
         out.extend_from_slice(&stint.start_ns.to_le_bytes());
         out.extend_from_slice(&stint.end_ns.to_le_bytes());
     }
-    out
+    Ok(out)
 }
 
-fn unpack_stints(bytes: &[u8]) -> Vec<DriverStint> {
-    let Some(count) = le_u32(bytes, 0) else {
-        return Vec::new();
-    };
-    let mut cursor = 4;
-    // Each stint is 24 bytes, so a valid count never exceeds the remaining
-    // bytes divided by 24. Bounding the count prevents a mutated u32::MAX
-    // from driving an unbounded allocation or iteration; the read loop also
-    // bounds-breaks on missing bytes.
-    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 24);
-    let mut stints = Vec::with_capacity(count);
+fn unpack_stints(bytes: &[u8]) -> Result<Vec<DriverStint>, ZipError> {
+    let count = le_u32(bytes, 0).ok_or_else(|| ZipError("truncated stint count".into()))? as usize;
+    let mut cursor = 4usize;
+    // Each stint is 24 bytes; capacity is bounded for allocation safety, but
+    // the loop iterates the declared count and errors on a short read.
+    let mut stints = Vec::with_capacity(count.min(bytes.len().saturating_sub(cursor) / 24));
     for _ in 0..count {
-        let Some(driver_id) = le_i64(bytes, cursor) else {
-            break;
-        };
-        let Some(start_ns) = le_u64(bytes, cursor + 8) else {
-            break;
-        };
-        let Some(end_ns) = le_u64(bytes, cursor + 16) else {
-            break;
-        };
+        let driver_id =
+            le_i64(bytes, cursor).ok_or_else(|| ZipError("truncated stint driver".into()))?;
+        let start_ns =
+            le_u64(bytes, cursor + 8).ok_or_else(|| ZipError("truncated stint start".into()))?;
+        let end_ns =
+            le_u64(bytes, cursor + 16).ok_or_else(|| ZipError("truncated stint end".into()))?;
         stints.push(DriverStint {
             driver_id,
             start_ns,
             end_ns,
         });
-        cursor += 24;
+        cursor = cursor
+            .checked_add(24)
+            .ok_or_else(|| ZipError("stint cursor overflow".into()))?;
     }
-    stints
+    Ok(stints)
 }
 
-fn pack_string(out: &mut Vec<u8>, value: &str) {
+fn pack_count(out: &mut Vec<u8>, count: usize) -> Result<(), ZipError> {
+    out.extend_from_slice(
+        &u32::try_from(count)
+            .map_err(|_| ZipError("catalog has too many entries for u32".into()))?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+
+fn pack_string(out: &mut Vec<u8>, value: &str) -> Result<(), ZipError> {
     let bytes = value.as_bytes();
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(bytes.len())
+            .map_err(|_| ZipError("catalog string too long for u32".into()))?
+            .to_le_bytes(),
+    );
     out.extend_from_slice(bytes);
+    Ok(())
 }
 
-fn unpack_string(bytes: &[u8], cursor: &mut usize) -> String {
-    let Some(len) = le_u32(bytes, *cursor) else {
-        return String::new();
-    };
-    *cursor += 4;
+fn unpack_string(bytes: &[u8], cursor: &mut usize) -> Result<String, ZipError> {
+    let len = le_u32(bytes, *cursor).ok_or_else(|| ZipError("truncated string length".into()))?;
+    *cursor = cursor
+        .checked_add(4)
+        .ok_or_else(|| ZipError("string length cursor overflow".into()))?;
+    let len_us =
+        usize::try_from(len).map_err(|_| ZipError("string length overflows usize".into()))?;
     let end = cursor
-        .checked_add(len as usize)
-        .unwrap_or(bytes.len())
-        .min(bytes.len());
-    let value = String::from_utf8_lossy(bytes.get(*cursor..end).unwrap_or_default()).into_owned();
+        .checked_add(len_us)
+        .ok_or_else(|| ZipError("string length overflows cursor".into()))?;
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| ZipError("truncated string body".into()))?;
+    let value = std::str::from_utf8(slice)
+        .map_err(|_| ZipError("catalog string is not valid UTF-8".into()))?
+        .to_owned();
     *cursor = end;
-    value
+    Ok(value)
 }
 
-fn pack_channels(channels: &[CatalogChannel]) -> Vec<u8> {
+fn pack_channels(channels: &[CatalogChannel]) -> Result<Vec<u8>, ZipError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(channels.len() as u32).to_le_bytes());
+    pack_count(&mut out, channels.len())?;
     for channel in channels {
         out.extend_from_slice(&channel.id.to_le_bytes());
-        pack_string(&mut out, &channel.name);
-        pack_string(&mut out, &channel.member);
-        pack_string(&mut out, &channel.time_member);
-        pack_string(&mut out, &channel.unit_raw);
-        pack_string(&mut out, &channel.unit_canonical);
+        pack_string(&mut out, &channel.name)?;
+        pack_string(&mut out, &channel.member)?;
+        pack_string(&mut out, &channel.time_member)?;
+        pack_string(&mut out, &channel.unit_raw)?;
+        pack_string(&mut out, &channel.unit_canonical)?;
         out.push(unit_source_code(channel.unit_source));
         out.push(channel.dimension);
         out.push(channel.sample_type.code() as u8);
@@ -788,7 +815,7 @@ fn pack_channels(channels: &[CatalogChannel]) -> Vec<u8> {
         out.extend_from_slice(&channel.bias.to_le_bytes());
         out.extend_from_slice(&channel.sample_count.to_le_bytes());
         out.extend_from_slice(&channel.duration_ns.to_le_bytes());
-        out.extend_from_slice(&(channel.chunks.len() as u32).to_le_bytes());
+        pack_count(&mut out, channel.chunks.len())?;
         for chunk in &channel.chunks {
             out.extend_from_slice(&chunk.sample_period_ns.to_le_bytes());
             out.extend_from_slice(&chunk.sample_count.to_le_bytes());
@@ -796,89 +823,83 @@ fn pack_channels(channels: &[CatalogChannel]) -> Vec<u8> {
             out.extend_from_slice(&chunk.time_base_ns.to_le_bytes());
         }
     }
-    out
+    Ok(out)
 }
 
-fn unpack_channels(bytes: &[u8]) -> Vec<CatalogChannel> {
-    let Some(count) = le_u32(bytes, 0) else {
-        return Vec::new();
-    };
-    let mut cursor = 4;
-    // Each channel entry is at least 65 bytes (id + five string lengths +
-    // five flag bytes + scale + bias + sample_count + duration + chunk_count),
-    // so a valid count never exceeds the remaining bytes divided by 65. Bounds
-    // allocation and iteration against a mutated u32::MAX; the read loop also
-    // bounds-breaks on missing bytes.
-    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 65);
-    let mut channels = Vec::with_capacity(count);
+fn unpack_channels(bytes: &[u8]) -> Result<Vec<CatalogChannel>, ZipError> {
+    let count =
+        le_u32(bytes, 0).ok_or_else(|| ZipError("truncated channel count".into()))? as usize;
+    let mut cursor = 4usize;
+    // Each channel entry is at least 65 bytes; capacity is bounded for
+    // allocation safety, but the loop iterates the declared count and errors
+    // on the first short read instead of silently truncating.
+    let mut channels = Vec::with_capacity(count.min(bytes.len().saturating_sub(cursor) / 65));
     for _ in 0..count {
-        let Some(id) = le_u32(bytes, cursor) else {
-            break;
-        };
-        cursor += 4;
-        let name = unpack_string(bytes, &mut cursor);
-        let member = unpack_string(bytes, &mut cursor);
-        let time_member = unpack_string(bytes, &mut cursor);
-        let unit_raw = unpack_string(bytes, &mut cursor);
-        let unit_canonical = unpack_string(bytes, &mut cursor);
-        let Some(unit_source_byte) = byte_at(bytes, cursor) else {
-            break;
-        };
-        let Some(dimension_byte) = byte_at(bytes, cursor + 1) else {
-            break;
-        };
-        let Some(sample_type_byte) = byte_at(bytes, cursor + 2) else {
-            break;
-        };
-        let Some(uses_step_byte) = byte_at(bytes, cursor + 3) else {
-            break;
-        };
-        let Some(kind_byte) = byte_at(bytes, cursor + 4) else {
-            break;
-        };
+        let id = le_u32(bytes, cursor).ok_or_else(|| ZipError("truncated channel id".into()))?;
+        cursor = cursor
+            .checked_add(4)
+            .ok_or_else(|| ZipError("channel cursor overflow".into()))?;
+        let name = unpack_string(bytes, &mut cursor)?;
+        let member = unpack_string(bytes, &mut cursor)?;
+        let time_member = unpack_string(bytes, &mut cursor)?;
+        let unit_raw = unpack_string(bytes, &mut cursor)?;
+        let unit_canonical = unpack_string(bytes, &mut cursor)?;
+        let unit_source_byte =
+            byte_at(bytes, cursor).ok_or_else(|| ZipError("truncated channel flags".into()))?;
+        let dimension_byte =
+            byte_at(bytes, cursor + 1).ok_or_else(|| ZipError("truncated channel flags".into()))?;
+        let sample_type_byte =
+            byte_at(bytes, cursor + 2).ok_or_else(|| ZipError("truncated channel flags".into()))?;
+        let uses_step_byte =
+            byte_at(bytes, cursor + 3).ok_or_else(|| ZipError("truncated channel flags".into()))?;
+        let kind_byte =
+            byte_at(bytes, cursor + 4).ok_or_else(|| ZipError("truncated channel flags".into()))?;
         let unit_source = unit_source_from(unit_source_byte);
         let dimension = dimension_byte;
         let sample_type = sample_type_from(sample_type_byte);
         let uses_step = uses_step_byte != 0;
         let kind = kind_byte;
-        cursor += 5;
-        let Some(scale) = le_f64(bytes, cursor) else {
-            break;
-        };
-        cursor += 8;
-        let Some(bias) = le_f64(bytes, cursor) else {
-            break;
-        };
-        cursor += 8;
-        let Some(sample_count) = le_u64(bytes, cursor) else {
-            break;
-        };
-        cursor += 8;
-        let Some(duration_ns) = le_u64(bytes, cursor) else {
-            break;
-        };
-        cursor += 8;
-        let Some(chunk_count) = le_u32(bytes, cursor) else {
-            break;
-        };
-        cursor += 4;
-        // Each chunk is 32 bytes; bound the count by the remaining bytes so a
-        // mutated u32::MAX cannot drive unbounded allocation or iteration.
-        let chunk_count = (chunk_count as usize).min(bytes.len().saturating_sub(cursor) / 32);
-        let mut chunks = Vec::with_capacity(chunk_count);
+        cursor = cursor
+            .checked_add(5)
+            .ok_or_else(|| ZipError("channel cursor overflow".into()))?;
+        let scale =
+            le_f64(bytes, cursor).ok_or_else(|| ZipError("truncated channel scale".into()))?;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| ZipError("channel cursor overflow".into()))?;
+        let bias =
+            le_f64(bytes, cursor).ok_or_else(|| ZipError("truncated channel bias".into()))?;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| ZipError("channel cursor overflow".into()))?;
+        let sample_count = le_u64(bytes, cursor)
+            .ok_or_else(|| ZipError("truncated channel sample count".into()))?;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| ZipError("channel cursor overflow".into()))?;
+        let duration_ns =
+            le_u64(bytes, cursor).ok_or_else(|| ZipError("truncated channel duration".into()))?;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| ZipError("channel cursor overflow".into()))?;
+        let chunk_count =
+            le_u32(bytes, cursor).ok_or_else(|| ZipError("truncated chunk count".into()))? as usize;
+        cursor = cursor
+            .checked_add(4)
+            .ok_or_else(|| ZipError("channel cursor overflow".into()))?;
+        // Each chunk is 32 bytes; capacity is bounded for allocation safety,
+        // but the loop iterates the declared count and errors on a short read.
+        let mut chunks =
+            Vec::with_capacity(chunk_count.min(bytes.len().saturating_sub(cursor) / 32));
         for _ in 0..chunk_count {
-            let Some(sample_period_ns) = le_u64(bytes, cursor) else {
-                break;
-            };
-            let Some(sample_count_chunk) = le_u64(bytes, cursor + 8) else {
-                break;
-            };
-            let Some(sample_base) = le_u64(bytes, cursor + 16) else {
-                break;
-            };
-            let Some(time_base_ns) = le_u64(bytes, cursor + 24) else {
-                break;
-            };
+            let sample_period_ns =
+                le_u64(bytes, cursor).ok_or_else(|| ZipError("truncated chunk period".into()))?;
+            let sample_count_chunk = le_u64(bytes, cursor + 8)
+                .ok_or_else(|| ZipError("truncated chunk count".into()))?;
+            let sample_base = le_u64(bytes, cursor + 16)
+                .ok_or_else(|| ZipError("truncated chunk base".into()))?;
+            let time_base_ns = le_u64(bytes, cursor + 24)
+                .ok_or_else(|| ZipError("truncated chunk time base".into()))?;
             chunks.push(Chunk {
                 sample_period_ns,
                 sample_count: sample_count_chunk,
@@ -886,7 +907,9 @@ fn unpack_channels(bytes: &[u8]) -> Vec<CatalogChannel> {
                 sample_base,
                 time_base_ns,
             });
-            cursor += 32;
+            cursor = cursor
+                .checked_add(32)
+                .ok_or_else(|| ZipError("chunk cursor overflow".into()))?;
         }
         channels.push(CatalogChannel {
             id,
@@ -910,7 +933,7 @@ fn unpack_channels(bytes: &[u8]) -> Vec<CatalogChannel> {
             display: ChannelDisplay::trace(),
         });
     }
-    channels
+    Ok(channels)
 }
 
 fn pack_visibility(channels: &[CatalogChannel]) -> Vec<u8> {
@@ -920,51 +943,55 @@ fn pack_visibility(channels: &[CatalogChannel]) -> Vec<u8> {
         .collect()
 }
 
-fn apply_visibility(channels: &mut [CatalogChannel], bytes: &[u8]) {
+fn apply_visibility(channels: &mut [CatalogChannel], bytes: &[u8]) -> Result<(), ZipError> {
+    if bytes.len() < channels.len() {
+        return Err(ZipError("truncated visibility vector".into()));
+    }
     for (channel, flag) in channels.iter_mut().zip(bytes) {
         channel.visible = *flag != 0;
     }
+    Ok(())
 }
 
-fn pack_labels(channels: &[CatalogChannel]) -> Vec<u8> {
+fn pack_labels(channels: &[CatalogChannel]) -> Result<Vec<u8>, ZipError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(channels.len() as u32).to_le_bytes());
+    pack_count(&mut out, channels.len())?;
     for channel in channels {
-        out.extend_from_slice(&(channel.labels.len() as u32).to_le_bytes());
+        pack_count(&mut out, channel.labels.len())?;
         for label in &channel.labels {
             out.extend_from_slice(&label.time_ns.to_le_bytes());
-            pack_string(&mut out, &label.text);
+            pack_string(&mut out, &label.text)?;
         }
     }
-    out
+    Ok(out)
 }
 
-fn apply_labels(channels: &mut [CatalogChannel], bytes: &[u8]) {
-    let Some(count) = le_u32(bytes, 0) else {
-        return;
-    };
-    let count = count as usize;
-    let mut cursor = 4;
+fn apply_labels(channels: &mut [CatalogChannel], bytes: &[u8]) -> Result<(), ZipError> {
+    let count = le_u32(bytes, 0).ok_or_else(|| ZipError("truncated label count".into()))? as usize;
+    let mut cursor = 4usize;
     for channel in channels.iter_mut().take(count) {
-        let Some(n) = le_u32(bytes, cursor) else {
-            break;
-        };
-        cursor += 4;
-        // Each label is at least 12 bytes (time_ns + text length), so a valid
-        // count never exceeds the remaining bytes divided by 12. Bounds the
-        // allocation and iteration against a mutated u32::MAX.
-        let n = (n as usize).min(bytes.len().saturating_sub(cursor) / 12);
-        let mut labels = Vec::with_capacity(n);
+        let n = le_u32(bytes, cursor)
+            .ok_or_else(|| ZipError("truncated label vector count".into()))?
+            as usize;
+        cursor = cursor
+            .checked_add(4)
+            .ok_or_else(|| ZipError("label cursor overflow".into()))?;
+        // Each label is at least 12 bytes; capacity is bounded for allocation
+        // safety, but the loop iterates the declared count and errors on a
+        // short read.
+        let mut labels = Vec::with_capacity(n.min(bytes.len().saturating_sub(cursor) / 12));
         for _ in 0..n {
-            let Some(time_ns) = le_u64(bytes, cursor) else {
-                break;
-            };
-            cursor += 8;
-            let text = unpack_string(bytes, &mut cursor);
+            let time_ns =
+                le_u64(bytes, cursor).ok_or_else(|| ZipError("truncated label time".into()))?;
+            cursor = cursor
+                .checked_add(8)
+                .ok_or_else(|| ZipError("label cursor overflow".into()))?;
+            let text = unpack_string(bytes, &mut cursor)?;
             labels.push(ChannelLabel { time_ns, text });
         }
         channel.labels = labels;
     }
+    Ok(())
 }
 
 fn plot_code(plot: ChannelPlot) -> u8 {
@@ -983,9 +1010,9 @@ fn plot_from(code: u8) -> ChannelPlot {
     }
 }
 
-fn pack_display(channels: &[CatalogChannel]) -> Vec<u8> {
+fn pack_display(channels: &[CatalogChannel]) -> Result<Vec<u8>, ZipError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(channels.len() as u32).to_le_bytes());
+    pack_count(&mut out, channels.len())?;
     for channel in channels {
         let display = &channel.display;
         out.push(plot_code(display.plot));
@@ -1013,77 +1040,79 @@ fn pack_display(channels: &[CatalogChannel]) -> Vec<u8> {
             out.push(decimals);
         }
         if !display.format.is_empty() {
-            pack_string(&mut out, &display.format);
+            pack_string(&mut out, &display.format)?;
         }
     }
-    out
+    Ok(out)
 }
 
-fn apply_display(channels: &mut [CatalogChannel], bytes: &[u8]) {
-    let Some(count) = le_u32(bytes, 0) else {
-        return;
-    };
-    let count = count as usize;
-    let mut cursor = 4;
+fn apply_display(channels: &mut [CatalogChannel], bytes: &[u8]) -> Result<(), ZipError> {
+    let count =
+        le_u32(bytes, 0).ok_or_else(|| ZipError("truncated display count".into()))? as usize;
+    let mut cursor = 4usize;
     for channel in channels.iter_mut().take(count) {
-        let Some(plot_byte) = byte_at(bytes, cursor) else {
-            break;
-        };
-        let Some(flags) = byte_at(bytes, cursor + 1) else {
-            break;
-        };
+        let plot_byte =
+            byte_at(bytes, cursor).ok_or_else(|| ZipError("truncated display plot".into()))?;
+        let flags =
+            byte_at(bytes, cursor + 1).ok_or_else(|| ZipError("truncated display flags".into()))?;
         let plot = plot_from(plot_byte);
-        cursor += 2;
+        cursor = cursor
+            .checked_add(2)
+            .ok_or_else(|| ZipError("display cursor overflow".into()))?;
         let mut display = ChannelDisplay {
             plot,
             ..ChannelDisplay::trace()
         };
         if flags & 1 != 0 {
-            let Some(min) = le_f64(bytes, cursor) else {
-                break;
-            };
+            let min = le_f64(bytes, cursor)
+                .ok_or_else(|| ZipError("truncated display scale min".into()))?;
             display.scale_min = Some(min);
-            cursor += 8;
+            cursor = cursor
+                .checked_add(8)
+                .ok_or_else(|| ZipError("display cursor overflow".into()))?;
         }
         if flags & 2 != 0 {
-            let Some(max) = le_f64(bytes, cursor) else {
-                break;
-            };
+            let max = le_f64(bytes, cursor)
+                .ok_or_else(|| ZipError("truncated display scale max".into()))?;
             display.scale_max = Some(max);
-            cursor += 8;
+            cursor = cursor
+                .checked_add(8)
+                .ok_or_else(|| ZipError("display cursor overflow".into()))?;
         }
         if flags & 4 != 0 {
-            let Some(decimals) = byte_at(bytes, cursor) else {
-                break;
-            };
+            let decimals = byte_at(bytes, cursor)
+                .ok_or_else(|| ZipError("truncated display decimals".into()))?;
             display.decimals = Some(decimals);
-            cursor += 1;
+            cursor = cursor
+                .checked_add(1)
+                .ok_or_else(|| ZipError("display cursor overflow".into()))?;
         }
         if flags & 8 != 0 {
-            display.format = unpack_string(bytes, &mut cursor);
+            display.format = unpack_string(bytes, &mut cursor)?;
         }
         channel.display = display;
     }
+    Ok(())
 }
 
-fn pack_spans(spans: &[Span]) -> Vec<u8> {
+fn pack_spans(spans: &[Span]) -> Result<Vec<u8>, ZipError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(spans.len() as u32).to_le_bytes());
+    pack_count(&mut out, spans.len())?;
     for span in spans {
-        pack_string(&mut out, &span.name);
+        pack_string(&mut out, &span.name)?;
         out.extend_from_slice(&span.start_ns.to_le_bytes());
         out.extend_from_slice(&span.end_ns.to_le_bytes());
         out.push(u8::from(span.visible));
-        pack_string(&mut out, &span.color);
-        pack_string(&mut out, &span.primary.title);
-        pack_string(&mut out, &span.primary.subtitle);
-        out.extend_from_slice(&(span.meta.len() as u32).to_le_bytes());
+        pack_string(&mut out, &span.color)?;
+        pack_string(&mut out, &span.primary.title)?;
+        pack_string(&mut out, &span.primary.subtitle)?;
+        pack_count(&mut out, span.meta.len())?;
         for (key, value) in &span.meta {
-            pack_string(&mut out, key);
+            pack_string(&mut out, key)?;
             match value {
                 SpanMetaValue::Text(text) => {
                     out.push(0);
-                    pack_string(&mut out, text);
+                    pack_string(&mut out, text)?;
                 }
                 SpanMetaValue::TimeMs(ms) => {
                     out.push(1);
@@ -1092,63 +1121,62 @@ fn pack_spans(spans: &[Span]) -> Vec<u8> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
-fn unpack_spans(bytes: &[u8], format_version: u16) -> Vec<Span> {
-    let Some(count) = le_u32(bytes, 0) else {
-        return Vec::new();
-    };
-    let mut cursor = 4;
-    // Each span is at least 33 bytes (name length + start + end + visible +
-    // color + title + subtitle lengths + meta_count), so a valid count never
-    // exceeds the remaining bytes divided by 33. Bounds allocation and
-    // iteration against a mutated u32::MAX; the read loop also bounds-breaks.
-    let count = (count as usize).min(bytes.len().saturating_sub(cursor) / 33);
-    let mut spans = Vec::with_capacity(count);
+fn unpack_spans(bytes: &[u8], format_version: u16) -> Result<Vec<Span>, ZipError> {
+    let count = le_u32(bytes, 0).ok_or_else(|| ZipError("truncated span count".into()))? as usize;
+    let mut cursor = 4usize;
+    // Each span is at least 33 bytes; capacity is bounded for allocation
+    // safety, but the loop iterates the declared count and errors on the
+    // first short read instead of silently truncating.
+    let mut spans = Vec::with_capacity(count.min(bytes.len().saturating_sub(cursor) / 33));
     for _ in 0..count {
-        let name = unpack_string(bytes, &mut cursor);
-        let Some(start_ns) = le_u64(bytes, cursor) else {
-            break;
-        };
-        let Some(end_ns) = le_u64(bytes, cursor + 8) else {
-            break;
-        };
-        let Some(visible_byte) = byte_at(bytes, cursor + 16) else {
-            break;
-        };
+        let name = unpack_string(bytes, &mut cursor)?;
+        let start_ns =
+            le_u64(bytes, cursor).ok_or_else(|| ZipError("truncated span start".into()))?;
+        let end_ns =
+            le_u64(bytes, cursor + 8).ok_or_else(|| ZipError("truncated span end".into()))?;
+        let visible_byte =
+            byte_at(bytes, cursor + 16).ok_or_else(|| ZipError("truncated span visible".into()))?;
         let visible = visible_byte != 0;
-        cursor += 17;
-        let color = unpack_string(bytes, &mut cursor);
-        let title = unpack_string(bytes, &mut cursor);
-        let subtitle = unpack_string(bytes, &mut cursor);
-        let Some(meta_count) = le_u32(bytes, cursor) else {
-            break;
-        };
-        cursor += 4;
-        // Each meta entry is at least 8 bytes (key length + value length), so
-        // a valid count never exceeds the remaining bytes divided by 8.
-        let meta_count = (meta_count as usize).min(bytes.len().saturating_sub(cursor) / 8);
-        let mut meta = Vec::with_capacity(meta_count);
+        cursor = cursor
+            .checked_add(17)
+            .ok_or_else(|| ZipError("span cursor overflow".into()))?;
+        let color = unpack_string(bytes, &mut cursor)?;
+        let title = unpack_string(bytes, &mut cursor)?;
+        let subtitle = unpack_string(bytes, &mut cursor)?;
+        let meta_count = le_u32(bytes, cursor)
+            .ok_or_else(|| ZipError("truncated span meta count".into()))?
+            as usize;
+        cursor = cursor
+            .checked_add(4)
+            .ok_or_else(|| ZipError("span cursor overflow".into()))?;
+        // Each meta entry is at least 8 bytes; capacity is bounded for
+        // allocation safety, but the loop iterates the declared count and
+        // errors on a short read.
+        let mut meta = Vec::with_capacity(meta_count.min(bytes.len().saturating_sub(cursor) / 8));
         for _ in 0..meta_count {
-            let key = unpack_string(bytes, &mut cursor);
+            let key = unpack_string(bytes, &mut cursor)?;
             let value = if format_version >= 8 {
-                let Some(kind) = byte_at(bytes, cursor) else {
-                    break;
-                };
-                cursor += 1;
+                let kind = byte_at(bytes, cursor)
+                    .ok_or_else(|| ZipError("truncated span meta kind".into()))?;
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or_else(|| ZipError("span cursor overflow".into()))?;
                 match kind {
                     1 => {
-                        let Some(ms) = le_u32(bytes, cursor) else {
-                            break;
-                        };
-                        cursor += 4;
+                        let ms = le_u32(bytes, cursor)
+                            .ok_or_else(|| ZipError("truncated span meta ms".into()))?;
+                        cursor = cursor
+                            .checked_add(4)
+                            .ok_or_else(|| ZipError("span cursor overflow".into()))?;
                         SpanMetaValue::TimeMs(ms.min(TIMESPAN_MS_MAX))
                     }
-                    _ => SpanMetaValue::from_stored_text(unpack_string(bytes, &mut cursor)),
+                    _ => SpanMetaValue::from_stored_text(unpack_string(bytes, &mut cursor)?),
                 }
             } else {
-                SpanMetaValue::from_stored_text(unpack_string(bytes, &mut cursor))
+                SpanMetaValue::from_stored_text(unpack_string(bytes, &mut cursor)?)
             };
             meta.push((key, value));
         }
@@ -1162,99 +1190,82 @@ fn unpack_spans(bytes: &[u8], format_version: u16) -> Vec<Span> {
             meta,
         });
     }
-    spans
+    Ok(spans)
 }
 
-fn pack_passes(passes: &[AppliedPass]) -> Vec<u8> {
+fn pack_passes(passes: &[AppliedPass]) -> Result<Vec<u8>, ZipError> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(passes.len() as u32).to_le_bytes());
+    pack_count(&mut out, passes.len())?;
     for pass in passes {
-        pack_string(&mut out, &pass.name);
+        pack_string(&mut out, &pass.name)?;
         out.extend_from_slice(&pass.version.to_le_bytes());
-        out.extend_from_slice(&(pass.params.len() as u32).to_le_bytes());
+        pack_count(&mut out, pass.params.len())?;
         for (key, value) in &pass.params {
-            pack_string(&mut out, key);
-            pack_string(&mut out, value);
+            pack_string(&mut out, key)?;
+            pack_string(&mut out, value)?;
         }
-        out.extend_from_slice(&(pass.inputs.len() as u32).to_le_bytes());
+        pack_count(&mut out, pass.inputs.len())?;
         for input in &pass.inputs {
-            pack_string(&mut out, input);
+            pack_string(&mut out, input)?;
         }
-        out.extend_from_slice(&(pass.outputs.len() as u32).to_le_bytes());
+        pack_count(&mut out, pass.outputs.len())?;
         for output in &pass.outputs {
-            pack_string(&mut out, output);
+            pack_string(&mut out, output)?;
         }
     }
-    out
+    Ok(out)
 }
 
-fn unpack_passes(bytes: &[u8]) -> Vec<AppliedPass> {
-    fn count(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
+fn unpack_passes(bytes: &[u8]) -> Result<Vec<AppliedPass>, ZipError> {
+    fn count(bytes: &[u8], cursor: &mut usize) -> Result<usize, ZipError> {
         let at = *cursor;
-        let value = le_u32(bytes, at)? as usize;
-        *cursor = at.checked_add(4)?;
-        Some(value)
+        let value =
+            le_u32(bytes, at).ok_or_else(|| ZipError("truncated pass count".into()))? as usize;
+        *cursor = at
+            .checked_add(4)
+            .ok_or_else(|| ZipError("pass cursor overflow".into()))?;
+        Ok(value)
     }
-    /// Bounds an untrusted element count by the bytes remaining at `cursor`
-    /// divided by the minimum encoded size of one element. A valid file never
-    /// has more elements than `remaining / min_record`, so this never truncates
-    /// real data but prevents a mutated u32::MAX from driving unbounded
-    /// allocation or iteration. The params/inputs/outputs loops call only
-    /// `unpack_string`, which returns empty without advancing once the buffer
-    /// is exhausted, so without this bound they could spin billions of times.
-    fn bounded(count: usize, bytes: &[u8], cursor: usize, min_record: usize) -> usize {
-        count.min(bytes.len().saturating_sub(cursor) / min_record)
+    /// Bounds a `with_capacity` hint by the bytes remaining at `cursor`
+    /// divided by the minimum encoded size of one element, for allocation
+    /// safety only. The loops iterate the declared count and error on a short
+    /// read, so this never silently truncates real data.
+    fn bounded(cap: usize, bytes: &[u8], cursor: usize, min_record: usize) -> usize {
+        cap.min(bytes.len().saturating_sub(cursor) / min_record)
     }
-    let mut cursor = 0;
-    let Some(pass_count) = count(bytes, &mut cursor) else {
-        return Vec::new();
-    };
-    // Each pass is at least 20 bytes (name + version + three count fields).
-    let pass_count = bounded(pass_count, bytes, cursor, 20);
-    let mut passes = Vec::with_capacity(pass_count);
+    let mut cursor = 0usize;
+    let pass_count = count(bytes, &mut cursor)?;
+    let mut passes = Vec::with_capacity(bounded(pass_count, bytes, cursor, 20));
     for _ in 0..pass_count {
-        let name = unpack_string(bytes, &mut cursor);
-        let Some(version) = count(bytes, &mut cursor) else {
-            break;
-        };
-        let Some(param_count) = count(bytes, &mut cursor) else {
-            break;
-        };
-        // Each param is two strings, at least 8 bytes total.
-        let param_count = bounded(param_count, bytes, cursor, 8);
-        let mut params = Vec::with_capacity(param_count);
+        let name = unpack_string(bytes, &mut cursor)?;
+        let version = count(bytes, &mut cursor)?;
+        let param_count = count(bytes, &mut cursor)?;
+        let mut params = Vec::with_capacity(bounded(param_count, bytes, cursor, 8));
         for _ in 0..param_count {
-            let key = unpack_string(bytes, &mut cursor);
-            let value = unpack_string(bytes, &mut cursor);
+            let key = unpack_string(bytes, &mut cursor)?;
+            let value = unpack_string(bytes, &mut cursor)?;
             params.push((key, value));
         }
-        let Some(input_count) = count(bytes, &mut cursor) else {
-            break;
-        };
-        // Each input is one string, at least 4 bytes.
-        let input_count = bounded(input_count, bytes, cursor, 4);
-        let mut inputs = Vec::with_capacity(input_count);
+        let input_count = count(bytes, &mut cursor)?;
+        let mut inputs = Vec::with_capacity(bounded(input_count, bytes, cursor, 4));
         for _ in 0..input_count {
-            inputs.push(unpack_string(bytes, &mut cursor));
+            inputs.push(unpack_string(bytes, &mut cursor)?);
         }
-        let Some(output_count) = count(bytes, &mut cursor) else {
-            break;
-        };
-        // Each output is one string, at least 4 bytes.
-        let output_count = bounded(output_count, bytes, cursor, 4);
-        let mut outputs = Vec::with_capacity(output_count);
+        let output_count = count(bytes, &mut cursor)?;
+        let mut outputs = Vec::with_capacity(bounded(output_count, bytes, cursor, 4));
         for _ in 0..output_count {
-            outputs.push(unpack_string(bytes, &mut cursor));
+            outputs.push(unpack_string(bytes, &mut cursor)?);
         }
         passes.push(AppliedPass {
             name,
-            version: version as u32,
+            version: u32::try_from(version)
+                .map_err(|_| ZipError("pass version overflows u32".into()))?,
             params,
             inputs,
             outputs,
         });
     }
-    passes
+    Ok(passes)
 }
 
 fn root_table(bytes: &[u8]) -> Result<Table<'_>, ZipError> {
@@ -1274,4 +1285,104 @@ fn root_table(bytes: &[u8]) -> Result<Table<'_>, ZipError> {
         buf: bytes,
         loc: root,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motorsport_telemetry_core::{ChannelDisplay, Chunk, LapMetadata, UnitSource};
+
+    fn channel_with_labels(count: usize) -> Vec<CatalogChannel> {
+        (0..count)
+            .map(|index| CatalogChannel {
+                id: index as u32,
+                name: format!("ch{index}"),
+                member: format!("channels/{index:04}.bin"),
+                time_member: String::new(),
+                unit_raw: String::new(),
+                unit_canonical: String::new(),
+                unit_source: UnitSource::Unknown,
+                dimension: 0,
+                sample_type: SampleType::F32,
+                scale: 1.0,
+                bias: 0.0,
+                uses_step: false,
+                sample_count: 0,
+                duration_ns: 0,
+                kind: 0,
+                visible: true,
+                labels: Vec::new(),
+                display: ChannelDisplay::trace(),
+                chunks: vec![Chunk {
+                    sample_period_ns: 1_000_000,
+                    sample_count: 0,
+                    data_ptr: 0,
+                    sample_base: 0,
+                    time_base_ns: 0,
+                }],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pack_rejects_too_many_entries() {
+        // u32::MAX + 1 channels overflow the u32 entry count. The packer must
+        // report an error rather than truncating the count.
+        let channels = channel_with_labels(0);
+        // Directly exercise the count helper with an unreachable usize: synthesize
+        // via pack_channels by constructing a slice whose len cannot be u32. We
+        // cannot allocate u32::MAX+1 entries, so assert the helper itself.
+        let mut out = Vec::new();
+        let err = pack_count(&mut out, u32::MAX as usize + 1).unwrap_err();
+        assert!(err.0.contains("too many entries"));
+        // A normal count packs fine.
+        let mut out = Vec::new();
+        pack_count(&mut out, channels.len()).unwrap();
+        assert_eq!(out, (0u32).to_le_bytes());
+    }
+
+    #[test]
+    fn unpack_laps_errors_on_truncated_body() {
+        let bytes = 1u32.to_le_bytes();
+        let err = unpack_laps(&bytes, FORMAT_VERSION).unwrap_err();
+        assert!(err.0.contains("truncated"));
+    }
+
+    #[test]
+    fn unpack_channels_errors_on_truncated_flags() {
+        // channel count = 1, id present, then five empty strings, then no
+        // flag bytes left.
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // id
+        for _ in 0..5 {
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // empty string lengths
+        }
+        let err = unpack_channels(&bytes).unwrap_err();
+        assert!(err.0.contains("truncated"));
+    }
+
+    #[test]
+    fn unpack_string_rejects_invalid_utf8() {
+        // length 2, then two continuation bytes that are not valid UTF-8.
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0xC3, 0x28]);
+        let mut cursor = 0usize;
+        let err = unpack_string(&bytes, &mut cursor).unwrap_err();
+        assert!(err.0.contains("UTF-8"));
+    }
+
+    #[test]
+    fn pack_unpack_laps_round_trip() {
+        let laps = vec![LapMetadata {
+            number: 1,
+            start_ns: 0,
+            end_ns: 40_000_000,
+            duration_ns: 40_000_000,
+            complete: true,
+            first_video_frame: Some(3),
+        }];
+        let packed = pack_laps(&laps, FORMAT_VERSION).unwrap();
+        let back = unpack_laps(&packed, FORMAT_VERSION).unwrap();
+        assert_eq!(back, laps);
+    }
 }

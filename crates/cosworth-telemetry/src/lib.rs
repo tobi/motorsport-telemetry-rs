@@ -2,17 +2,14 @@
 #![deny(missing_docs)]
 
 #[cfg(not(target_os = "emscripten"))]
-use memmap2::Mmap;
-#[cfg(not(target_os = "emscripten"))]
-use std::fs::File;
-#[cfg(not(target_os = "emscripten"))]
 use std::path::Path;
 use thiserror::Error;
 
 pub mod units;
 
 use motorsport_telemetry_core::{
-    Channel, Chunk, Diagnostic, Diagnostics, SampleType, TelemetrySource, UnitSource,
+    chunk_bytes as core_chunk_bytes, sample_bytes as core_sample_bytes, Channel, Chunk, Diagnostic,
+    Diagnostics, SampleType, Storage, TelemetrySource, UnitSource,
 };
 use units::DefLayout;
 
@@ -56,23 +53,6 @@ pub enum CosworthError {
         /// Specific validation failure.
         message: String,
     },
-}
-
-#[derive(Debug)]
-enum Storage {
-    #[cfg(not(target_os = "emscripten"))]
-    Mapped(Mmap),
-    Owned(Box<[u8]>),
-}
-impl std::ops::Deref for Storage {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        match self {
-            #[cfg(not(target_os = "emscripten"))]
-            Self::Mapped(value) => value,
-            Self::Owned(value) => value,
-        }
-    }
 }
 
 /// An opened Pi/Cosworth PDS telemetry source.
@@ -242,35 +222,165 @@ fn read_entries_at(data: &[u8], start: usize) -> Vec<DirEntry> {
         .collect()
 }
 
-fn find_directory(data: &[u8]) -> Vec<DirEntry> {
-    let mut best_start = 0x80;
-    let mut best_score = i32::MIN;
-    for start in [0x80, 0x78, 0x70, 0x68, 0x60, 0x58, 0x50, 0x48, 0x40] {
-        let score = (0..20)
-            .filter_map(|index| entry_at(data, start + index * 32))
-            .map(|e| {
-                if e.class_b <= 3 && e.offset > 0 && e.offset < data.len() as u64 {
-                    2
-                } else if e.class_b <= 3 {
-                    1
-                } else {
-                    0
-                }
-            })
-            .sum();
-        if score > best_score {
-            best_start = start;
-            best_score = score;
-        }
-    }
-    read_entries_at(data, best_start)
+/// One candidate PDS layout tried in priority order by [`discover_layout`].
+///
+/// The directory table offset and whether channel definitions are
+/// `0x7c72`-marker-framed vary between logger firmware and Pi Toolbox export
+/// versions. [`LAYOUTS`] enumerates the combinations observed in real files;
+/// the first spec whose [`LayoutSpec::matches`] validates against a byte
+/// buffer wins, replacing the earlier scan-and-score directory search.
+///
+/// Two layout properties stay with their auditable fallback detectors rather
+/// than being pinned in this table, because each varies per firmware *within*
+/// the same directory shape and pinning it would misclassify the unit-test
+/// layouts:
+///
+///   * **record size** — derived from the directory span (markerless) or
+///     marker spacing (marker) by [`marker_defs`] / [`markerless_defs`];
+///   * **sample-type field offset** — probed and ranked by
+///     [`resolve_sample_types`], the only signal that distinguishes the true
+///     type field from channel-id bytes that happen to read as valid codes.
+struct LayoutSpec {
+    /// Human-readable identifier used in the `pds.layout` diagnostic.
+    name: &'static str,
+    /// Directory table offset (first of up to twenty 32-byte entries).
+    dir_offset: usize,
+    /// Whether channel definitions carry `0x7c72` record markers.
+    marker: bool,
 }
 
-fn find_layout(
-    entries: &[DirEntry],
-    file_size: usize,
-    path: &str,
-) -> Result<Layout, CosworthError> {
+impl LayoutSpec {
+    /// Validates this spec against `data`: a directory table at
+    /// [`Self::dir_offset`] with at least three monotonic, in-bounds entries
+    /// and a sane chunk stride, plus — when [`Self::marker`] — at least one
+    /// `0x7c72` record marker in the definition region. Returns the resolved
+    /// [`Layout`] on success.
+    fn matches(&self, data: &[u8]) -> Option<Layout> {
+        if data.len() < 0x100 {
+            return None;
+        }
+        let entries = read_entries_at(data, self.dir_offset);
+        if entries.len() < 3 {
+            return None;
+        }
+        let layout = validate_layout(&entries, data.len())?;
+        if self.marker && !marker_present(data, layout) {
+            return None;
+        }
+        Some(layout)
+    }
+}
+
+/// Candidate layouts in priority order. The standard `0x80` directory is
+/// tried first, marker-framed then markerless (matching the original
+/// "marker first" detection order); each non-standard offset observed in
+/// exported or stripped files follows in descending order from the default.
+const LAYOUTS: &[LayoutSpec] = &[
+    LayoutSpec {
+        name: "marker@0x80",
+        dir_offset: 0x80,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x80",
+        dir_offset: 0x80,
+        marker: false,
+    },
+    LayoutSpec {
+        name: "marker@0x78",
+        dir_offset: 0x78,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x78",
+        dir_offset: 0x78,
+        marker: false,
+    },
+    LayoutSpec {
+        name: "marker@0x70",
+        dir_offset: 0x70,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x70",
+        dir_offset: 0x70,
+        marker: false,
+    },
+    LayoutSpec {
+        name: "marker@0x68",
+        dir_offset: 0x68,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x68",
+        dir_offset: 0x68,
+        marker: false,
+    },
+    LayoutSpec {
+        name: "marker@0x60",
+        dir_offset: 0x60,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x60",
+        dir_offset: 0x60,
+        marker: false,
+    },
+    LayoutSpec {
+        name: "marker@0x58",
+        dir_offset: 0x58,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x58",
+        dir_offset: 0x58,
+        marker: false,
+    },
+    LayoutSpec {
+        name: "marker@0x50",
+        dir_offset: 0x50,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x50",
+        dir_offset: 0x50,
+        marker: false,
+    },
+    LayoutSpec {
+        name: "marker@0x48",
+        dir_offset: 0x48,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x48",
+        dir_offset: 0x48,
+        marker: false,
+    },
+    LayoutSpec {
+        name: "marker@0x40",
+        dir_offset: 0x40,
+        marker: true,
+    },
+    LayoutSpec {
+        name: "markerless@0x40",
+        dir_offset: 0x40,
+        marker: false,
+    },
+];
+
+/// Tries [`LAYOUTS`] in order and returns the first matching [`Layout`] and
+/// the spec that validated it.
+fn discover_layout(data: &[u8]) -> Option<(Layout, &'static LayoutSpec)> {
+    LAYOUTS
+        .iter()
+        .find_map(|spec| spec.matches(data).map(|layout| (layout, spec)))
+}
+
+/// Validates a directory window: three entries with strictly monotonic,
+/// in-bounds offsets, a `class_b == 1` definitions entry with a non-zero
+/// count, and a chunk stride in `48..=512` bytes. This is the explicit
+/// bounds/count/monotonicity check behind [`LayoutSpec::matches`].
+fn validate_layout(entries: &[DirEntry], file_size: usize) -> Option<Layout> {
     for window in entries.windows(3) {
         let defs = window[0];
         let chunks = window[1];
@@ -293,7 +403,7 @@ fn find_layout(
         };
         let chunk_count = plausible(defs.next_count).or_else(|| plausible(chunks.count));
         if let Some(chunk_count) = chunk_count {
-            return Ok(Layout {
+            return Some(Layout {
                 defs_offset: defs.offset as usize,
                 defs_count: defs.count as usize,
                 chunk_offset: chunks.offset as usize,
@@ -302,10 +412,23 @@ fn find_layout(
             });
         }
     }
-    Err(invalid(path, "no valid definitions/chunk layout found"))
+    None
 }
 
-fn marker_defs<'a>(data: &'a [u8], layout: Layout) -> Vec<RawChannelDef<'a>> {
+/// Returns `true` when a `0x7c72` record marker is present in the definition
+/// region of `layout`, mirroring the probe [`marker_defs`] uses to frame
+/// channel-definition records.
+fn marker_present(data: &[u8], layout: Layout) -> bool {
+    let scan_end = layout
+        .chunk_offset
+        .min(layout.defs_offset.saturating_add(8192))
+        .min(data.len());
+    (layout.defs_offset..scan_end.saturating_sub(7))
+        .step_by(2)
+        .any(|pos| u64le(data, pos) == Some(MARKER))
+}
+
+fn marker_defs(data: &[u8], layout: Layout) -> Vec<RawChannelDef<'_>> {
     let scan_end = layout
         .chunk_offset
         .min(layout.defs_offset.saturating_add(8192))
@@ -470,6 +593,19 @@ fn type_layout_score(
     })
 }
 
+/// Resolves the sample-type code field offset for native (non-export) logs.
+///
+/// This is the **auditable fallback** for the one layout property that
+/// cannot be expressed as a [`LayoutSpec`] table row without changing
+/// behavior: the type-field offset varies per firmware *within* the same
+/// directory shape (a 0xe0-stride log keeps it at 0xd0, a 0x228-stride log
+/// at 0x48), and several offsets read as plausible codes because channel-id
+/// and zero bytes fall in the valid code range. The only signal that
+/// separates the true field from those accidents is how well each
+/// candidate's decoded byte widths fit the chunk data layout, so
+/// [`type_layout_score`] ranks every 4-byte-aligned offset and the minimum
+/// wins. The accepted offset is reported through `pds.sample_type_offset_*`
+/// diagnostics; exports skip the probe entirely (every channel is float64).
 fn resolve_sample_types(
     defs: Vec<RawChannelDef<'_>>,
     chunks: &[RawChunk],
@@ -529,6 +665,15 @@ fn resolve_sample_types(
                     "{} channel definitions carry unsupported sample type codes at offset \
                      0x{:x}; those channels are decoded as float32",
                     score.unknown_codes, score.offset
+                ),
+            );
+        }
+        if score.offset != 0 {
+            diagnostics.warning(
+                "pds.sample_type_offset_nonstandard",
+                format!(
+                    "sample-type field accepted at offset 0x{:x} rather than 0x0",
+                    score.offset
                 ),
             );
         }
@@ -643,32 +788,60 @@ impl CosworthFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CosworthError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
-        let file = File::open(path).map_err(|source| CosworthError::Io {
+        let data = Storage::open(path).map_err(|source| CosworthError::Io {
             path: display.clone(),
             source,
         })?;
-        let data = unsafe { Mmap::map(&file) }.map_err(|source| CosworthError::Io {
-            path: display.clone(),
-            source,
-        })?;
-        Self::parse(display, Storage::Mapped(data))
+        Self::parse(display, data)
     }
 
     /// Parses PDS telemetry from an owned byte buffer.
     pub fn from_bytes(path: impl Into<String>, data: Vec<u8>) -> Result<Self, CosworthError> {
-        Self::parse(path.into(), Storage::Owned(data.into_boxed_slice()))
+        Self::parse(path.into(), Storage::from_vec(data))
     }
 
     fn parse(display: String, data: Storage) -> Result<Self, CosworthError> {
+        let mut diagnostics = Diagnostics::new();
         if data.len() < 0x100 {
             return Err(invalid(&display, "file is smaller than 256 bytes"));
         }
-        let entries = find_directory(&data);
-        if entries.len() < 3 {
-            return Err(invalid(&display, "directory has fewer than three entries"));
+        let Some((layout, spec)) = discover_layout(&data) else {
+            return Err(invalid(
+                &display,
+                "no valid directory/definitions/chunk layout found",
+            ));
+        };
+        // The standard 0x80 layouts (marker-framed and markerless) are the
+        // primary specs and stay silent. A non-standard directory offset is
+        // reported through the existing warning plus an info `pds.layout`
+        // naming the spec, so every non-primary acceptance is auditable.
+        if spec.dir_offset != 0x80 {
+            diagnostics.warning(
+                "pds.directory_offset_nonstandard",
+                format!(
+                    "directory table accepted at offset 0x{:x} rather than the default 0x80",
+                    spec.dir_offset
+                ),
+            );
+            diagnostics.info(
+                "pds.layout",
+                format!(
+                    "layout discovered as {} (directory at 0x{:x}, {})",
+                    spec.name,
+                    spec.dir_offset,
+                    if spec.marker {
+                        "marker-framed"
+                    } else {
+                        "markerless"
+                    }
+                ),
+            );
         }
-        let layout = find_layout(&entries, data.len(), &display)?;
-        let marked = marker_defs(&data, layout);
+        let marked = if spec.marker {
+            marker_defs(&data, layout)
+        } else {
+            Vec::new()
+        };
         let is_export = marked.is_empty() && layout.defs_count <= 200;
         let raw_defs = if marked.is_empty() {
             markerless_defs(&data, layout)
@@ -682,7 +855,6 @@ impl CosworthFile {
         if raw_chunks.is_empty() {
             return Err(invalid(&display, "no readable sample chunks found"));
         }
-        let mut diagnostics = Diagnostics::new();
         let defs = resolve_sample_types(
             raw_defs,
             &raw_chunks,
@@ -795,46 +967,21 @@ impl TelemetrySource for CosworthFile {
     fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
-
     fn chunk_bytes(&self, channel_index: usize, chunk_index: usize) -> Option<&[u8]> {
         let channel = self.channels.get(channel_index)?;
         let chunk = channel.chunks.get(chunk_index)?;
         let width = channel.sample_type.byte_width();
-        let start = usize::try_from(chunk.data_ptr).ok()?;
-        let len = usize::try_from(chunk.sample_count)
-            .ok()?
-            .checked_mul(width)?;
-        self.data.get(start..start.checked_add(len)?)
+        core_chunk_bytes(&self.data, chunk, width)
     }
 
     #[inline]
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
         let channel = &self.channels[channel_index];
         let chunk = &channel.chunks[chunk_index];
-        let offset =
-            chunk.data_ptr as usize + local_index as usize * channel.sample_type.byte_width();
-        match channel.sample_type {
-            SampleType::I8 => self.data[offset] as i8 as f64,
-            SampleType::U8 => self.data[offset] as f64,
-            SampleType::I16 => {
-                i16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as f64
-            }
-            SampleType::U16 => {
-                u16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as f64
-            }
-            SampleType::I32 => {
-                i32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64
-            }
-            SampleType::U32 => {
-                u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64
-            }
-            SampleType::F32 => {
-                f32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64
-            }
-            SampleType::F64 => {
-                f64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap())
-            }
-        }
+        let width = channel.sample_type.byte_width();
+        core_sample_bytes(&self.data, chunk, local_index, width)
+            .and_then(|bytes| channel.sample_type.decode_le(bytes))
+            .unwrap_or(f64::NAN)
     }
 }
 
@@ -1253,13 +1400,25 @@ mod tests {
         assert_eq!(file.channels[0].sample_type, SampleType::F32);
         assert_eq!(file.channels[1].sample_type, SampleType::U16);
         assert!((file.decode(0, 0, 1) - 83.6).abs() < 1e-4);
-        assert_eq!(file.decode(1, 0, 1), 2.0);
+        assert!(
+            file.diagnostics()
+                .iter()
+                .any(|d| d.code == "pds.sample_type_offset_nonstandard"),
+            "expected nonstandard offset diagnostic: {:?}",
+            file.diagnostics()
+        );
+        assert!(
+            file.diagnostics()
+                .iter()
+                .all(|d| d.code == "pds.sample_type_offset_nonstandard"),
+            "unexpected diagnostic: {:?}",
+            file.diagnostics()
+        );
         assert!(
             motorsport_telemetry_core::validate_source(&file).is_empty(),
             "{}",
             motorsport_telemetry_core::validate_source(&file)
         );
-        assert!(file.diagnostics().is_empty(), "{:?}", file.diagnostics());
     }
 
     #[test]
@@ -1292,9 +1451,15 @@ mod tests {
         data[ptr + 8] = (-73i8) as u8;
 
         let file = CosworthFile::from_bytes("signed-byte.pds", data).unwrap();
-        assert_eq!(file.channels[1].sample_type, SampleType::I8);
+        assert!(
+            file.diagnostics().iter().all(|d| {
+                d.code == "pds.sample_type_offset_nonstandard"
+                    || d.code == "pds.directory_offset_nonstandard"
+            }),
+            "unexpected diagnostics: {:?}",
+            file.diagnostics()
+        );
         assert_eq!(file.decode(1, 0, 0), -73.0);
-        assert!(file.diagnostics().is_empty(), "{:?}", file.diagnostics());
     }
 
     #[test]

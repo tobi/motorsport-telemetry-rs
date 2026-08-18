@@ -10,5 +10,13 @@ description = "Shared zero-copy model for motorsport telemetry parsers"
 [lints]
 workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lib]
 name = "motorsport_telemetry_core"
+
+[dependencies]
+jiff.workspace = true
+memmap2.workspace = true
+motorsport-track-atlas.workspace = true

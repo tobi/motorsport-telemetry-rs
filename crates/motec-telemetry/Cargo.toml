@@ -12,7 +12,6 @@ name = "motec_telemetry"
 
 [dependencies]
 motorsport-telemetry-core.workspace = true
-memmap2.workspace = true
 quick-xml.workspace = true
 thiserror.workspace = true
 

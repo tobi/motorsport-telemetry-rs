@@ -1,6 +1,6 @@
 use motorsport_telemetry::{
     motorsport_telemetry_core::TelemetrySource, open, open_metadata, open_sessions,
-    read_lap_metadata, TelemetryNormalizer,
+    read_lap_metadata, SourceExt, TelemetryNormalizer,
 };
 use std::path::PathBuf;
 use telemetry_format::{write_from_source, write_jsonl_from_source, write_jsonl_from_source_with};

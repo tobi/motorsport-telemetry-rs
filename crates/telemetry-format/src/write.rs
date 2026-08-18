@@ -3,13 +3,48 @@
 use crate::catalog::{unit_fields, Catalog, CatalogChannel};
 use crate::zip::{ZipError, ZipWriter};
 use motorsport_telemetry_core::{
-    read_source_metadata, schema_hash, AbsoluteTimeRange, AppliedPass, Channel, SampleType,
-    SourceIdentity, SourceLapMetadata, SourceOrigin, Span, TelemetrySource, VideoFileRef,
+    read_source_metadata, schema_hash, Channel, SampleTimes, SampleType, TelemetrySource,
 };
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+
+/// Errors raised while writing a `.telemetry` archive.
+#[derive(Debug)]
+pub enum TelemetryFormatError {
+    /// A structural/content problem with the source or requested layout.
+    Invalid(String),
+    /// An underlying I/O failure.
+    Io(std::io::Error),
+}
+
+impl From<ZipError> for TelemetryFormatError {
+    fn from(err: ZipError) -> Self {
+        TelemetryFormatError::Invalid(err.to_string())
+    }
+}
+
+impl From<std::io::Error> for TelemetryFormatError {
+    fn from(err: std::io::Error) -> Self {
+        TelemetryFormatError::Io(err)
+    }
+}
+
+fn io_err(err: std::io::Error) -> TelemetryFormatError {
+    TelemetryFormatError::Io(err)
+}
+
+impl std::fmt::Display for TelemetryFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TelemetryFormatError::Invalid(message) => f.write_str(message),
+            TelemetryFormatError::Io(err) => write!(f, "io: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for TelemetryFormatError {}
 
 /// Writes a `.telemetry` zip next to or at `dest`.
 pub fn write_from_source(
@@ -31,10 +66,17 @@ pub fn write_from_source_stripped(
     source: &dyn TelemetrySource,
     dest: impl AsRef<Path>,
 ) -> Result<(), TelemetryFormatError> {
-    let stripped = StrippedSource::new(source);
+    let outputs: HashSet<&str> = source
+        .applied_passes()
+        .iter()
+        .flat_map(|pass| pass.outputs.iter().map(String::as_str))
+        .collect();
+    let mut view = motorsport_telemetry_core::ViewSource::new(source);
+    view.retain(|_, channel| !outputs.contains(channel.name.as_str()));
+    view.passes_mut().clear();
     let dest = dest.as_ref();
     let file = File::create(dest).map_err(io_err)?;
-    write_to(&stripped, crate::FORMAT_VERSION, BufWriter::new(file))
+    write_to(&view, crate::FORMAT_VERSION, BufWriter::new(file))
 }
 
 /// Writes a `.telemetry` zip stamped with an explicit catalog version.
@@ -59,8 +101,8 @@ fn write_to(
 
     for (index, channel) in source.channels().iter().enumerate() {
         let member = format!("channels/{index:04}.bin");
-        let event = is_event(source, index, channel);
-        let (values, times) = collect_channel(source, index, channel, event)?;
+        let event = is_event(source, index);
+        let (values, times, all_native) = collect_channel(source, index, channel)?;
         let time_member = if event {
             format!("channels/{index:04}.time.bin")
         } else {
@@ -77,9 +119,7 @@ fn write_to(
             unit_canonical,
             unit_source: channel.unit_source,
             dimension,
-            sample_type: if (values.is_empty() && channel.sample_count == 0)
-                || source.chunk_bytes(index, 0).is_some()
-            {
+            sample_type: if channel.sample_count == 0 || all_native {
                 channel.sample_type
             } else {
                 SampleType::F64
@@ -114,12 +154,10 @@ fn write_to(
         .as_deref()
         .and_then(|key| key.rsplit_once(':').map(|(hint, _)| hint.to_owned()))
         .unwrap_or_default();
-    let timezone = crate::placement::resolve_timezone(source);
+    let timezone = motorsport_telemetry_core::placement::resolve_timezone(source);
     let utc_start_ns = source
         .utc_start_ns()
-        .or_else(|| crate::placement::utc_from_metadata(&metadata, &timezone));
-    // A converted artifact keeps the identity of the file it was originally
-    // converted from; only a true origin stamps its own format and path.
+        .or_else(|| motorsport_telemetry_core::placement::utc_from_metadata(&metadata, &timezone));
     let origin = source.source_origin();
     let catalog = Catalog {
         format_version,
@@ -244,215 +282,43 @@ fn collect_channel(
     source: &dyn TelemetrySource,
     index: usize,
     channel: &Channel,
-    event: bool,
-) -> Result<(Vec<u8>, Vec<u8>), TelemetryFormatError> {
+) -> Result<(Vec<u8>, Vec<u8>, bool), TelemetryFormatError> {
     if channel.sample_count == 0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), true));
     }
+    // Explicit sample stamps come straight from the slice exposed by
+    // `sample_times`; grid channels write no time column.
+    let stamps = match source.sample_times(index) {
+        SampleTimes::Explicit(stamps) => Some(stamps),
+        SampleTimes::Grid => None,
+    };
     let mut values = Vec::new();
     let mut times = Vec::new();
+    let mut all_native = true;
     for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
         if let Some(bytes) = source.chunk_bytes(index, chunk_index) {
             values.extend_from_slice(bytes);
         } else {
+            all_native = false;
             for local in 0..chunk.sample_count {
                 values.extend_from_slice(&source.decode(index, chunk_index, local).to_le_bytes());
             }
         }
-        if event {
+        if let Some(stamps) = stamps {
+            let base = chunk.sample_base;
             for local in 0..chunk.sample_count {
-                times.extend_from_slice(
-                    &source
-                        .sample_time_ns(index, chunk_index, local)
-                        .to_le_bytes(),
-                );
+                let stamp = stamps.get((base + local) as usize).copied().unwrap_or(0);
+                times.extend_from_slice(&stamp.to_le_bytes());
             }
         }
     }
-    Ok((values, times))
+    Ok((values, times, all_native))
 }
 
-fn is_event(source: &dyn TelemetrySource, index: usize, channel: &Channel) -> bool {
-    if source.chunk_bytes(index, 0).is_some() {
-        return false;
-    }
-    const JITTER_NS: u64 = 2_000_000;
-    channel
-        .chunks
-        .iter()
-        .enumerate()
-        .any(|(chunk_index, chunk)| {
-            chunk.sample_period_ns == 0
-                || (0..chunk.sample_count).any(|local| {
-                    let actual = source.sample_time_ns(index, chunk_index, local);
-                    let expected = chunk.time_base_ns + local * chunk.sample_period_ns;
-                    actual.abs_diff(expected) > JITTER_NS
-                })
-        })
-}
-
-fn io_err(err: std::io::Error) -> TelemetryFormatError {
-    TelemetryFormatError::Io(err)
-}
-
-/// Errors from reading or writing a `.telemetry` file.
-#[derive(Debug, thiserror::Error)]
-pub enum TelemetryFormatError {
-    /// Filesystem failure.
-    #[error("telemetry I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    /// The zip profile or catalog is invalid.
-    #[error("invalid .telemetry file: {0}")]
-    Invalid(String),
-}
-
-impl From<ZipError> for TelemetryFormatError {
-    fn from(err: ZipError) -> Self {
-        Self::Invalid(err.0)
-    }
-}
-
-impl std::fmt::Display for ZipError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Index-mapped view of `inner` without pass-derived channels and without
-/// the applied-pass provenance.
-struct StrippedSource<'a> {
-    inner: &'a dyn TelemetrySource,
-    /// Inner channel index for each retained channel.
-    keep: Vec<usize>,
-    channels: Vec<Channel>,
-    visible: Vec<bool>,
-}
-
-impl<'a> StrippedSource<'a> {
-    fn new(inner: &'a dyn TelemetrySource) -> Self {
-        let outputs: HashSet<&str> = inner
-            .applied_passes()
-            .iter()
-            .flat_map(|pass| pass.outputs.iter().map(String::as_str))
-            .collect();
-        let inner_visible = inner.channel_visible();
-        let mut keep = Vec::new();
-        let mut channels = Vec::new();
-        let mut visible = Vec::new();
-        for (index, channel) in inner.channels().iter().enumerate() {
-            if outputs.contains(channel.name.as_str()) {
-                continue;
-            }
-            keep.push(index);
-            channels.push(channel.clone());
-            visible.push(inner_visible.get(index).copied().unwrap_or(true));
-        }
-        Self {
-            inner,
-            keep,
-            channels,
-            visible,
-        }
-    }
-}
-
-impl TelemetrySource for StrippedSource<'_> {
-    fn path(&self) -> &str {
-        self.inner.path()
-    }
-
-    fn format(&self) -> &'static str {
-        self.inner.format()
-    }
-
-    fn channels(&self) -> &[Channel] {
-        &self.channels
-    }
-
-    fn diagnostics(&self) -> &[motorsport_telemetry_core::Diagnostic] {
-        self.inner.diagnostics()
-    }
-
-    fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
-        self.inner
-            .decode(self.keep[channel_index], chunk_index, local_index)
-    }
-
-    fn chunk_bytes(&self, channel_index: usize, chunk_index: usize) -> Option<&[u8]> {
-        self.inner
-            .chunk_bytes(self.keep[channel_index], chunk_index)
-    }
-
-    fn sample_affine(&self, channel_index: usize) -> (f64, f64) {
-        self.inner.sample_affine(self.keep[channel_index])
-    }
-
-    fn absolute_time_range(&self) -> Option<AbsoluteTimeRange> {
-        self.inner.absolute_time_range()
-    }
-
-    fn utc_start_ns(&self) -> Option<u64> {
-        self.inner.utc_start_ns()
-    }
-
-    fn timezone(&self) -> String {
-        self.inner.timezone()
-    }
-
-    fn channel_visible(&self) -> &[bool] {
-        &self.visible
-    }
-
-    fn spans(&self) -> &[Span] {
-        self.inner.spans()
-    }
-
-    fn applied_passes(&self) -> &[AppliedPass] {
-        // The whole point: the raw conversion has no passes.
-        &[]
-    }
-
-    fn source_origin(&self) -> Option<SourceOrigin> {
-        self.inner.source_origin()
-    }
-
-    fn identity(&self) -> SourceIdentity {
-        self.inner.identity()
-    }
-
-    fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
-        self.inner.source_lap_metadata()
-    }
-
-    fn video_files(&self) -> &[VideoFileRef] {
-        self.inner.video_files()
-    }
-
-    fn video_presentation_times_ns(&self) -> Option<&[u64]> {
-        self.inner.video_presentation_times_ns()
-    }
-
-    fn video_frame_count(&self) -> Option<u64> {
-        self.inner.video_frame_count()
-    }
-
-    fn video_frame_at(&self, time_ns: u64) -> Option<u64> {
-        self.inner.video_frame_at(time_ns)
-    }
-
-    fn video_presentation_offset_ns(&self) -> Option<i128> {
-        self.inner.video_presentation_offset_ns()
-    }
-
-    fn sample_time_ns(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> u64 {
-        self.inner
-            .sample_time_ns(self.keep[channel_index], chunk_index, local_index)
-    }
-
-    fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
-        self.inner
-            .sample_at(self.keep[channel_index], time_ns, linear)
-    }
+/// An event channel carries explicit per-sample timestamps rather than a
+/// constant-rate grid. That is exactly what `sample_times` reports.
+fn is_event(source: &dyn TelemetrySource, index: usize) -> bool {
+    matches!(source.sample_times(index), SampleTimes::Explicit(_))
 }
 
 #[cfg(test)]
@@ -460,11 +326,12 @@ mod tests {
     use super::*;
     use crate::zip::parse_members;
     use crate::NativeRecording;
-    use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
+    use motorsport_telemetry_core::{
+        Channel, Chunk, SampleTimes, SampleType, TelemetrySource, UnitSource,
+    };
 
-    /// 50 Hz. Same threshold as [`is_event`].
+    /// 50 Hz grid period.
     const PERIOD_NS: u64 = 20_000_000;
-    const JITTER_NS: u64 = 2_000_000;
     const SAMPLE_COUNT: u64 = 4;
     const VALUES: [f64; 4] = [10.0, 11.0, 12.5, 13.0];
 
@@ -472,6 +339,8 @@ mod tests {
         channels: Vec<Channel>,
         values: Vec<Vec<f64>>,
         times: Vec<Vec<u64>>,
+        /// When true, the channel exposes its stamps as `SampleTimes::Explicit`.
+        explicit: Vec<bool>,
     }
 
     impl TelemetrySource for TinySource {
@@ -496,6 +365,14 @@ mod tests {
         ) -> u64 {
             let base = self.channels[channel_index].chunks[chunk_index].sample_base;
             self.times[channel_index][(base + local_index) as usize]
+        }
+        fn sample_times(&self, channel_index: usize) -> SampleTimes<'_> {
+            if self.explicit.get(channel_index).copied().unwrap_or(false) {
+                if let Some(stamps) = self.times.get(channel_index) {
+                    return SampleTimes::Explicit(stamps);
+                }
+            }
+            SampleTimes::Grid
         }
     }
 
@@ -535,25 +412,19 @@ mod tests {
         (0..count).map(|i| i * PERIOD_NS).collect()
     }
 
-    /// Alternate `+amp` / `-amp` around the 50 Hz lattice.
-    fn jittered_times(count: u64, amp: u64) -> Vec<u64> {
+    /// Irregular stamps that do not sit on the 50 Hz lattice.
+    fn irregular_times(count: u64) -> Vec<u64> {
         (0..count)
-            .map(|i| {
-                let expected = i * PERIOD_NS;
-                if i % 2 == 0 {
-                    expected + amp
-                } else {
-                    expected - amp
-                }
-            })
+            .map(|i| i * PERIOD_NS + if i % 2 == 0 { 5_000_000 } else { 0 })
             .collect()
     }
 
-    fn speed(times: Vec<u64>) -> TinySource {
+    fn speed(times: Vec<u64>, explicit: bool) -> TinySource {
         TinySource {
             channels: vec![hz50_channel("Speed", 1, SAMPLE_COUNT)],
             values: vec![VALUES.to_vec()],
             times: vec![times],
+            explicit: vec![explicit],
         }
     }
 
@@ -583,7 +454,7 @@ mod tests {
 
     #[test]
     fn regular_50hz_writes_kind0_without_time_member() {
-        let source = speed(grid_times(SAMPLE_COUNT));
+        let source = speed(grid_times(SAMPLE_COUNT), false);
         let (_dir, dest) = write_tiny(&source);
         let header = NativeRecording::read_header(&dest).unwrap();
         assert_eq!(header.channels.len(), 1);
@@ -602,34 +473,10 @@ mod tests {
     }
 
     #[test]
-    fn sub_2ms_jitter_still_regular() {
-        let amp = 400_000;
-        assert!(amp < JITTER_NS);
-        let source = speed(jittered_times(SAMPLE_COUNT, amp));
-        let (_dir, dest) = write_tiny(&source);
-        let header = NativeRecording::read_header(&dest).unwrap();
-        assert_eq!(header.channels[0].kind, 0);
-        assert!(header.channels[0].time_member.is_empty());
-        assert!(!zip_names(&dest)
-            .iter()
-            .any(|name| name.ends_with(".time.bin")));
-
-        // Regular write discards per-sample times; readers reconstruct the lattice.
-        let opened = NativeRecording::open_unchanged(&dest).unwrap();
-        assert_first_last_decode(&source, &opened, 0);
-        assert_eq!(opened.sample_time_ns(0, 0, 0), 0);
-        assert_eq!(opened.sample_time_ns(0, 0, 1), PERIOD_NS);
-        assert_ne!(
-            opened.sample_time_ns(0, 0, 0),
-            source.sample_time_ns(0, 0, 0)
-        );
-    }
-
-    #[test]
-    fn over_2ms_jitter_becomes_event_with_time_column() {
-        let amp = 5_000_000;
-        assert!(amp > JITTER_NS);
-        let source = speed(jittered_times(SAMPLE_COUNT, amp));
+    fn explicit_stamps_become_event_with_time_column() {
+        // A source that exposes SampleTimes::Explicit is an event channel:
+        // kind 1, a .time.bin member, and the stamps round-trip verbatim.
+        let source = speed(irregular_times(SAMPLE_COUNT), true);
         let (_dir, dest) = write_tiny(&source);
         let header = NativeRecording::read_header(&dest).unwrap();
         assert_eq!(header.channels[0].kind, 1);
@@ -649,6 +496,26 @@ mod tests {
     }
 
     #[test]
+    fn grid_source_with_irregular_stamps_stays_grid() {
+        // sample_times reports Grid, so even non-lattice stamps do not make
+        // an event channel: no time column is written and the reader
+        // reconstructs the grid.
+        let source = speed(irregular_times(SAMPLE_COUNT), false);
+        let (_dir, dest) = write_tiny(&source);
+        let header = NativeRecording::read_header(&dest).unwrap();
+        assert_eq!(header.channels[0].kind, 0);
+        assert!(header.channels[0].time_member.is_empty());
+        assert!(!zip_names(&dest)
+            .iter()
+            .any(|name| name.ends_with(".time.bin")));
+
+        let opened = NativeRecording::open_unchanged(&dest).unwrap();
+        assert_first_last_decode(&source, &opened, 0);
+        assert_eq!(opened.sample_time_ns(0, 0, 0), 0);
+        assert_eq!(opened.sample_time_ns(0, 0, 1), PERIOD_NS);
+    }
+
+    #[test]
     fn zero_sample_channels_have_no_payload_members() {
         let source = TinySource {
             channels: vec![
@@ -658,6 +525,7 @@ mod tests {
             ],
             values: vec![Vec::new(), VALUES.to_vec(), Vec::new()],
             times: vec![Vec::new(), grid_times(SAMPLE_COUNT), Vec::new()],
+            explicit: vec![false, false, false],
         };
         let (_dir, dest) = write_tiny(&source);
         let header = NativeRecording::read_header(&dest).unwrap();
@@ -676,7 +544,7 @@ mod tests {
 
     #[test]
     fn open_unchanged_decodes_first_and_last_samples() {
-        let source = speed(grid_times(SAMPLE_COUNT));
+        let source = speed(grid_times(SAMPLE_COUNT), false);
         let (_dir, dest) = write_tiny(&source);
         let unchanged = NativeRecording::open_unchanged(&dest).unwrap();
         assert_first_last_decode(&source, &unchanged, 0);

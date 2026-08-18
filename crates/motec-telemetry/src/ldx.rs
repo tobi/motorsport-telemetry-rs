@@ -232,19 +232,10 @@ pub struct LapMarkers {
     pub source_channel: String,
 }
 
-fn normalized_eq(value: &str, wanted: &str) -> bool {
-    value
-        .bytes()
-        .filter(u8::is_ascii_alphanumeric)
-        .map(|byte| byte.to_ascii_lowercase())
-        .eq(wanted.bytes())
-}
-
 fn channel_index(source: &dyn TelemetrySource, wanted: &str) -> Option<usize> {
-    source
-        .channels()
-        .iter()
-        .position(|channel| normalized_eq(&channel.name, wanted) && channel.sample_count > 0)
+    source.channels().iter().position(|channel| {
+        motorsport_telemetry_core::names::eq(&channel.name, wanted) && channel.sample_count > 0
+    })
 }
 
 fn transitions(source: &dyn TelemetrySource, index: usize, rising_pulse: bool) -> Vec<u64> {

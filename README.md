@@ -74,7 +74,7 @@ the planned lap-progress passes: [`docs/WHY_POSITIONING_IS_HARD.md`](docs/WHY_PO
 `TelemetrySource` to access source-exact channels and samples:
 
 ```rust,no_run
-use motorsport_telemetry::{open, motorsport_telemetry_core::TelemetrySource};
+use motorsport_telemetry::{open, motorsport_telemetry_core::TelemetrySource, SourceExt};
 
 let recording = open("run.mp4")?;
 println!("{} channels", recording.channels().len());
@@ -96,7 +96,7 @@ format-neutral checks for non-finite values, physically implausible values, and
 impossible packed sample footprints:
 
 ```rust,no_run
-# use motorsport_telemetry::open;
+# use motorsport_telemetry::{open, SourceExt};
 # let recording = open("run.pds")?;
 for diagnostic in recording.validate() {
     eprintln!("{diagnostic}");
@@ -108,13 +108,13 @@ The CLI prints the same report under `diagnostics:` in `inspect` (and as a JSON
 array under `--json`). `verify` returns non-zero for a proven decode-layout
 fault; ordinary warnings keep the file usable.
 
-`TelemetryFile::normalizer()` is intended for sampling loops. It resolves
+`SourceExt::normalizer()` is intended for sampling loops. It resolves
 signal roles and track context once, and lazily computes lap metadata at most
 once when lap progress needs that fallback.
 
 ## Core channels
 
-`TelemetryFile::normalizer().sample(time_ns)` is the stable way to read the
+`SourceExt::normalizer().sample(time_ns)` is the stable way to read the
 driver-facing signals. Names are matched after stripping punctuation and case;
 units are converted only when the registry can do so honestly. Missing or
 incompatible inputs stay `None`.
@@ -180,7 +180,7 @@ master-cylinder channels are handled together.
 ```rust
 use motorsport_telemetry::{
     motorsport_telemetry_core::{can_convert, convert, TelemetrySource},
-    open,
+    open, SourceExt,
 };
 
 fn maximum_between(

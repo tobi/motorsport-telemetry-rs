@@ -47,7 +47,7 @@ dates prefer a real source clock, but fall back to file creation when that clock
 is at least two years older or more than seven days newer.
 
 ```rust,no_run
-use motorsport_telemetry::{open, motorsport_telemetry_core::TelemetrySource};
+use motorsport_telemetry::{open, motorsport_telemetry_core::TelemetrySource, SourceExt};
 
 let file = open("run.mp4")?;
 let metadata = file.metadata();

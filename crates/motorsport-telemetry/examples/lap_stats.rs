@@ -1,6 +1,6 @@
 use motorsport_telemetry::{
     motorsport_telemetry_core::{can_convert, convert, TelemetrySource},
-    open,
+    open, SourceExt,
 };
 
 fn maximum_between(

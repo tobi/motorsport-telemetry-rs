@@ -2,11 +2,34 @@
 //!
 //! Bump [`FORMAT_VERSION`] when the on-disk layout changes, then add a step
 //! here. [`crate::NativeRecording::open`] rewrites writable older files.
+//!
+//! Migration only advances the catalog version and applies the structural
+//! changes each version requires. Placement recovery — deriving
+//! `utc_start_ns` and `timezone` from stored clocks and the track atlas — is
+//! deferred to the rewrite path ([`crate::NativeRecording::rewrite_migrated`]
+//! and the writers), which resolves them through
+//! `motorsport_telemetry_core::placement`. A catalog never invents an absolute
+//! instant or venue timezone on its own.
 
 use crate::catalog::{Catalog, FORMAT_VERSION};
+use motorsport_telemetry_core::ChannelDisplay;
+
+/// Errors from advancing a catalog to the current format version.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateError {
+    /// The catalog reports a version this build cannot migrate: either a
+    /// future version newer than [`FORMAT_VERSION`] or an unknown gap in the
+    /// step chain. Either way the file must not be silently rewritten as if
+    /// it were current.
+    #[error("unsupported catalog format version {0}")]
+    UnsupportedVersion(u16),
+}
 
 /// Applies every step from `catalog.format_version` up to [`FORMAT_VERSION`].
-pub fn apply(catalog: &mut Catalog) {
+///
+/// Returns [`MigrateError::UnsupportedVersion`] for a future/unknown version
+/// instead of silently leaving the catalog in place.
+pub fn apply(catalog: &mut Catalog) -> Result<(), MigrateError> {
     while catalog.format_version < FORMAT_VERSION {
         let before = catalog.format_version;
         match catalog.format_version {
@@ -19,12 +42,16 @@ pub fn apply(catalog: &mut Catalog) {
             7 => v7_to_v8(catalog),
             8 => v8_to_v9(catalog),
             9 => v9_to_v10(catalog),
-            _ => break,
+            other => return Err(MigrateError::UnsupportedVersion(other)),
         }
         if catalog.format_version <= before {
-            break;
+            return Err(MigrateError::UnsupportedVersion(before));
         }
     }
+    if catalog.format_version > FORMAT_VERSION {
+        return Err(MigrateError::UnsupportedVersion(catalog.format_version));
+    }
+    Ok(())
 }
 
 fn v1_to_v2(catalog: &mut Catalog) {
@@ -46,21 +73,11 @@ fn v2_to_v3(catalog: &mut Catalog) {
 }
 
 fn v3_to_v4(catalog: &mut Catalog) {
-    // v4 stamps UTC start-of-file and IANA timezone. Recover only from
-    // stored clocks and the track atlas. Do not invent a UTC instant.
-    if catalog.timezone.is_empty() {
-        if let Some(timezone) = motorsport_track_atlas::timezone_for_venue(&catalog.identity.venue)
-        {
-            catalog.timezone = timezone.to_owned();
-        }
-    }
-    if catalog.utc_start_ns.is_none() {
-        catalog.utc_start_ns = crate::placement::utc_from_clock(
-            catalog.clock.as_ref().map(|clock| clock.clock.as_str()),
-            catalog.clock.as_ref().map(|clock| clock.start_ns),
-            &catalog.timezone,
-        );
-    }
+    // v4 stamps UTC start-of-file and IANA timezone. The catalog itself does
+    // not recover them: the rewrite path fills `utc_start_ns` and `timezone`
+    // from the recording's clocks and venue via core placement, never
+    // inventing a value. Advancing the version here marks the file as v4 so
+    // the writer persists the resolved fields.
     catalog.format_version = 4;
 }
 
@@ -85,7 +102,7 @@ fn v5_to_v6(catalog: &mut Catalog) {
 fn v6_to_v7(catalog: &mut Catalog) {
     // v7 adds plot class / scale / rounding. Older channels stay traces.
     for channel in &mut catalog.channels {
-        channel.display = motorsport_telemetry_core::ChannelDisplay::trace();
+        channel.display = ChannelDisplay::trace();
         if !channel.display.plot.is_trace() {
             channel.labels.clear();
         }
@@ -120,11 +137,11 @@ fn v9_to_v10(catalog: &mut Catalog) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motorsport_telemetry_core::AbsoluteTimeRange;
 
-    #[test]
-    fn walks_from_missing_version_to_current() {
-        let mut catalog = Catalog {
-            format_version: 0,
+    fn empty_catalog(version: u16) -> Catalog {
+        Catalog {
+            format_version: version,
             identity: Default::default(),
             laps: Vec::new(),
             valid_laps: 0,
@@ -146,8 +163,36 @@ mod tests {
             presentation_offset_ns: None,
             spans: Vec::new(),
             passes: Vec::new(),
-        };
-        apply(&mut catalog);
+        }
+    }
+
+    #[test]
+    fn walks_from_missing_version_to_current() {
+        let mut catalog = empty_catalog(0);
+        apply(&mut catalog).unwrap();
+        assert_eq!(catalog.format_version, FORMAT_VERSION);
+        // apply advances the version only; placement recovery is deferred to
+        // the rewrite path, so a bare catalog stays without utc/timezone.
+        assert!(catalog.utc_start_ns.is_none());
+        assert!(catalog.timezone.is_empty());
+        assert!(catalog.spans.is_empty());
+    }
+
+    #[test]
+    fn apply_advances_v3_without_recovering_placement() {
+        // A v3 catalog with a gps clock and a known venue used to recover
+        // utc_start_ns/timezone inside the migration step. Recovery now lives
+        // in the rewrite path (core placement), so apply must only advance the
+        // version and leave placement fields empty.
+        let mut catalog = empty_catalog(3);
+        catalog.identity.venue = "Sebring".into();
+        catalog.clock = Some(AbsoluteTimeRange {
+            clock: "gps".into(),
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_000_000_100_000_000,
+            session_hint: String::new(),
+        });
+        apply(&mut catalog).unwrap();
         assert_eq!(catalog.format_version, FORMAT_VERSION);
         assert!(catalog.utc_start_ns.is_none());
         assert!(catalog.timezone.is_empty());
@@ -155,43 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn v3_recovers_utc_from_gps_and_timezone_from_venue() {
-        let mut catalog = Catalog {
-            format_version: 3,
-            identity: motorsport_telemetry_core::SourceIdentity {
-                venue: "Sebring".into(),
-                ..Default::default()
-            },
-            laps: Vec::new(),
-            valid_laps: 0,
-            channels: Vec::new(),
-            source_format: String::new(),
-            source_path: String::new(),
-            schema_hash: 0,
-            duration_ns: 0,
-            sample_count: 0,
-            channel_count: 0,
-            sampled_channel_count: 0,
-            session_hint: String::new(),
-            comment: String::new(),
-            clock: Some(motorsport_telemetry_core::AbsoluteTimeRange {
-                clock: "gps".into(),
-                start_ns: 1_700_000_000_000_000_000,
-                end_ns: 1_700_000_000_100_000_000,
-                session_hint: String::new(),
-            }),
-            utc_start_ns: None,
-            timezone: String::new(),
-            driver_stints: Vec::new(),
-            videos: Vec::new(),
-            presentation_offset_ns: None,
-            spans: Vec::new(),
-            passes: Vec::new(),
-        };
-        apply(&mut catalog);
-        assert_eq!(catalog.format_version, FORMAT_VERSION);
-        assert_eq!(catalog.utc_start_ns, Some(1_700_000_000_000_000_000));
-        assert_eq!(catalog.timezone, "America/New_York");
-        assert!(catalog.spans.is_empty());
+    fn rejects_future_version() {
+        let mut catalog = empty_catalog(FORMAT_VERSION + 1);
+        let err = apply(&mut catalog).unwrap_err();
+        assert!(matches!(err, MigrateError::UnsupportedVersion(v) if v == FORMAT_VERSION + 1));
     }
 }

@@ -219,7 +219,7 @@ fn missing_gps_skips_with_named_reasons() {
         data: vec![full.data[3].clone()],
     };
     let (passed, reports) = apply_registry(&source).unwrap();
-    assert_eq!(passed.derived_len(), 2); // odometer + sigma only
+    assert_eq!(passed.appended_len(), 2); // odometer + sigma only
     for name in ["gps.quality", "gps.clean"] {
         let report = reports.iter().find(|report| report.name == name).unwrap();
         assert_eq!(

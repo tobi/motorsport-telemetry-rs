@@ -1,5 +1,25 @@
 # Agent notes
 
+## Shared primitives (`crates/telemetry-core`)
+
+Readers implement `TelemetrySource` and nothing beside it. Timing is one of
+two models declared by `sample_times()`: `SampleTimes::Grid` (chunk
+`time_base_ns + local * sample_period_ns`) or `SampleTimes::Explicit(&[u64])`
+(one stamp per sample, channel-global index). `sample_time_ns` and
+`sample_at` are core defaults dispatching on that; never override them. The
+native writer classifies a channel as event-timed purely from `Explicit`.
+Other things that live in core and must not be re-implemented per crate:
+`storage::Storage` (mmap/owned bytes), `SampleType::decode_le/encode_le` +
+`sample_bytes`/`chunk_bytes` (checked packed-sample access; malformed
+offsets decode to NaN, never panic), `names::{normalize,eq,contains,find}`
+(channel-name matching), `ViewSource` (subset/reorder/append over another
+source; passes and `write_from_source_stripped` are built on it),
+`placement` (UTC start + venue timezone), and blanket
+`TelemetrySource` impls for `&T`/`Box<T>`/`Arc<T>` (the facade's
+`TelemetryFile` is `Box<dyn TelemetrySource>`; cross-format helpers are the
+`SourceExt` trait in `motorsport-telemetry`). Adding a trait method means
+adding it to the blanket macro and `ViewSource` once.
+
 ## `.telemetry` format version
 
 `FORMAT_VERSION` in `crates/telemetry-format/src/catalog.rs` is the on-disk

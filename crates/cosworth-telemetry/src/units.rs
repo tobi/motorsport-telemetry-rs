@@ -39,6 +39,7 @@
 //! supports it; otherwise units degrade to [`UnitSource::Unknown`] rather than
 //! being invented.
 
+use motorsport_telemetry_core::units::{lookup as lookup_unit, Dimension};
 use motorsport_telemetry_core::UnitSource;
 
 /// A physical dimension a PDS channel can carry.
@@ -117,62 +118,58 @@ impl Quantity {
         }
     }
 
-    /// The SI unit PDS uses to store this dimension.
+    /// The core dimension this quantity maps to, if any.
     ///
-    /// Returns `None` for dimensionless channels and unrecognised codes: there
-    /// is no unit to report, and inventing one is exactly the bug this module
-    /// exists to prevent.
-    pub fn si_unit(self) -> Option<&'static str> {
+    /// Dimensionless channels, per-unit ratios, and unrecognised codes have
+    /// no dimension: there is no unit to report, and inventing one is exactly
+    /// the bug this module exists to prevent.
+    pub fn dimension(self) -> Option<Dimension> {
         Some(match self {
-            Self::Length => "m",
-            Self::Volume => "m^3",
-            Self::Speed => "m/s",
-            Self::Temperature => "K",
-            Self::Time | Self::AbsoluteTime => "s",
-            Self::Angle => "rad",
-            Self::AngularVelocity => "rad/s",
-            Self::AngularAcceleration => "rad/s^2",
-            Self::Pressure => "Pa",
-            Self::Acceleration => "m/s^2",
-            Self::Voltage => "V",
-            Self::Current => "A",
-            Self::Mass => "kg",
-            Self::Force => "N",
-            Self::Torque => "N.m",
-            // Dimensionless, per-unit ratios and unknown codes have no unit.
+            Self::Length => Dimension::Length,
+            Self::Volume => Dimension::Volume,
+            Self::Speed => Dimension::Speed,
+            Self::Temperature => Dimension::Temperature,
+            Self::Time | Self::AbsoluteTime => Dimension::Time,
+            Self::Angle => Dimension::Angle,
+            Self::AngularVelocity => Dimension::AngularVelocity,
+            Self::AngularAcceleration => Dimension::AngularAcceleration,
+            Self::Pressure => Dimension::Pressure,
+            Self::Acceleration => Dimension::Acceleration,
+            Self::Voltage => Dimension::Voltage,
+            Self::Current => Dimension::Current,
+            Self::Mass => Dimension::Mass,
+            Self::Force => Dimension::Force,
+            Self::Torque => Dimension::Torque,
             Self::Dimensionless | Self::PerUnit | Self::Unknown(_) => return None,
         })
     }
 
+    /// The SI unit PDS uses to store this dimension.
+    ///
+    /// Returns the core canonical base-unit string for this quantity's
+    /// dimension. Returns `None` for dimensionless channels and unrecognised
+    /// codes.
+    pub fn si_unit(self) -> Option<&'static str> {
+        self.dimension().map(Dimension::base_unit)
+    }
+
     /// Whether a declared unit string is consistent with this dimension.
     ///
-    /// Used to score candidate field offsets during layout detection, so it
-    /// accepts the spellings real files use rather than requiring an exact
-    /// match against [`Self::si_unit`].
+    /// Used to score candidate field offsets during layout detection. For
+    /// quantities with a known dimension the unit is looked up in the core
+    /// registry and its dimension is compared, so the accepted spellings are
+    /// exactly those the registry knows. Dimensionless, per-unit, and unknown
+    /// quantities use the PDS-specific marker lists instead.
     fn accepts(self, unit: &str) -> bool {
         let text = unit.trim();
-        let any = |values: &[&str]| values.iter().any(|value| text.eq_ignore_ascii_case(value));
         match self {
-            Self::Length => any(&["m", "mm", "cm", "km"]),
-            Self::Volume => any(&["m^3", "l", "litre", "liter", "ml", "cc"]),
-            Self::Speed => any(&["m/s", "km/h", "kph", "mph"]),
-            Self::Temperature => any(&["k", "c", "degc", "f"]),
-            Self::Time => any(&["s", "sec", "ms", "us", "min"]),
-            Self::AbsoluteTime => any(&["s", "sec", "date", "time"]),
-            Self::Angle => any(&["rad", "deg", "degree", "degrees"]),
-            Self::AngularVelocity => any(&["rad/s", "rpm", "deg/s"]),
-            Self::AngularAcceleration => any(&["rad/s^2", "rad/s2", "deg/s^2"]),
-            Self::Pressure => any(&["pa", "kpa", "bar", "mbar", "psi"]),
-            Self::Acceleration => any(&["m/s^2", "m/s2", "g", "mps_2"]),
-            Self::Voltage => any(&["v", "mv", "volt", "volts"]),
-            Self::Current => any(&["a", "ma", "amp", "amps"]),
-            Self::Mass => any(&["kg", "g", "lb"]),
-            Self::Force => any(&["n", "kn", "lbf"]),
-            Self::Torque => any(&["nm", "n.m", "n-m", "lbft"]),
-            Self::PerUnit => any(&["pp1", "%", "ratio", ""]),
-            // Dimensionless channels legitimately carry marker text.
+            Self::PerUnit => matches!(
+                text.to_ascii_lowercase().as_str(),
+                "pp1" | "%" | "ratio" | ""
+            ),
             Self::Dimensionless => text.is_empty() || is_dimensionless_marker(text),
             Self::Unknown(_) => true,
+            _ => lookup_unit(text).is_some_and(|def| def.dimension == self.dimension().unwrap()),
         }
     }
 }

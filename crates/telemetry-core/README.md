@@ -100,3 +100,25 @@ use motorsport_telemetry_core::{average_timespan_ms, format_timespan_ms};
 assert_eq!(format_timespan_ms(110_332), "1:50.332");
 assert_eq!(average_timespan_ms(&[110_332, 112_104]), Some(111_218));
 ```
+
+## Names, storage, views, and placement
+
+Channel-name matching, byte storage, derived-channel views, and absolute
+placement are shared here so every parser and the facade reuse one
+implementation:
+
+- `names::{normalize, eq, contains, find}` match channel names after dropping
+  punctuation/case. `find` returns the first channel matching any name in
+  priority order.
+- `storage::Storage` is a memory-mapped or owned `[u8]` backing buffer.
+- `SampleType::decode_le`/`encode_le` and the free `sample_bytes`/`chunk_bytes`
+  helpers decode and slice packed native samples with checked arithmetic.
+- `SampleTimes` distinguishes grid-derived instants from explicit per-sample
+  stamps; `TelemetrySource::sample_times` defaults to grid and the
+  `sample_time_ns`/`sample_at` defaults dispatch on it.
+- `view::ViewSource` exposes a subset of an inner source's channels plus
+  in-memory appended channels that mirror an existing channel's layout and
+  sample times.
+- `placement::{resolve_timezone, resolve_utc_start_ns, utc_from_metadata,
+  civil_ns_to_utc_ns}` resolve venue timezone and UTC start-of-file;
+  `read_source_metadata` fills `utc_start_ns`/`timezone` from them.

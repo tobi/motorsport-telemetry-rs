@@ -1,10 +1,10 @@
 //! `gps.clean` — masked decimal-degree coordinates safe to position from.
 
 use crate::{
-    collect_samples, degrees_precondition, find_channel, gps_quality, Applicability,
+    collect_samples, degrees_precondition, gps_quality, sample_times_monotonic, Applicability,
     DerivedChannel, PassError, PassOutput, TelemetryPass,
 };
-use motorsport_telemetry_core::TelemetrySource;
+use motorsport_telemetry_core::{names, TelemetrySource};
 
 /// Motion faster than this between consecutive fixes is a teleport, not a
 /// race car (150 m/s = 540 km/h).
@@ -46,8 +46,8 @@ impl TelemetryPass for GpsClean {
     fn check(&self, source: &dyn TelemetrySource) -> Applicability {
         let channels = source.channels();
         let (Some(latitude), Some(longitude)) = (
-            find_channel(channels, gps_quality::LATITUDE),
-            find_channel(channels, gps_quality::LONGITUDE),
+            names::find(channels, gps_quality::LATITUDE),
+            names::find(channels, gps_quality::LONGITUDE),
         ) else {
             return Applicability::Skipped {
                 reason: "no GPS coordinate channels present".to_owned(),
@@ -59,6 +59,10 @@ impl TelemetryPass for GpsClean {
             };
         }
         match degrees_precondition(source, latitude) {
+            Ok(()) => {}
+            Err(reason) => return Applicability::Skipped { reason },
+        }
+        match sample_times_monotonic(source, latitude) {
             Ok(()) => Applicability::Ready,
             Err(reason) => Applicability::Skipped { reason },
         }
@@ -67,15 +71,15 @@ impl TelemetryPass for GpsClean {
     fn derive(&self, source: &dyn TelemetrySource) -> Result<PassOutput, PassError> {
         let channels = source.channels();
         let (Some(latitude), Some(longitude)) = (
-            find_channel(channels, gps_quality::LATITUDE),
-            find_channel(channels, gps_quality::LONGITUDE),
+            names::find(channels, gps_quality::LATITUDE),
+            names::find(channels, gps_quality::LONGITUDE),
         ) else {
             return Err(PassError::Precondition {
                 pass: self.label(),
                 reason: "no GPS coordinate channels present".to_owned(),
             });
         };
-        let fix_valid = find_channel(channels, &["gpsfixvalid"]);
+        let fix_valid = names::find(channels, &["gpsfixvalid"]);
 
         let samples = collect_samples(source, latitude);
         let mut clean_latitude = Vec::with_capacity(samples.len());
@@ -100,7 +104,19 @@ impl TelemetryPass for GpsClean {
             let mut accept = flagged_valid && sane;
             if accept {
                 if let Some((last_ns, last_lat, last_lon)) = last_accepted {
-                    let dt = (time_ns.saturating_sub(last_ns)) as f64 / 1e9;
+                    let dt_ns =
+                        time_ns
+                            .checked_sub(last_ns)
+                            .ok_or_else(|| PassError::Precondition {
+                                pass: self.label(),
+                                reason: format!(
+                                    "channel {:?} has non-monotonic sample times \
+                                 (timestamp went backwards); source timestamps \
+                                 must be non-decreasing",
+                                    channels[latitude].name
+                                ),
+                            })?;
+                    let dt = dt_ns as f64 / 1e9;
                     if dt > 0.0
                         && equirectangular_m(last_lat, last_lon, lat, lon) / dt > MAX_SPEED_MPS
                     {

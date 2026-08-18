@@ -1,10 +1,10 @@
 //! `gps.quality` — grade every GPS fix and derive a position sigma.
 
 use crate::{
-    collect_samples, degrees_precondition, find_channel, Applicability, DerivedChannel, PassError,
-    PassOutput, TelemetryPass,
+    collect_samples, degrees_precondition, Applicability, DerivedChannel, PassError, PassOutput,
+    TelemetryPass,
 };
-use motorsport_telemetry_core::TelemetrySource;
+use motorsport_telemetry_core::{names, TelemetrySource};
 
 /// Latitude channel names, in priority order (normalized).
 pub(crate) const LATITUDE: &[&str] = &["gpslatitude", "latitude", "gpslat", "lat"];
@@ -73,8 +73,8 @@ impl TelemetryPass for GpsQuality {
     fn check(&self, source: &dyn TelemetrySource) -> Applicability {
         let channels = source.channels();
         let (Some(latitude), Some(longitude)) = (
-            find_channel(channels, LATITUDE),
-            find_channel(channels, LONGITUDE),
+            names::find(channels, LATITUDE),
+            names::find(channels, LONGITUDE),
         ) else {
             return Applicability::Skipped {
                 reason: "no GPS coordinate channels present".to_owned(),
@@ -94,18 +94,18 @@ impl TelemetryPass for GpsQuality {
     fn derive(&self, source: &dyn TelemetrySource) -> Result<PassOutput, PassError> {
         let channels = source.channels();
         let (Some(latitude), Some(longitude)) = (
-            find_channel(channels, LATITUDE),
-            find_channel(channels, LONGITUDE),
+            names::find(channels, LATITUDE),
+            names::find(channels, LONGITUDE),
         ) else {
             return Err(PassError::Precondition {
                 pass: self.label(),
                 reason: "no GPS coordinate channels present".to_owned(),
             });
         };
-        let fix_type = find_channel(channels, FIX_TYPE);
-        let satellites = find_channel(channels, SATELLITES);
-        let accuracy = find_channel(channels, ACCURACY);
-        let dop = find_channel(channels, DOP);
+        let fix_type = names::find(channels, FIX_TYPE);
+        let satellites = names::find(channels, SATELLITES);
+        let accuracy = names::find(channels, ACCURACY);
+        let dop = names::find(channels, DOP);
 
         let samples = collect_samples(source, latitude);
         let mut valid = Vec::with_capacity(samples.len());
@@ -136,13 +136,13 @@ impl TelemetryPass for GpsQuality {
             sigma.push(if !is_valid {
                 f32::NAN
             } else if let Some(acc) = acc.filter(|acc| acc.is_finite() && *acc > 0.0) {
-                acc as f32
+                to_f32_clamped(acc)
             } else if let Some(hdop) =
                 hdop.filter(|dop| dop.is_finite() && *dop > 0.0 && *dop < 99.0)
             {
-                (hdop * UERE_M) as f32
+                to_f32_clamped(hdop * UERE_M)
             } else {
-                DEFAULT_SIGMA_M as f32
+                to_f32_clamped(DEFAULT_SIGMA_M)
             });
         }
 
@@ -168,4 +168,24 @@ impl TelemetryPass for GpsQuality {
             ],
         })
     }
+}
+
+/// Narrows an `f64` to `f32` clamping to the finite `f32` range instead of
+/// saturating to infinity.
+///
+/// A bare `as f32` cast turns an out-of-range finite `f64` into `f32::INF`,
+/// which would silently corrupt the sigma channel. Position accuracies are
+/// always small in practice, but the clamp makes the narrowing safe by
+/// construction rather than by assumption.
+fn to_f32_clamped(value: f64) -> f32 {
+    if value.is_nan() {
+        return f32::NAN;
+    }
+    if value > f32::MAX as f64 {
+        return f32::MAX;
+    }
+    if value < f32::MIN as f64 {
+        return f32::MIN;
+    }
+    value as f32
 }

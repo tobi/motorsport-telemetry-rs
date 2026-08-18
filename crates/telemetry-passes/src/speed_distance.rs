@@ -1,10 +1,10 @@
 //! `speed.distance` — integrated odometer with an honest uncertainty.
 
 use crate::{
-    collect_samples, find_channel, Applicability, DerivedChannel, PassError, PassOutput,
+    collect_samples, sample_times_monotonic, Applicability, DerivedChannel, PassError, PassOutput,
     TelemetryPass,
 };
-use motorsport_telemetry_core::{convert, TelemetrySource};
+use motorsport_telemetry_core::{convert, names, TelemetrySource};
 
 /// Speed channels in preference order (normalized). Chassis-derived speed
 /// integrates better than GPS speed — it never drops out under bridges or
@@ -40,7 +40,7 @@ pub struct SpeedDistance;
 impl SpeedDistance {
     fn speed_channel(&self, source: &dyn TelemetrySource) -> Result<usize, String> {
         let channels = source.channels();
-        let Some(index) = find_channel(channels, SPEED) else {
+        let Some(index) = names::find(channels, SPEED) else {
             return Err("no speed channel present (looked for ground, reference, \
                  corrected, vehicle, wheel, and GPS speed)"
                 .to_owned());
@@ -86,8 +86,12 @@ impl TelemetryPass for SpeedDistance {
     }
 
     fn check(&self, source: &dyn TelemetrySource) -> Applicability {
-        match self.speed_channel(source) {
-            Ok(_) => Applicability::Ready,
+        let speed_index = match self.speed_channel(source) {
+            Ok(index) => index,
+            Err(reason) => return Applicability::Skipped { reason },
+        };
+        match sample_times_monotonic(source, speed_index) {
+            Ok(()) => Applicability::Ready,
             Err(reason) => Applicability::Skipped { reason },
         }
     }
@@ -117,7 +121,19 @@ impl TelemetryPass for SpeedDistance {
                 speed = previous.map_or(0.0, |(_, last)| last.max(0.0));
             }
             if let Some((last_ns, last_speed)) = previous {
-                let dt = (time_ns.saturating_sub(last_ns)) as f64 / 1e9;
+                let dt_ns =
+                    time_ns
+                        .checked_sub(last_ns)
+                        .ok_or_else(|| PassError::Precondition {
+                            pass: self.label(),
+                            reason: format!(
+                                "speed channel {:?} has non-monotonic sample times \
+                         (timestamp went backwards); source timestamps must be \
+                         non-decreasing",
+                                channel.name
+                            ),
+                        })?;
+                let dt = dt_ns as f64 / 1e9;
                 let segment = 0.5 * (last_speed + speed) * dt;
                 distance_m += segment;
                 if dt > MAX_GAP_S {

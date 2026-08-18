@@ -3,10 +3,9 @@
 use crate::catalog::{decode, Catalog};
 use crate::write::TelemetryFormatError;
 use crate::zip::{parse_members, read_first_member, ZipWriter};
-use memmap2::Mmap;
 use motorsport_telemetry_core::{
-    AppliedPass, Channel, Diagnostic, FileMetadata, SampleType, SourceIdentity, SourceLapMetadata,
-    SourceOrigin, Span, TelemetrySource, VideoFileRef,
+    storage::Storage, AppliedPass, Channel, Diagnostic, FileMetadata, SampleTimes, SourceIdentity,
+    SourceLapMetadata, SourceOrigin, Span, TelemetrySource, VideoFileRef,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -24,22 +23,6 @@ pub struct NativeRecording {
     video_times: Option<(usize, usize)>,
     diagnostics: Vec<Diagnostic>,
     data: Storage,
-}
-
-#[derive(Debug)]
-enum Storage {
-    Mapped(Mmap),
-    Owned(Box<[u8]>),
-}
-
-impl std::ops::Deref for Storage {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Mapped(value) => value,
-            Self::Owned(value) => value,
-        }
-    }
 }
 
 impl NativeRecording {
@@ -61,14 +44,27 @@ impl NativeRecording {
     pub fn open_unchanged(path: impl AsRef<Path>) -> Result<Self, TelemetryFormatError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
-        let file = File::open(path)?;
-        let mapped = unsafe { Mmap::map(&file)? };
-        Self::from_storage(display, Storage::Mapped(mapped))
+        let storage = Storage::open(path)?;
+        Self::from_storage(display, storage)
     }
 
     fn rewrite_migrated(&self, path: &Path) -> Result<(), TelemetryFormatError> {
         let mut catalog = self.catalog.clone();
-        crate::migrate::apply(&mut catalog);
+        crate::migrate::apply(&mut catalog)
+            .map_err(|err| TelemetryFormatError::Invalid(err.to_string()))?;
+        // v4+ requires `utc_start_ns` and `timezone`. Pre-v4 catalogs have
+        // neither; recover them from the recording's clocks and venue through
+        // core placement (never inventing a value) instead of leaving the
+        // migrated catalog without absolute placement.
+        if catalog.format_version >= 4 {
+            let metadata = motorsport_telemetry_core::read_source_metadata(self);
+            if catalog.timezone.is_empty() {
+                catalog.timezone = metadata.timezone.clone();
+            }
+            if catalog.utc_start_ns.is_none() {
+                catalog.utc_start_ns = metadata.utc_start_ns;
+            }
+        }
         for lap in &mut catalog.laps {
             if lap.first_video_frame.is_none() {
                 lap.first_video_frame = self.video_frame_at(lap.start_ns);
@@ -84,8 +80,15 @@ impl NativeRecording {
                 if member.name == "metadata.fb" {
                     continue;
                 }
-                let start = member.offset as usize;
-                let end = start + member.size as usize;
+                let start = usize::try_from(member.offset).map_err(|_| {
+                    TelemetryFormatError::Invalid(format!("{} offset overflows usize", member.name))
+                })?;
+                let size = usize::try_from(member.size).map_err(|_| {
+                    TelemetryFormatError::Invalid(format!("{} size overflows usize", member.name))
+                })?;
+                let end = start.checked_add(size).ok_or_else(|| {
+                    TelemetryFormatError::Invalid(format!("{} range overflows usize", member.name))
+                })?;
                 let bytes = self.data.get(start..end).ok_or_else(|| {
                     TelemetryFormatError::Invalid(format!("{} is out of range", member.name))
                 })?;
@@ -108,7 +111,7 @@ impl NativeRecording {
         path: impl Into<String>,
         data: Vec<u8>,
     ) -> Result<Self, TelemetryFormatError> {
-        Self::from_storage(path.into(), Storage::Owned(data.into_boxed_slice()))
+        Self::from_storage(path.into(), Storage::from_vec(data))
     }
 
     /// Reads only `metadata.fb`. Cost is independent of channel payload size.
@@ -190,8 +193,15 @@ impl NativeRecording {
             .iter()
             .find(|member| member.name == "metadata.fb")
             .ok_or_else(|| TelemetryFormatError::Invalid("missing metadata.fb".into()))?;
-        let start = meta.offset as usize;
-        let end = start + meta.size as usize;
+        let start = usize::try_from(meta.offset).map_err(|_| {
+            TelemetryFormatError::Invalid("metadata.fb offset overflows usize".into())
+        })?;
+        let size = usize::try_from(meta.size).map_err(|_| {
+            TelemetryFormatError::Invalid("metadata.fb size overflows usize".into())
+        })?;
+        let end = start.checked_add(size).ok_or_else(|| {
+            TelemetryFormatError::Invalid("metadata.fb range overflows usize".into())
+        })?;
         let catalog =
             decode(data.get(start..end).ok_or_else(|| {
                 TelemetryFormatError::Invalid("metadata.fb is out of range".into())
@@ -280,10 +290,15 @@ impl NativeRecording {
                     .with_channel(&channel.name),
                 );
             }
-            let mut time_member = by_name
-                .get(channel.time_member.as_str())
-                .copied()
-                .map(|member| (member.offset as usize, member.size as usize));
+            let mut time_member =
+                by_name
+                    .get(channel.time_member.as_str())
+                    .copied()
+                    .and_then(|member| {
+                        let offset = usize::try_from(member.offset).ok()?;
+                        let size = usize::try_from(member.size).ok()?;
+                        Some((offset, size))
+                    });
             if time_member.is_none() && !channel.time_member.is_empty() {
                 diagnostics.push(
                     Diagnostic::warning(
@@ -296,9 +311,29 @@ impl NativeRecording {
                     )
                     .with_channel(&channel.name),
                 );
-            } else if let Some((_, size)) = time_member {
+            } else if let Some((offset, size)) = time_member {
+                // The timestamp member is a little-endian u64 STORE. The zip
+                // profile 64-byte-aligns the payload; confirm the actual byte
+                // address is 8-byte aligned (mmap base + offset) and that the
+                // size is a whole number of u64s. A misaligned or odd-sized
+                // member is not safe to reinterpret as &[u64], so drop it to
+                // the grid model and report the recovery.
+                let ptr_aligned = (data.as_ptr() as usize).wrapping_add(offset) % 8 == 0;
                 let required = sample_count.saturating_mul(8);
-                if (size as u64) < required {
+                if !ptr_aligned || size % 8 != 0 {
+                    diagnostics.push(
+                        Diagnostic::warning(
+                            "telemetry.member_unaligned",
+                            format!(
+                                "channel \"{}\" timestamp member \"{}\" is not 8-byte aligned \
+                                 or not a multiple of 8 bytes; irregular timestamps were dropped",
+                                channel.name, channel.time_member,
+                            ),
+                        )
+                        .with_channel(&channel.name),
+                    );
+                    time_member = None;
+                } else if (size as u64) < required {
                     diagnostics.push(
                         Diagnostic::warning(
                             "telemetry.member_truncated",
@@ -427,42 +462,28 @@ impl TelemetrySource for NativeRecording {
     }
 
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
-        let channel = &self.channels[channel_index];
-        let chunk = &channel.chunks[chunk_index];
-        let width = channel.sample_type.byte_width();
-        let offset = chunk.data_ptr as usize + local_index as usize * width;
-        let raw = match channel.sample_type {
-            SampleType::I8 => self.data[offset] as i8 as f64,
-            SampleType::U8 => self.data[offset] as f64,
-            SampleType::I16 => {
-                i16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as f64
-            }
-            SampleType::U16 => {
-                u16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as f64
-            }
-            SampleType::I32 => {
-                i32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64
-            }
-            SampleType::U32 => {
-                u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64
-            }
-            SampleType::F32 => {
-                f32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64
-            }
-            SampleType::F64 => {
-                f64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap())
-            }
+        let Some(channel) = self.channels.get(channel_index) else {
+            return f64::NAN;
         };
-        let (scale, bias) = self.affines[channel_index];
+        let Some(chunk) = channel.chunks.get(chunk_index) else {
+            return f64::NAN;
+        };
+        let width = channel.sample_type.byte_width();
+        let raw = motorsport_telemetry_core::sample_bytes(&self.data, chunk, local_index, width)
+            .and_then(|bytes| channel.sample_type.decode_le(bytes))
+            .unwrap_or(f64::NAN);
+        let (scale, bias) = self
+            .affines
+            .get(channel_index)
+            .copied()
+            .unwrap_or((1.0, 0.0));
         raw.mul_add(scale, bias)
     }
 
     fn chunk_bytes(&self, channel_index: usize, chunk_index: usize) -> Option<&[u8]> {
         let channel = self.channels.get(channel_index)?;
         let chunk = channel.chunks.get(chunk_index)?;
-        let start = usize::try_from(chunk.data_ptr).ok()?;
-        let len = usize::try_from(chunk.sample_count).ok()? * channel.sample_type.byte_width();
-        self.data.get(start..start + len)
+        motorsport_telemetry_core::chunk_bytes(&self.data, chunk, channel.sample_type.byte_width())
     }
 
     fn sample_affine(&self, channel_index: usize) -> (f64, f64) {
@@ -472,56 +493,20 @@ impl TelemetrySource for NativeRecording {
             .unwrap_or((1.0, 0.0))
     }
 
-    fn sample_time_ns(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> u64 {
-        if let Some((start, size)) = self.times[channel_index] {
-            let at = start + local_index as usize * 8;
-            if at + 8 <= start + size {
-                return u64::from_le_bytes(self.data[at..at + 8].try_into().unwrap());
+    fn sample_times(&self, channel_index: usize) -> SampleTimes<'_> {
+        match self.times.get(channel_index).copied().flatten() {
+            Some((start, size)) if size % 8 == 0 => {
+                // Alignment and whole-u64 size were verified at open; the
+                // payload is a little-endian u64 STORE, reinterpreted as
+                // &[u64] without copying.
+                let bytes = &self.data[start..start + size];
+                let stamps = unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr().cast::<u64>(), bytes.len() / 8)
+                };
+                SampleTimes::Explicit(stamps)
             }
+            _ => SampleTimes::Grid,
         }
-        let chunk = &self.channels[channel_index].chunks[chunk_index];
-        chunk
-            .time_base_ns
-            .saturating_add(local_index.saturating_mul(chunk.sample_period_ns))
-    }
-
-    fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
-        let Some((start, size)) = self.times.get(channel_index).copied().flatten() else {
-            return default_dense_sample_at(self, channel_index, time_ns, linear);
-        };
-        let count =
-            (size / 8).min(usize::try_from(self.channels.get(channel_index)?.sample_count).ok()?);
-        if count == 0 {
-            return None;
-        }
-        let time_at = |index: usize| {
-            u64::from_le_bytes(
-                self.data[start + index * 8..start + index * 8 + 8]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-        let mut lo = 0usize;
-        let mut hi = count;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if time_at(mid) <= time_ns {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        let lower = lo.saturating_sub(1).min(count - 1);
-        let a = self.decode(channel_index, 0, lower as u64);
-        if !linear || self.channels[channel_index].uses_step_interpolation() || lo >= count {
-            return Some(a);
-        }
-        let interval = time_at(lo).saturating_sub(time_at(lower));
-        if interval == 0 {
-            return Some(a);
-        }
-        let fraction = time_ns.saturating_sub(time_at(lower)) as f64 / interval as f64;
-        Some(a + (self.decode(channel_index, 0, lo as u64) - a) * fraction)
     }
 
     fn identity(&self) -> SourceIdentity {
@@ -631,45 +616,10 @@ impl TelemetrySource for NativeRecording {
             },
         )
     }
-}
 
-fn default_dense_sample_at(
-    source: &NativeRecording,
-    channel_index: usize,
-    time_ns: u64,
-    linear: bool,
-) -> Option<f64> {
-    let channel = source.channels().get(channel_index)?;
-    if time_ns >= channel.duration_ns || channel.chunks.is_empty() {
-        return None;
+    fn metadata(&self) -> FileMetadata {
+        self.catalog.to_file_metadata(&self.path)
     }
-    let chunk_index = channel.chunks.partition_point(|chunk| {
-        chunk
-            .time_base_ns
-            .saturating_add(chunk.sample_count.saturating_mul(chunk.sample_period_ns))
-            <= time_ns
-    });
-    let chunk = channel.chunks.get(chunk_index)?;
-    let sample = (time_ns.saturating_sub(chunk.time_base_ns) / chunk.sample_period_ns)
-        .min(chunk.sample_count - 1);
-    let a = source.decode(channel_index, chunk_index, sample);
-    if !linear || channel.uses_step_interpolation() {
-        return Some(a);
-    }
-    if sample + 1 >= chunk.sample_count {
-        return Some(a);
-    }
-    let interval = chunk.sample_period_ns;
-    if interval == 0 {
-        return Some(a);
-    }
-    let fraction = time_ns.saturating_sub(
-        chunk
-            .time_base_ns
-            .saturating_add(sample.saturating_mul(interval)),
-    ) as f64
-        / interval as f64;
-    Some(a + (source.decode(channel_index, chunk_index, sample + 1) - a) * fraction)
 }
 
 fn writable(path: &Path) -> bool {

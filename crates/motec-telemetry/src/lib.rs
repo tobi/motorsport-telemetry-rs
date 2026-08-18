@@ -1,13 +1,10 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
-#[cfg(not(target_os = "emscripten"))]
-use memmap2::Mmap;
 use motorsport_telemetry_core::{
-    Channel, Chunk, Diagnostic, SampleType, SourceLapMetadata, TelemetrySource, UnitSource,
+    chunk_bytes as core_chunk_bytes, sample_bytes as core_sample_bytes, Channel, Chunk, Diagnostic,
+    SampleType, SourceLapMetadata, Storage, TelemetrySource, UnitSource,
 };
-#[cfg(not(target_os = "emscripten"))]
-use std::fs::File;
 #[cfg(not(target_os = "emscripten"))]
 use std::path::Path;
 use thiserror::Error;
@@ -81,23 +78,6 @@ struct Encoding {
     width: usize,
     factor: f64,
     offset: f64,
-}
-
-#[derive(Debug)]
-enum Storage {
-    #[cfg(not(target_os = "emscripten"))]
-    Mapped(Mmap),
-    Owned(Box<[u8]>),
-}
-impl std::ops::Deref for Storage {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        match self {
-            #[cfg(not(target_os = "emscripten"))]
-            Self::Mapped(value) => value,
-            Self::Owned(value) => value,
-        }
-    }
 }
 
 /// An opened MoTeC LD telemetry source and its embedded session identity.
@@ -195,38 +175,17 @@ fn parse_datetime_ns(date: &str, time: &str) -> Option<u64> {
     u64::try_from(seconds).ok()?.checked_mul(1_000_000_000)
 }
 
-/// Whether [`TelemetrySource::decode`] would return 0.0 for a channel with
-/// this encoding — the silent fallback when the datatype/width combination has
-/// no interpretable decode path but the channel still carries samples.
-fn decode_would_return_zero(datatype_a: u16, width: usize) -> bool {
-    if datatype_a == 0x07 {
-        // Float type 0x07: only widths 4 and 8 are decoded; width 2 yields 0.0.
-        !matches!(width, 4 | 8)
-    } else if datatype_a == 0x08 {
-        // Type 0x08 is handled as f64 at width 8 and falls through to the
-        // integer path at widths 2/4, neither of which returns 0.0.
-        false
-    } else {
-        // Integer path: only widths 2 and 4 are decoded; width 8 yields 0.0.
-        !matches!(width, 2 | 4)
-    }
-}
-
 impl MotecFile {
     #[cfg(not(target_os = "emscripten"))]
     /// Memory-maps and parses a local MoTeC LD file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MotecError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
-        let file = File::open(path).map_err(|source| MotecError::Io {
+        let data = Storage::open(path).map_err(|source| MotecError::Io {
             path: display.clone(),
             source,
         })?;
-        let data = unsafe { Mmap::map(&file) }.map_err(|source| MotecError::Io {
-            path: display.clone(),
-            source,
-        })?;
-        let mut parsed = Self::parse(display, Storage::Mapped(data))?;
+        let mut parsed = Self::parse(display, data)?;
         let sidecar = motec_sidecar_path(path);
         match std::fs::read(&sidecar) {
             Ok(bytes) => match parse_motec_ldx_bytes(sidecar.to_string_lossy(), &bytes) {
@@ -260,7 +219,7 @@ impl MotecFile {
 
     /// Parses MoTeC telemetry from an owned LD byte buffer.
     pub fn from_bytes(path: impl Into<String>, data: Vec<u8>) -> Result<Self, MotecError> {
-        Self::parse(path.into(), Storage::Owned(data.into_boxed_slice()))
+        Self::parse(path.into(), Storage::from_vec(data))
     }
 
     /// Parses an LD byte buffer together with its companion LDX sidecar.
@@ -271,7 +230,7 @@ impl MotecFile {
     ) -> Result<Self, MotecError> {
         let path = path.into();
         let ldx = parse_motec_ldx_bytes(format!("{path}x"), ldx_data)?;
-        let mut parsed = Self::parse(path, Storage::Owned(data.into_boxed_slice()))?;
+        let mut parsed = Self::parse(path, Storage::from_vec(data))?;
         parsed.diagnostics.extend(ldx.diagnostics.iter().cloned());
         parsed.ldx = Some(Box::new(ldx));
         Ok(parsed)
@@ -326,8 +285,18 @@ impl MotecFile {
             } else {
                 UnitSource::Declared
             };
+            let sample_type = match (datatype_a, width) {
+                // 0x08/8 is MoTeC's little-endian f64 (seen on GPS channels).
+                (0x08, 8) => SampleType::F64,
+                (0x07, 8) => SampleType::F64,
+                (0x07, _) => SampleType::F32,
+                (_, 2) => SampleType::I16,
+                (_, 4) => SampleType::I32,
+                _ => SampleType::F32,
+            };
             let valid_width = matches!(width, 2 | 4 | 8);
-            let count = if valid_width && data_ptr < data.len() as u64 {
+            let decodable = sample_type.byte_width() == width;
+            let count = if valid_width && decodable && data_ptr < data.len() as u64 {
                 requested_count.min((data.len() as u64 - data_ptr) / width as u64)
             } else {
                 0
@@ -343,15 +312,6 @@ impl MotecFile {
                 }]
             } else {
                 Vec::new()
-            };
-            let sample_type = match (datatype_a, width) {
-                // 0x08/8 is MoTeC's little-endian f64 (seen on GPS channels).
-                (0x08, 8) => SampleType::F64,
-                (0x07, 8) => SampleType::F64,
-                (0x07, _) => SampleType::F32,
-                (_, 2) => SampleType::I16,
-                (_, 4) => SampleType::I32,
-                _ => SampleType::F32,
             };
             // Report recoveries that would otherwise be silent. Each message
             // names the concrete evidence (offset, channel, observed value).
@@ -428,13 +388,14 @@ impl MotecFile {
                     .with_channel(&name),
                 );
             }
-            if count > 0 && decode_would_return_zero(datatype_a, width) {
+            if valid_width && !decodable {
                 diagnostics.push(
                     Diagnostic::warning(
                         "ld.decode_unsupported_width",
                         format!(
                             "channel at offset 0x{address:x} has datatype 0x{datatype_a:02x} \
-                             with width {width}; decode returns 0.0 for this combination"
+                             with width {width}; unsupported combination, sample count forced \
+                             to 0"
                         ),
                     )
                     .with_channel(&name),
@@ -560,11 +521,7 @@ impl TelemetrySource for MotecFile {
         let channel = self.channels.get(channel_index)?;
         let chunk = channel.chunks.get(chunk_index)?;
         let width = self.encodings.get(channel_index)?.width;
-        let start = usize::try_from(chunk.data_ptr).ok()?;
-        let len = usize::try_from(chunk.sample_count)
-            .ok()?
-            .checked_mul(width)?;
-        self.data.get(start..start.checked_add(len)?)
+        core_chunk_bytes(&self.data, chunk, width)
     }
 
     fn sample_affine(&self, channel_index: usize) -> (f64, f64) {
@@ -581,25 +538,20 @@ impl TelemetrySource for MotecFile {
     fn decode(&self, channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
         let channel = &self.channels[channel_index];
         let encoding = &self.encodings[channel_index];
-        let offset = channel.chunks[0].data_ptr as usize + local_index as usize * encoding.width;
+        let Some(chunk) = channel.chunks.first() else {
+            return f64::NAN;
+        };
+        let width = channel.sample_type.byte_width();
+        let raw = core_sample_bytes(&self.data, chunk, local_index, width)
+            .and_then(|bytes| channel.sample_type.decode_le(bytes))
+            .unwrap_or(f64::NAN);
         // Float channels carry raw IEEE values; the scale/shift/mul transform
         // applies to the integer encodings only.
-        if encoding.datatype_a == 0x08 && encoding.width == 8 {
-            return f64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap());
+        if encoding.datatype_a == 0x07 || encoding.datatype_a == 0x08 {
+            raw
+        } else {
+            raw.mul_add(encoding.factor, encoding.offset)
         }
-        if encoding.datatype_a == 0x07 {
-            return match encoding.width {
-                8 => f64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap()),
-                4 => f32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64,
-                _ => 0.0,
-            };
-        }
-        let raw = match encoding.width {
-            2 => i16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as f64,
-            4 => i32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as f64,
-            _ => return 0.0,
-        };
-        raw.mul_add(encoding.factor, encoding.offset)
     }
 
     fn diagnostics(&self) -> &[Diagnostic] {
@@ -778,6 +730,42 @@ mod tests {
             .diagnostics()
             .iter()
             .any(|d| d.code == "ld.invalid_width" && d.channel.as_deref() == Some("Speed")));
+    }
+
+    #[test]
+    fn unsupported_datatype_width_is_visibly_empty() {
+        // Float type 0x07 with width 2 is a valid width but not a decodable
+        // combination: the sample type would be F32 (4 bytes) but the data
+        // is only 2 bytes wide. The channel must be exposed with
+        // sample_count 0 and a diagnostic, not silently decode to 0.0.
+        let mut data = fixture_bytes();
+        // Speed channel starts at 0x200; datatype is at offset 0x12 (already
+        // 0x07), width is at offset 0x14. Set width to 2.
+        u16_at(&mut data, 0x200 + 0x14, 2);
+        // Adjust data_ptr and count so they would normally produce samples
+        // if the width were valid.
+        u32_at(&mut data, 0x200 + 0x08, 0x380);
+        u32_at(&mut data, 0x200 + 0x0c, 10);
+        // Write some bytes at the data area so bounds checks would pass.
+        for i in 0..20 {
+            data[0x380 + i] = 0xff;
+        }
+        let file = MotecFile::from_bytes("fixture.ld", data).unwrap();
+        let speed = file
+            .channels()
+            .iter()
+            .find(|c| c.name == "Speed")
+            .expect("Speed channel");
+        assert_eq!(speed.sample_count, 0);
+        assert!(speed.chunks.is_empty());
+        assert!(
+            file.diagnostics()
+                .iter()
+                .any(|d| d.code == "ld.decode_unsupported_width"
+                    && d.channel.as_deref() == Some("Speed")),
+            "expected ld.decode_unsupported_width diagnostic: {:?}",
+            file.diagnostics()
+        );
     }
 
     #[test]

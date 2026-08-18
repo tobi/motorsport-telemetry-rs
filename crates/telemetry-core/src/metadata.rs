@@ -1,5 +1,28 @@
+//! Format-neutral file and session metadata derivation.
+//!
+//! [`read_source_metadata`] is a small pipeline of named strategy functions:
+//!
+//! 1. [`derive_clock`] resolves the absolute clock (GPS week/ITOW, an explicit
+//!    source range, or nothing) plus the session candidate key.
+//! 2. [`driver_stints`] splits the recording by internal driver identifier.
+//! 3. Lap recovery lives in [`crate::laps`] and follows the precedence
+//!    `authoritative > counter > timer` (see the README "How laps are
+//!    recovered" section): [`crate::laps::authoritative_laps`],
+//!    [`crate::laps::counter_laps`], [`crate::laps::timer_reset_laps`], and
+//!    [`crate::laps::pick_laps`]; [`crate::laps::fastest_lap`] derives the
+//!    fastest lap from the chosen set.
+//! 4. [`video_summary`] collects linked-video counts and file references.
+//!
+//! Timestamp and lap arithmetic uses `checked_*` primitives and skips a value
+//! on overflow (a dropped sample is noted at each site) rather than saturating.
+//! File-derived floats are narrowed to integers through [`finite_i64`] /
+//! [`finite_u64`], which return `None` for non-finite or out-of-range inputs.
+
+use crate::names;
 use crate::{AppliedPass, TelemetrySource};
 use std::collections::{BTreeMap, BTreeSet};
+
+use crate::laps;
 
 const GPS_WEEK_MS: u64 = 604_800_000;
 const GPS_UNIX_EPOCH_MS: u64 = 315_964_800_000;
@@ -195,24 +218,28 @@ pub struct SessionMetadata {
     pub fastest_lap: Option<LapMetadata>,
 }
 
-fn normalized_eq(value: &str, wanted: &str) -> bool {
-    value
-        .bytes()
-        .filter(u8::is_ascii_alphanumeric)
-        .map(|byte| byte.to_ascii_lowercase())
-        .eq(wanted.bytes())
+/// Rounds a finite f64 to `i64`, returning `None` for NaN, infinity, or values
+/// outside the `i64` range. Used for file-derived counter and driver values.
+pub(crate) fn finite_i64(value: f64) -> Option<i64> {
+    if value.is_finite() && (i64::MIN as f64..=i64::MAX as f64).contains(&value) {
+        Some(value.round() as i64)
+    } else {
+        None
+    }
 }
 
-fn channel_index(source: &dyn TelemetrySource, names: &[&str]) -> Option<usize> {
-    source.channels().iter().position(|channel| {
-        channel.sample_count > 0
-            && names
-                .iter()
-                .any(|wanted| normalized_eq(&channel.name, wanted))
-    })
+/// Rounds a finite, non-negative f64 to `u64`, returning `None` for NaN,
+/// infinity, negative, or out-of-range values. Used for file-derived timestamps.
+pub(crate) fn finite_u64(value: f64) -> Option<u64> {
+    if value.is_finite() && (0.0..=u64::MAX as f64).contains(&value) {
+        Some(value.round() as u64)
+    } else {
+        None
+    }
 }
 
-fn samples(source: &dyn TelemetrySource, channel_index: usize) -> Vec<(u64, f64)> {
+/// All native samples of one channel as `(time_ns, value)` pairs.
+pub(crate) fn samples(source: &dyn TelemetrySource, channel_index: usize) -> Vec<(u64, f64)> {
     let channel = &source.channels()[channel_index];
     let mut values = Vec::with_capacity(channel.sample_count as usize);
     for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
@@ -226,14 +253,14 @@ fn samples(source: &dyn TelemetrySource, channel_index: usize) -> Vec<(u64, f64)
     values
 }
 
+/// Runs of consecutive equal integer values, as `(value, start_ns, end_ns)`.
 fn integer_runs(values: &[(u64, f64)], duration_ns: u64) -> Vec<(i64, u64, u64)> {
     let mut runs = Vec::new();
     let mut current: Option<(i64, u64)> = None;
     for &(time_ns, value) in values {
-        if !value.is_finite() {
+        let Some(integer) = finite_i64(value) else {
             continue;
-        }
-        let integer = value.round() as i64;
+        };
         if current.is_some_and(|(before, _)| before == integer) {
             continue;
         }
@@ -247,170 +274,133 @@ fn integer_runs(values: &[(u64, f64)], duration_ns: u64) -> Vec<(i64, u64, u64)>
     runs
 }
 
-fn is_completed_lap_counter(channel: &crate::Channel) -> bool {
-    ["beaconeventcount", "beaconcount", "lapbeaconcount"]
-        .iter()
-        .any(|wanted| normalized_eq(&channel.name, wanted))
+/// Absolute clock coverage and session candidate key for one source.
+struct ClockInfo {
+    clock: Option<String>,
+    start_ns: Option<u64>,
+    end_ns: Option<u64>,
+    offset_ns: Option<i128>,
+    session_key: Option<String>,
 }
 
-fn counter_lap_number_at(
-    source: &dyn TelemetrySource,
-    channel_index: usize,
-    time_ns: u64,
-    previous: bool,
-) -> Option<i64> {
-    let value = source.sample_at(channel_index, time_ns, false)?;
-    if !value.is_finite() {
-        return None;
-    }
-    let value = value.round() as i64;
-    let completed_count = is_completed_lap_counter(&source.channels()[channel_index]);
-    Some(match (completed_count, previous) {
-        (true, false) => value.saturating_add(1),
-        (true, true) | (false, false) => value,
-        (false, true) => value.saturating_sub(1),
-    })
-}
-
-const LAP_COUNTER_NAMES: &[&str] = &[
-    "lapnumber",
-    "lapnum",
-    "lapcount",
-    "lapcounter",
-    "currentlap",
-    "lap",
-    "beaconeventcount",
-    "beaconcount",
-    "lapbeaconcount",
-];
-
-fn lap_counter_rank(name: &str) -> Option<usize> {
-    LAP_COUNTER_NAMES
-        .iter()
-        .position(|wanted| normalized_eq(name, wanted))
-}
-
-/// Picks a lap-counter channel that actually increments.
+/// Resolves the absolute clock (GPS week/ITOW or an explicit source range) and
+/// the internal session candidate key.
 ///
-/// File order must not win: Cosworth logs often have a `Lap Number` that only
-/// toggles 0/1 while `beaconEventCount` counts crossings. A counter is *strong*
-/// when it increments at least twice (high-water >= 2). Strong counters beat
-/// weak ones; more crossings beat fewer; name-list order is the tie-break.
-fn select_lap_counter(
-    source: &dyn TelemetrySource,
-    duration_ns: u64,
-) -> (Option<usize>, Vec<LapMetadata>, usize) {
-    let mut best_strong: Option<(usize, usize, usize, Vec<LapMetadata>)> = None;
-    let mut best_weak: Option<(usize, usize, usize, Vec<LapMetadata>)> = None;
-    let mut best_constant: Option<(usize, usize, usize, Vec<LapMetadata>)> = None;
-    for (index, channel) in source.channels().iter().enumerate() {
-        let Some(rank) = (channel.sample_count > 0)
-            .then(|| lap_counter_rank(&channel.name))
-            .flatten()
-        else {
-            continue;
-        };
-        let (laps, crossings) = increasing_counter_laps(source, index, duration_ns);
-        if laps.is_empty() {
-            continue;
+/// GPS week and ITOW are narrowed through [`finite_u64`]; any non-finite or
+/// out-of-range value leaves the GPS clock unset. The millisecond-to-nanosecond
+/// chain uses `checked_*` arithmetic, so an overflow drops the whole GPS clock
+/// rather than saturating to a wrong instant.
+fn derive_clock(source: &dyn TelemetrySource, hash: u64) -> ClockInfo {
+    let explicit_absolute = source.absolute_time_range();
+    let absolute = names::find(source.channels(), &["gpsweek"]).and_then(|week_index| {
+        let week = samples(source, week_index)
+            .into_iter()
+            .find_map(|(_, value)| finite_u64(value))?;
+        let itow_index = names::find(source.channels(), &["gpsitow"])?;
+        let itow = samples(source, itow_index);
+        let &(first_time, first_value) = itow.first()?;
+        let &(_last_time, last_value) = itow.last()?;
+        let first_itow = finite_u64(first_value)?;
+        let last_itow = finite_u64(last_value)?;
+        // GPS clock overflow: leave the absolute clock unset on any failure.
+        let start_ns = week
+            .checked_mul(GPS_WEEK_MS)?
+            .checked_add(first_itow)?
+            .checked_add(GPS_UNIX_EPOCH_MS)?
+            .checked_mul(1_000_000)?;
+        let end_ns = week
+            .checked_mul(GPS_WEEK_MS)?
+            .checked_add(last_itow)?
+            .checked_add(GPS_UNIX_EPOCH_MS)?
+            .checked_mul(1_000_000)?;
+        Some((week, first_time, start_ns, end_ns))
+    });
+    if let Some(range) = explicit_absolute {
+        ClockInfo {
+            clock: Some(range.clock),
+            start_ns: Some(range.start_ns),
+            end_ns: Some(range.end_ns),
+            offset_ns: Some(i128::from(range.start_ns)),
+            session_key: Some(format!("{}:{hash:016x}", range.session_hint)),
         }
-        let candidate = (rank, crossings, index, laps);
-        if crossings >= 2 {
-            if best_strong
-                .as_ref()
-                .is_none_or(|(rank0, crossings0, _, _)| {
-                    crossings > *crossings0 || (crossings == *crossings0 && rank < *rank0)
-                })
-            {
-                best_strong = Some(candidate);
-            }
-        } else if crossings == 1 {
-            if best_weak
-                .as_ref()
-                .is_none_or(|(rank0, _, _, _)| rank < *rank0)
-            {
-                best_weak = Some(candidate);
-            }
-        } else if best_constant
-            .as_ref()
-            .is_none_or(|(rank0, _, _, _)| rank < *rank0)
-        {
-            best_constant = Some(candidate);
+    } else if let Some((week, first_time, start_ns, end_ns)) = absolute {
+        ClockInfo {
+            clock: Some("gps".into()),
+            start_ns: Some(start_ns),
+            end_ns: Some(end_ns),
+            offset_ns: Some(i128::from(start_ns) - i128::from(first_time)),
+            session_key: Some(format!("gps:{week}:{hash:016x}")),
         }
-    }
-    let selected = best_strong.or(best_weak).or(best_constant);
-    match selected {
-        Some((_, crossings, index, laps)) => (Some(index), laps, crossings),
-        None => (None, Vec::new(), 0),
+    } else {
+        ClockInfo {
+            clock: None,
+            start_ns: None,
+            end_ns: None,
+            offset_ns: None,
+            session_key: None,
+        }
     }
 }
 
-fn increasing_counter_laps(
-    source: &dyn TelemetrySource,
-    channel_index: usize,
-    duration_ns: u64,
-) -> (Vec<LapMetadata>, usize) {
-    let channel = &source.channels()[channel_index];
-    let completed_count = is_completed_lap_counter(channel);
-    let number_offset = i64::from(completed_count);
-    let mut laps = Vec::new();
-    let mut current: Option<(i64, u64, bool)> = None;
-    let mut high_water: Option<i64> = None;
-    let mut crossings = 0;
+/// Distinct driver identifiers and their contiguous stints.
+///
+/// When several runs exist, stints shorter than one second are dropped as
+/// transient noise; a single run is always kept. `checked_sub` makes an
+/// inverted run (end before start) fail the duration test instead of
+/// saturating to zero.
+fn driver_stints(source: &dyn TelemetrySource, duration_ns: u64) -> (Vec<i64>, Vec<DriverStint>) {
+    let raw_driver_runs = names::find(source.channels(), &["driverid", "driver", "driverindex"])
+        .map(|index| integer_runs(&samples(source, index), duration_ns))
+        .unwrap_or_default();
+    let driver_runs = raw_driver_runs
+        .iter()
+        .copied()
+        .filter(|(_, start_ns, end_ns)| {
+            raw_driver_runs.len() == 1
+                || end_ns
+                    .checked_sub(*start_ns)
+                    .is_some_and(|duration| duration >= 1_000_000_000)
+        })
+        .collect::<Vec<_>>();
+    let driver_ids = driver_runs
+        .iter()
+        .map(|(driver, _, _)| *driver)
+        .filter(|driver| *driver >= 0)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let stints = driver_runs
+        .into_iter()
+        .filter(|(driver, _, _)| *driver >= 0)
+        .map(|(driver_id, start_ns, end_ns)| DriverStint {
+            driver_id,
+            start_ns,
+            end_ns,
+        })
+        .collect::<Vec<_>>();
+    (driver_ids, stints)
+}
 
-    for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
-        for local_index in 0..chunk.sample_count {
-            let value = source.decode(channel_index, chunk_index, local_index);
-            if !value.is_finite() {
-                continue;
+/// Linked-video frame count, presentation offset, and file references.
+fn video_summary(source: &dyn TelemetrySource) -> (Option<u64>, Option<i128>, Vec<VideoFileRef>) {
+    let offset = source.video_presentation_offset_ns();
+    let videos = source
+        .video_files()
+        .iter()
+        .cloned()
+        .map(|mut video| {
+            if video.presentation_offset_ns.is_none() {
+                video.presentation_offset_ns = offset;
             }
-            let counter = value.round() as i64;
-            if counter < 0 {
-                continue;
-            }
-            let time_ns = source.sample_time_ns(channel_index, chunk_index, local_index);
-            let Some(before) = high_water else {
-                high_water = Some(counter);
-                current = Some((counter.saturating_add(number_offset), time_ns, false));
-                continue;
-            };
-            if counter <= before {
-                // Shutdown resets and transient backwards values are not lap
-                // crossings. Keep the high-water mark so a later 0 -> 1 does
-                // not create a second, overlapping lap sequence.
-                continue;
-            }
-            if let Some((number, start_ns, start_known)) =
-                current.replace((counter.saturating_add(number_offset), time_ns, true))
-            {
-                if number > 0 && time_ns > start_ns {
-                    laps.push(LapMetadata {
-                        number,
-                        start_ns,
-                        end_ns: time_ns,
-                        duration_ns: time_ns - start_ns,
-                        complete: start_known,
-                        first_video_frame: None,
-                    });
+            if video.frame_count == 0 {
+                if let Some(count) = source.video_frame_count() {
+                    video.frame_count = count;
                 }
             }
-            high_water = Some(counter);
-            crossings += 1;
-        }
-    }
-    if let Some((number, start_ns, _)) = current {
-        if number > 0 && duration_ns > start_ns {
-            laps.push(LapMetadata {
-                number,
-                start_ns,
-                end_ns: duration_ns,
-                duration_ns: duration_ns - start_ns,
-                complete: false,
-                first_video_frame: None,
-            });
-        }
-    }
-    (laps, crossings)
+            video
+        })
+        .collect();
+    (source.video_frame_count(), offset, videos)
 }
 
 /// Stable FNV-1a of lowercased channel names, raw units, and sample-type codes.
@@ -435,6 +425,7 @@ pub fn schema_hash(source: &dyn TelemetrySource) -> u64 {
 ///
 /// Channel names are matched conservatively after punctuation and case
 /// normalization. Missing evidence remains absent rather than being guessed.
+/// The pipeline is documented in the module-level comment.
 pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
     let duration_ns = source
         .channels()
@@ -443,227 +434,26 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         .max()
         .unwrap_or(0);
     let hash = schema_hash(source);
-    let explicit_absolute = source.absolute_time_range();
-    let absolute = channel_index(source, &["gpsweek"]).and_then(|week_index| {
-        let week = samples(source, week_index)
-            .into_iter()
-            .find_map(|(_, value)| value.is_finite().then_some(value.round() as u64))?;
-        let itow_index = channel_index(source, &["gpsitow"])?;
-        let itow = samples(source, itow_index);
-        let &(first_time, first_value) = itow.first()?;
-        let &(_last_time, last_value) = itow.last()?;
-        let start_ns = week
-            .saturating_mul(GPS_WEEK_MS)
-            .saturating_add(first_value.round().max(0.0) as u64)
-            .saturating_add(GPS_UNIX_EPOCH_MS)
-            .saturating_mul(1_000_000);
-        let end_ns = week
-            .saturating_mul(GPS_WEEK_MS)
-            .saturating_add(last_value.round().max(0.0) as u64)
-            .saturating_add(GPS_UNIX_EPOCH_MS)
-            .saturating_mul(1_000_000);
-        Some((week, first_time, start_ns, end_ns))
-    });
-    let (absolute_clock, absolute_start_ns, absolute_end_ns, clock_offset_ns, session_key) =
-        if let Some(range) = explicit_absolute {
-            (
-                Some(range.clock),
-                Some(range.start_ns),
-                Some(range.end_ns),
-                Some(i128::from(range.start_ns)),
-                Some(format!("{}:{hash:016x}", range.session_hint)),
-            )
-        } else if let Some((week, first_time, start_ns, end_ns)) = absolute {
-            (
-                Some("gps".into()),
-                Some(start_ns),
-                Some(end_ns),
-                Some(i128::from(start_ns) - i128::from(first_time)),
-                Some(format!("gps:{week}:{hash:016x}")),
-            )
-        } else {
-            (None, None, None, None, None)
-        };
-    let raw_driver_runs = channel_index(source, &["driverid", "driver", "driverindex"])
-        .map(|index| integer_runs(&samples(source, index), duration_ns))
-        .unwrap_or_default();
-    let driver_runs = raw_driver_runs
-        .iter()
-        .copied()
-        .filter(|(_, start_ns, end_ns)| {
-            raw_driver_runs.len() == 1 || end_ns.saturating_sub(*start_ns) >= 1_000_000_000
-        })
-        .collect::<Vec<_>>();
-    let driver_ids = driver_runs
-        .iter()
-        .map(|(driver, _, _)| *driver)
-        .filter(|driver| *driver >= 0)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let driver_stints = driver_runs
-        .into_iter()
-        .filter(|(driver, _, _)| *driver >= 0)
-        .map(|(driver_id, start_ns, end_ns)| DriverStint {
-            driver_id,
-            start_ns,
-            end_ns,
-        })
-        .collect::<Vec<_>>();
+    let clock = derive_clock(source, hash);
+    let (driver_ids, driver_stints) = driver_stints(source, duration_ns);
 
-    let source_laps = source.source_lap_metadata();
-    let (lap_channel_index, counter_laps, counter_crossings) = if source_laps.is_some() {
-        (None, Vec::new(), 0)
-    } else {
-        select_lap_counter(source, duration_ns)
-    };
-    let timer_resets = if source_laps.is_none() {
-        channel_index(
-            source,
-            &[
-                "currentlaptime",
-                "lapcurrentlaptime",
-                "laptime",
-                "laptimerunning",
-                "lapprogression",
-                "lapprogress",
-                "lapprogresspct",
-            ],
-        )
-        .map(|index| {
-            let values = samples(source, index);
-            let is_progress = ["lapprogression", "lapprogress", "lapprogresspct"]
-                .iter()
-                .any(|wanted| normalized_eq(&source.channels()[index].name, wanted));
-            let max_value = values
-                .iter()
-                .map(|(_, value)| *value)
-                .filter(|value| value.is_finite())
-                .fold(0.0_f64, f64::max);
-            let reset_threshold = if max_value > 1_000.0 { 5_000.0 } else { 5.0 };
-            values
-                .windows(2)
-                .filter_map(|pair| {
-                    let before = pair[0].1;
-                    let after = pair[1].1;
-                    let reset = if is_progress {
-                        let full_lap = if max_value > 2.0 { 100.0 } else { 1.0 };
-                        before >= full_lap * 0.75 && after <= full_lap * 0.25
-                    } else {
-                        before - after > reset_threshold
-                    };
-                    (before.is_finite() && after.is_finite() && reset).then_some(pair[1].0)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let mut laps = if let Some(source_laps) = &source_laps {
-        source_laps.laps.clone()
-    } else if counter_crossings > 0 {
-        counter_laps
-    } else if !timer_resets.is_empty() {
-        let mut boundaries = Vec::with_capacity(timer_resets.len() + 2);
-        boundaries.push(0);
-        boundaries.extend(timer_resets);
-        boundaries.push(duration_ns);
-        let count = boundaries.len() - 1;
-        boundaries
-            .windows(2)
-            .enumerate()
-            .filter_map(|(index, pair)| {
-                let number = lap_channel_index
-                    .and_then(|channel| counter_lap_number_at(source, channel, pair[0], false))
-                    .unwrap_or(index as i64 + 1);
-                (number > 0).then_some(LapMetadata {
-                    number,
-                    start_ns: pair[0],
-                    end_ns: pair[1],
-                    duration_ns: pair[1].saturating_sub(pair[0]),
-                    complete: index > 0 && index + 1 < count,
-                    first_video_frame: None,
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        counter_laps
-    };
-    let reference_lap_ns = source_laps
-        .is_none()
-        .then(|| {
-            channel_index(source, &["reflaptime", "referencelaptime"]).and_then(|index| {
-                let values = samples(source, index);
-                let max_value = values
-                    .iter()
-                    .map(|(_, value)| *value)
-                    .filter(|value| value.is_finite())
-                    .fold(0.0_f64, f64::max);
-                let scale = if max_value > 1_000.0 {
-                    1_000_000.0
-                } else {
-                    1_000_000_000.0
-                };
-                values
-                    .into_iter()
-                    .map(|(_, value)| value)
-                    .find(|value| value.is_finite() && *value > 0.0)
-                    .map(|value| (value * scale).round() as u64)
-            })
-        })
-        .flatten();
-    let plausible_lap = |duration_ns: u64| {
-        duration_ns >= 10_000_000_000
-            && reference_lap_ns.is_none_or(|reference| {
-                duration_ns >= reference / 2 && duration_ns <= reference.saturating_mul(3) / 2
-            })
-    };
-    let mut fastest_lap = source_laps
-        .as_ref()
-        .and_then(|source| source.fastest_lap.clone())
-        .or_else(|| {
-            laps.iter()
-                .filter(|lap| lap.complete && plausible_lap(lap.duration_ns))
-                .min_by_key(|lap| lap.duration_ns)
-                .cloned()
-        });
-    if let Some(previous_lap_index) = source_laps
-        .is_none()
-        .then(|| channel_index(source, &["previouslt", "previouslaptime", "lastlaptime"]))
-        .flatten()
-    {
-        let values = samples(source, previous_lap_index);
-        let max_value = values
-            .iter()
-            .map(|(_, value)| *value)
-            .filter(|value| value.is_finite())
-            .fold(0.0_f64, f64::max);
-        let scale = if max_value > 1_000.0 {
-            1_000_000.0
-        } else {
-            1_000_000_000.0
-        };
-        let reported = values
-            .into_iter()
-            .filter(|(_, value)| value.is_finite() && *value > 0.0)
-            .map(|(time_ns, value)| (time_ns, (value * scale).round() as u64))
-            .filter(|(_, duration_ns)| plausible_lap(*duration_ns))
-            .min_by_key(|(_, duration_ns)| *duration_ns);
-        if let Some((time_ns, duration_ns)) = reported {
-            let number = lap_channel_index
-                .and_then(|channel| counter_lap_number_at(source, channel, time_ns, true))
-                .unwrap_or(0);
-            fastest_lap = Some(LapMetadata {
-                number,
-                start_ns: time_ns.saturating_sub(duration_ns),
-                end_ns: time_ns,
-                duration_ns,
-                complete: true,
-                first_video_frame: None,
-            });
+    let authoritative = laps::authoritative_laps(source);
+    let (lap_channel_index, counter_laps, counter_crossings, timer_laps) = match &authoritative {
+        Some(_) => (None, Vec::new(), 0, Vec::new()),
+        None => {
+            let (index, counter_laps, crossings) = laps::counter_laps(source, duration_ns);
+            let timer_laps = laps::timer_reset_laps(source, duration_ns, index);
+            (index, counter_laps, crossings, timer_laps)
         }
-    }
+    };
+    let mut laps = laps::pick_laps(
+        authoritative.as_ref(),
+        counter_laps,
+        counter_crossings,
+        timer_laps,
+    );
+    let mut fastest_lap =
+        laps::fastest_lap(source, &laps, authoritative.as_ref(), lap_channel_index);
 
     stamp_lap_video_frames(source, &mut laps);
     if let Some(fastest) = &mut fastest_lap {
@@ -672,8 +462,9 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         }
     }
 
+    let (video_frame_count, video_presentation_offset_ns, videos) = video_summary(source);
     let origin = source.source_origin();
-    FileMetadata {
+    let mut metadata = FileMetadata {
         path: source.path().to_owned(),
         format: source.format().to_owned(),
         source_format: origin
@@ -700,11 +491,11 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         duration_ns,
         schema_hash: hash,
         format_version: None,
-        session_key,
-        absolute_clock,
-        absolute_start_ns,
-        absolute_end_ns,
-        clock_offset_ns,
+        session_key: clock.session_key,
+        absolute_clock: clock.clock,
+        absolute_start_ns: clock.start_ns,
+        absolute_end_ns: clock.end_ns,
+        clock_offset_ns: clock.offset_ns,
         utc_start_ns: None,
         timezone: String::new(),
         identity: source.identity(),
@@ -713,28 +504,17 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         valid_laps: laps.iter().filter(|lap| lap.complete).count() as u32,
         laps,
         fastest_lap,
-        video_frame_count: source.video_frame_count(),
-        video_presentation_offset_ns: source.video_presentation_offset_ns(),
-        videos: {
-            let offset = source.video_presentation_offset_ns();
-            source
-                .video_files()
-                .iter()
-                .cloned()
-                .map(|mut video| {
-                    if video.presentation_offset_ns.is_none() {
-                        video.presentation_offset_ns = offset;
-                    }
-                    if video.frame_count == 0 {
-                        if let Some(count) = source.video_frame_count() {
-                            video.frame_count = count;
-                        }
-                    }
-                    video
-                })
-                .collect()
-        },
-    }
+        video_frame_count,
+        video_presentation_offset_ns,
+        videos,
+    };
+    let timezone = crate::placement::resolve_timezone(source);
+    let utc_start_ns = source
+        .utc_start_ns()
+        .or_else(|| crate::placement::utc_from_metadata(&metadata, &timezone));
+    metadata.utc_start_ns = utc_start_ns;
+    metadata.timezone = timezone;
+    metadata
 }
 
 fn stamp_lap_video_frames(source: &dyn TelemetrySource, laps: &mut [LapMetadata]) {
@@ -896,16 +676,17 @@ pub fn group_sessions(files: &[FileMetadata], max_gap_ns: u64) -> Vec<SessionMet
 
 /// Counts native samples for each value of a recognized driver-ID channel.
 ///
-/// Returns an empty map if no recognized sampled channel exists. Finite values
-/// are rounded to the nearest integer identifier.
+/// Returns an empty map if no recognized sampled channel exists. Finite,
+/// in-range values are rounded to the nearest integer identifier; out-of-range
+/// values are skipped.
 pub fn driver_histogram(source: &dyn TelemetrySource) -> BTreeMap<i64, u64> {
-    let Some(index) = channel_index(source, &["driverid", "driver", "driverindex"]) else {
+    let Some(index) = names::find(source.channels(), &["driverid", "driver", "driverindex"]) else {
         return BTreeMap::new();
     };
     let mut counts = BTreeMap::new();
     for (_, value) in samples(source, index) {
-        if value.is_finite() {
-            *counts.entry(value.round() as i64).or_default() += 1;
+        if let Some(id) = finite_i64(value) {
+            *counts.entry(id).or_default() += 1;
         }
     }
     counts
