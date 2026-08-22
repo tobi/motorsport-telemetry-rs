@@ -972,18 +972,14 @@ fn rejects_folder_records() {
 }
 
 #[test]
-fn alignment_jitter_accepts_inside_window_and_drops_outside() {
-    assert_eq!(ALIGN_JITTER_NS, 2_000_000);
+fn alignment_snaps_jittered_samples_to_the_nearest_slot() {
     let period_ns = 10_000_000u64;
-    let cases = [(500_000_i64, true), (3_000_000_i64, false)];
-    for (jitter_ns, keep) in cases {
+    // ±0.5 ms and ±3 ms of logger jitter both land every sample in its own
+    // nearest slot; the old writer dropped the whole channel past 2 ms.
+    for jitter_ns in [500_000_i64, 3_000_000_i64] {
         let mut source = tiny();
         source.sample_times = vec![jittered_times(period_ns, 4, 0, jitter_ns)];
-        assert_eq!(
-            collect_aligned(&source, 0, &source.channels[0]).is_some(),
-            keep,
-            "jitter_ns={jitter_ns}"
-        );
+        assert!(collect_aligned(&source, 0, &source.channels[0]).is_some());
         assert!(collect_aligned(&source, 1, &source.channels[1]).is_some());
 
         let (bytes, opened) = write_alignment_jsonl(&source);
@@ -992,34 +988,26 @@ fn alignment_jitter_accepts_inside_window_and_drops_outside() {
             .iter()
             .map(|ch| ch.name.as_str())
             .collect();
-        if keep {
-            assert_eq!(names, ["Speed", "GPS Speed"], "jitter_ns={jitter_ns}");
-            assert_eq!(opened.quantum_ns(), period_ns);
-            assert_eq!(opened.origin_ns(), 0);
-            assert_eq!(opened.duration_ns(), 40_000_000);
-            assert_eq!(opened.channels()[0].sample_count, 4);
-            assert_eq!(opened.channels()[0].chunks[0].sample_period_ns, period_ns);
-            assert_eq!(opened.decode(0, 0, 0), 10.0);
-            assert_eq!(opened.decode(0, 0, 2), 12.5);
-            assert_eq!(opened.decode(0, 0, 3), 13.0);
-            for index in 0..4u64 {
-                assert_eq!(opened.sample_time_ns(0, 0, index), index * period_ns);
-            }
-            let text = String::from_utf8(bytes).unwrap();
-            assert!(text.contains("\"n\":\"Speed\""));
-            assert!(text.contains("\"hz\":100"));
-        } else {
-            assert_eq!(names, ["GPS Speed"], "jitter_ns={jitter_ns}");
-            assert_eq!(opened.quantum_ns(), 40_000_000);
-            assert_eq!(opened.origin_ns(), 0);
-            let text = String::from_utf8(bytes).unwrap();
-            assert!(!text.contains("\"n\":\"Speed\""));
+        assert_eq!(names, ["Speed", "GPS Speed"], "jitter_ns={jitter_ns}");
+        assert_eq!(opened.quantum_ns(), period_ns);
+        assert_eq!(opened.origin_ns(), 0);
+        assert_eq!(opened.duration_ns(), 40_000_000);
+        assert_eq!(opened.channels()[0].sample_count, 4);
+        assert_eq!(opened.channels()[0].chunks[0].sample_period_ns, period_ns);
+        assert_eq!(opened.decode(0, 0, 0), 10.0);
+        assert_eq!(opened.decode(0, 0, 2), 12.5);
+        assert_eq!(opened.decode(0, 0, 3), 13.0);
+        for index in 0..4u64 {
+            assert_eq!(opened.sample_time_ns(0, 0, index), index * period_ns);
         }
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"n\":\"Speed\""));
+        assert!(text.contains("\"hz\":100"));
     }
 }
 
 #[test]
-fn alignment_mixed_period_chunks_are_omitted() {
+fn alignment_mixed_period_chunks_land_on_the_dominant_lattice() {
     let mut source = tiny();
     source.channels.push(Channel {
         id: 3,
@@ -1030,7 +1018,7 @@ fn alignment_mixed_period_chunks_are_omitted() {
         chunks: vec![
             Chunk {
                 sample_period_ns: 10_000_000,
-                sample_count: 2,
+                sample_count: 3,
                 data_ptr: 0,
                 sample_base: 0,
                 time_base_ns: 0,
@@ -1039,28 +1027,44 @@ fn alignment_mixed_period_chunks_are_omitted() {
                 sample_period_ns: 20_000_000,
                 sample_count: 2,
                 data_ptr: 0,
-                sample_base: 2,
-                time_base_ns: 20_000_000,
+                sample_base: 3,
+                time_base_ns: 40_000_000,
             },
         ],
-        sample_count: 4,
+        sample_count: 5,
         duration_ns: 60_000_000,
     });
-    source.values.push(vec![1.0, 2.0, 3.0, 4.0]);
-    assert!(collect_aligned(&source, 2, &source.channels[2]).is_none());
+    source.values.push(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    // Lattice is the 10 ms period (three samples beat two). Samples at 0, 10,
+    // 20, 40, 60 ms occupy slots 0, 1, 2, 4, 6; slots 3 and 5 are null.
+    let series = collect_aligned(&source, 2, &source.channels[2]).unwrap();
+    assert_eq!(series.period_ns, 10_000_000);
+    assert_eq!(
+        series.values,
+        vec![
+            Some(1.0),
+            Some(2.0),
+            Some(3.0),
+            None,
+            Some(4.0),
+            None,
+            Some(5.0)
+        ]
+    );
 
-    let (bytes, opened) = write_alignment_jsonl(&source);
-    assert_eq!(opened.channels().len(), 2);
-    assert!(opened.channels().iter().all(|ch| ch.name != "Beacon"));
-    assert_eq!(opened.channels()[0].name, "Speed");
-    assert_eq!(opened.channels()[1].name, "GPS Speed");
+    let (_, opened) = write_alignment_jsonl(&source);
+    assert_eq!(opened.channels().len(), 3);
+    let beacon = opened
+        .channels()
+        .iter()
+        .position(|ch| ch.name == "Beacon")
+        .unwrap();
+    assert_eq!(opened.decode(beacon, 0, 0), 1.0);
+    assert_eq!(opened.decode(beacon, 0, 2), 3.0);
+    assert_eq!(opened.decode(beacon, 0, 4), 4.0);
+    assert_eq!(opened.decode(beacon, 0, 6), 5.0);
     assert_eq!(opened.quantum_ns(), 10_000_000);
-    assert_eq!(opened.origin_ns(), 0);
-    assert_eq!(opened.decode(0, 0, 0), 10.0);
-    let text = String::from_utf8(bytes).unwrap();
-    assert!(!text.contains("\"n\":\"Beacon\""));
 }
-
 #[test]
 fn alignment_two_holes_fill_null_and_keep_indexes() {
     let period_ns = 10_000_000u64;

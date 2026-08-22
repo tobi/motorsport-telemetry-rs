@@ -188,7 +188,7 @@ fn check_footprint(
 
 /// Flags chunk tables that cannot describe a real timeline.
 fn check_chunks(channel: &crate::Channel, diagnostics: &mut Diagnostics) {
-    let mut previous_end = 0u64;
+    let mut previous_last = 0u64;
     for (index, chunk) in channel.chunks.iter().enumerate() {
         if chunk.sample_period_ns == 0 {
             diagnostics.push(
@@ -199,22 +199,31 @@ fn check_chunks(channel: &crate::Channel, diagnostics: &mut Diagnostics) {
                 .with_channel(&channel.name),
             );
         }
-        if chunk.time_base_ns < previous_end {
+        // A chunk ends at its last *sample*, not one period past it. Readers
+        // that fit each run's period re-anchor the next chunk on the logger's
+        // own stamp, which may legitimately fall inside the last modeled
+        // interval by a sample's worth of jitter; only a chunk that begins at
+        // or before the previous chunk's final sample describes an
+        // impossible timeline.
+        if chunk.time_base_ns <= previous_last && index > 0 {
             diagnostics.push(
                 Diagnostic::warning(
                     "layout.chunk_time_overlap",
                     format!(
-                        "chunk {index} starts at {} ns, before the previous chunk ended at \
-                         {previous_end} ns",
+                        "chunk {index} starts at {} ns, at or before the previous chunk's \
+                         last sample at {previous_last} ns",
                         chunk.time_base_ns
                     ),
                 )
                 .with_channel(&channel.name),
             );
         }
-        previous_end = chunk
-            .time_base_ns
-            .saturating_add(chunk.sample_count.saturating_mul(chunk.sample_period_ns));
+        previous_last = chunk.time_base_ns.saturating_add(
+            chunk
+                .sample_count
+                .saturating_sub(1)
+                .saturating_mul(chunk.sample_period_ns),
+        );
     }
 }
 

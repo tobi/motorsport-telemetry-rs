@@ -44,8 +44,6 @@ pub const JSONL_VERSION: u16 = 1;
 pub const JSONL_EXT_VERSION: u16 = 1;
 /// Recommended lattice quantum when a recording has no regular channels.
 pub(super) const DEFAULT_QUANTUM_NS: u64 = 1_000_000;
-/// Jitter allowed when deciding that a native channel is already regular.
-pub(super) const ALIGN_JITTER_NS: u64 = 2_000_000;
 /// An opened MTJ document.
 #[derive(Debug, Clone)]
 pub struct JsonlRecording {

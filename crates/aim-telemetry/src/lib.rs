@@ -843,10 +843,10 @@ fn period_chunks(samples: &[SampleRef]) -> Vec<Chunk> {
             time_base_ns: samples[0].time_ns,
         }];
     }
-    // Logger timestamps have occasional millisecond jitter. Use the modal
-    // delta as the native rate, splitting only at real acquisition gaps.
-    // Logger jitter normally produces only a handful of distinct deltas. A
-    // tiny linear table avoids hashing every sample in every channel while
+    // Logger timestamps have occasional millisecond jitter. The modal delta
+    // is the native rate used to recognise real acquisition gaps. Logger
+    // jitter normally produces only a handful of distinct deltas, so a tiny
+    // linear table avoids hashing every sample in every channel while
     // retaining the exact modal-delta tie break.
     let mut counts = Vec::<(u64, usize)>::new();
     for pair in samples.windows(2) {
@@ -859,36 +859,84 @@ fn period_chunks(samples: &[SampleRef]) -> Vec<Chunk> {
             }
         }
     }
-    let period = counts
+    let modal = counts
         .into_iter()
         .max_by_key(|&(delta, count)| (count, std::cmp::Reverse(delta)))
         .map(|(delta, _)| delta)
         .unwrap_or(1);
+    // A chunk models its samples as `time_base + i * period`, and the
+    // logger's own millisecond stamps are the clock that model must honour.
+    // Each gap-free run is fitted with its own period (the run's mean
+    // spacing), and any run in which a sample would still land more than
+    // half a modal period from its stamp is split at the worst sample and
+    // fitted again. The modal delta alone let 0.04 % of rate error on a
+    // 100 Hz channel accumulate to half a second over a twenty-minute
+    // session, and placed a jittery 1 Hz channel two minutes ahead of its
+    // own samples by the end of the file.
+    let tolerance = (modal / 2).max(1);
     let mut chunks = Vec::new();
     let mut start = 0usize;
     for index in 1..samples.len() {
         let delta = samples[index]
             .time_ns
             .saturating_sub(samples[index - 1].time_ns);
-        if delta > period.saturating_mul(2) {
-            chunks.push(Chunk {
-                sample_period_ns: period,
-                sample_count: (index - start) as u64,
-                data_ptr: 0,
-                sample_base: start as u64,
-                time_base_ns: samples[start].time_ns,
-            });
+        if delta > modal.saturating_mul(2) {
+            fitted_chunks(&samples[start..index], start, modal, tolerance, &mut chunks);
             start = index;
         }
     }
+    fitted_chunks(&samples[start..], start, modal, tolerance, &mut chunks);
+    chunks
+}
+
+/// Appends chunks covering `run` (a gap-free slice starting at channel sample
+/// index `base`), splitting until every sample sits within `tolerance` of the
+/// chunk's linear time model.
+fn fitted_chunks(
+    run: &[SampleRef],
+    base: usize,
+    modal: u64,
+    tolerance: u64,
+    chunks: &mut Vec<Chunk>,
+) {
+    let first = run[0].time_ns;
+    if run.len() == 1 {
+        chunks.push(Chunk {
+            sample_period_ns: modal,
+            sample_count: 1,
+            data_ptr: 0,
+            sample_base: base as u64,
+            time_base_ns: first,
+        });
+        return;
+    }
+    let span = run[run.len() - 1].time_ns.saturating_sub(first);
+    let steps = (run.len() - 1) as u64;
+    // Round to the nearest nanosecond: the endpoints then sit exactly on the
+    // model and residuals in between are pure logger jitter.
+    let period = ((span + steps / 2) / steps).max(1);
+    let mut worst = 0usize;
+    let mut worst_drift = 0u64;
+    for (index, sample) in run.iter().enumerate() {
+        let modeled = first.saturating_add(period.saturating_mul(index as u64));
+        let drift = sample.time_ns.abs_diff(modeled);
+        if drift > worst_drift {
+            worst_drift = drift;
+            worst = index;
+        }
+    }
+    if worst_drift > tolerance && worst > 0 {
+        fitted_chunks(&run[..worst], base, modal, tolerance, chunks);
+        fitted_chunks(&run[worst..], base + worst, modal, tolerance, chunks);
+        return;
+    }
     chunks.push(Chunk {
         sample_period_ns: period,
-        sample_count: (samples.len() - start) as u64,
+        sample_count: run.len() as u64,
         data_ptr: 0,
-        sample_base: start as u64,
-        time_base_ns: samples[start].time_ns,
+        sample_base: base as u64,
+        time_base_ns: first,
     });
-    chunks
 }
 
 #[inline]
@@ -1580,7 +1628,9 @@ mod tests {
         ];
         let chunks = period_chunks(&samples_at(&times));
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].sample_period_ns, PERIOD_NS);
+        // The run is fitted end to end: 109 ms over 11 steps.
+        assert_eq!(chunks[0].sample_period_ns, (109_000_000 + 11 / 2) / 11);
+        assert!(chunks[0].sample_period_ns.abs_diff(PERIOD_NS) < 1_000_000);
         assert_eq!(chunks[0].sample_count, times.len() as u64);
         assert_eq!(chunks[0].time_base_ns, 0);
         assert_eq!(chunks[0].sample_base, 0);
@@ -1610,6 +1660,61 @@ mod tests {
         assert_eq!(chunks[1].sample_count, 4);
         assert_eq!(chunks[1].time_base_ns, 90_000_000);
         assert_eq!(chunks[1].sample_base, 5);
+    }
+
+    #[test]
+    fn period_chunks_fits_the_run_instead_of_trusting_the_modal_delta() {
+        // The logger stamps every 10.5 ms (alternating 10/11). The modal
+        // delta would say 10 ms and fall 0.5 ms further behind every sample;
+        // the fitted run says 10.5 ms and every residual is jitter.
+        let mut times = Vec::new();
+        let mut t = 0u64;
+        for index in 0..201u64 {
+            times.push(t);
+            t += if index % 2 == 0 {
+                10_000_000
+            } else {
+                11_000_000
+            };
+        }
+        let chunks = period_chunks(&samples_at(&times));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].sample_period_ns, 10_500_000);
+        assert_within_half_period(&chunks, &times);
+    }
+
+    #[test]
+    fn period_chunks_splits_where_the_rate_changes() {
+        // 100 samples at 10 ms, then the logger slows to 11 ms for 100 more.
+        // One linear model cannot hold both within half a period, so the run
+        // splits where the rate changes and each side is fitted exactly.
+        let mut times = Vec::new();
+        let mut t = 0u64;
+        for index in 0..200u64 {
+            times.push(t);
+            t += if index < 100 { 10_000_000 } else { 11_000_000 };
+        }
+        let chunks = period_chunks(&samples_at(&times));
+        assert!(chunks.len() >= 2, "rate change must split: {chunks:?}");
+        assert_within_half_period(&chunks, &times);
+    }
+
+    fn assert_within_half_period(chunks: &[Chunk], times: &[u64]) {
+        let mut covered = 0u64;
+        for chunk in chunks {
+            assert_eq!(chunk.sample_base, covered);
+            for i in 0..chunk.sample_count {
+                let modeled = chunk.time_base_ns + i * chunk.sample_period_ns;
+                let actual = times[(chunk.sample_base + i) as usize];
+                assert!(
+                    modeled.abs_diff(actual) <= chunk.sample_period_ns / 2,
+                    "sample {} modeled {modeled} actual {actual}",
+                    chunk.sample_base + i
+                );
+            }
+            covered += chunk.sample_count;
+        }
+        assert_eq!(covered, times.len() as u64);
     }
 
     #[test]

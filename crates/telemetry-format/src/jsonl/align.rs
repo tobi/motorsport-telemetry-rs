@@ -1,7 +1,6 @@
 //! Time-alignment helpers: regular-channel collection and lattice snapping.
 
 use super::json::invalid;
-use super::ALIGN_JITTER_NS;
 use crate::write::TelemetryFormatError;
 use motorsport_telemetry_core::{
     Channel, ChannelDisplay, ChannelLabel, LapMetadata, Span, TelemetrySource,
@@ -22,6 +21,18 @@ impl AlignedSeries {
         self.t0_ns + self.values.len() as u64 * self.period_ns
     }
 }
+/// Lays one channel onto a single `hz`/`t0` lattice, which is all MTJ can
+/// express for a channel.
+///
+/// Readers now fit each gap-free run with its own period so the chunk model
+/// follows the logger's stamps (see `aim_telemetry::period_chunks`), which
+/// means a real recording almost never arrives as one exact lattice. Refusing
+/// such channels — the old behaviour — silently dropped nearly every channel
+/// of an AiM export. Instead every sample is placed in the lattice slot
+/// nearest its own timestamp: a sample is never more than half a period from
+/// where the logger put it, a slot nothing landed in is `null`, and when two
+/// samples contend for one slot the earlier one is kept. That is the loss
+/// inherent to the MTJ schema, not a property of the channel.
 pub(super) fn collect_aligned(
     source: &dyn TelemetrySource,
     index: usize,
@@ -30,47 +41,30 @@ pub(super) fn collect_aligned(
     if channel.sample_count == 0 || channel.chunks.is_empty() {
         return None;
     }
-    let period_ns = channel.first_period_ns().filter(|period| *period > 0)?;
-    if channel
+    let period_ns = lattice_period_ns(channel)?;
+    let t0_ns = channel
         .chunks
         .iter()
-        .any(|chunk| chunk.sample_period_ns != period_ns)
-    {
-        return None;
-    }
-    let jitter = ALIGN_JITTER_NS.min(period_ns / 2).max(1);
+        .map(|chunk| chunk.time_base_ns)
+        .min()?;
+    let mut last_ns = t0_ns;
     for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
-        for local in 0..chunk.sample_count {
-            let actual = source.sample_time_ns(index, chunk_index, local);
-            let expected = chunk
-                .time_base_ns
-                .checked_add(local.checked_mul(period_ns)?)?;
-            if actual.abs_diff(expected) > jitter {
-                return None;
-            }
+        if chunk.sample_count == 0 {
+            continue;
         }
+        last_ns = last_ns.max(source.sample_time_ns(index, chunk_index, chunk.sample_count - 1));
     }
-    let t0_ns = channel.chunks[0].time_base_ns;
-    let last = {
-        let chunk = channel.chunks.last()?;
-        chunk.time_base_ns.checked_add(
-            chunk
-                .sample_count
-                .saturating_sub(1)
-                .checked_mul(period_ns)?,
-        )?
-    };
-    if last < t0_ns {
-        return None;
-    }
-    let count = usize::try_from((last - t0_ns) / period_ns + 1).ok()?;
+    let count = usize::try_from(nearest_slot(last_ns, t0_ns, period_ns)? + 1).ok()?;
     let mut values = vec![None; count];
+    let mut taken = vec![false; count];
     for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
         for local in 0..chunk.sample_count {
-            let time = chunk
-                .time_base_ns
-                .checked_add(local.checked_mul(period_ns)?)?;
-            let slot = usize::try_from((time - t0_ns) / period_ns).ok()?;
+            let time = source.sample_time_ns(index, chunk_index, local);
+            let slot = usize::try_from(nearest_slot(time, t0_ns, period_ns)?).ok()?;
+            if slot >= count || taken[slot] {
+                continue;
+            }
+            taken[slot] = true;
             let value = source.decode(index, chunk_index, local);
             values[slot] = value.is_finite().then_some(value);
         }
@@ -92,6 +86,44 @@ pub(super) fn collect_aligned(
             Vec::new()
         },
     })
+}
+
+/// Index of the lattice slot nearest `time_ns`; `None` when it precedes `t0`.
+fn nearest_slot(time_ns: u64, t0_ns: u64, period_ns: u64) -> Option<u64> {
+    let offset = time_ns.checked_sub(t0_ns)?;
+    Some((offset + period_ns / 2) / period_ns)
+}
+
+/// The lattice period for a channel: the sample-weighted dominant chunk
+/// period, rounded to the nearest millisecond when it is within 2 % of one so
+/// a fitted 9 999 213 ns run is written as `hz: 100` rather than
+/// `100.007870…`. A period that is not close to a millisecond multiple is
+/// kept exactly.
+fn lattice_period_ns(channel: &Channel) -> Option<u64> {
+    let mut weights: Vec<(u64, u64)> = Vec::new();
+    for chunk in &channel.chunks {
+        if chunk.sample_period_ns == 0 || chunk.sample_count == 0 {
+            continue;
+        }
+        match weights
+            .iter_mut()
+            .find(|(period, _)| *period == chunk.sample_period_ns)
+        {
+            Some((_, weight)) => *weight += chunk.sample_count,
+            None => weights.push((chunk.sample_period_ns, chunk.sample_count)),
+        }
+    }
+    let (dominant, _) = weights
+        .into_iter()
+        .max_by_key(|&(period, weight)| (weight, std::cmp::Reverse(period)))?;
+    const MILLISECOND: u64 = 1_000_000;
+    if dominant >= MILLISECOND {
+        let rounded = ((dominant + MILLISECOND / 2) / MILLISECOND) * MILLISECOND;
+        if rounded > 0 && rounded.abs_diff(dominant) * 50 <= dominant {
+            return Some(rounded);
+        }
+    }
+    Some(dominant)
 }
 pub(super) fn snap_spans(
     spans: &[Span],

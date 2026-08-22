@@ -283,8 +283,9 @@ struct ClockInfo {
     session_key: Option<String>,
 }
 
-/// Resolves the absolute clock (GPS week/ITOW or an explicit source range) and
-/// the internal session candidate key.
+/// Resolves the absolute clock (an explicit source range, GPS week/ITOW, or a
+/// Unix-seconds channel such as Cosworth `Global Time`) and the internal
+/// session candidate key.
 ///
 /// GPS week and ITOW are narrowed through [`finite_u64`]; any non-finite or
 /// out-of-range value leaves the GPS clock unset. The millisecond-to-nanosecond
@@ -331,6 +332,17 @@ fn derive_clock(source: &dyn TelemetrySource, hash: u64) -> ClockInfo {
             offset_ns: Some(i128::from(start_ns) - i128::from(first_time)),
             session_key: Some(format!("gps:{week}:{hash:016x}")),
         }
+    } else if let Some((first_time, start_ns, end_ns)) = unix_clock(source) {
+        ClockInfo {
+            clock: Some("utc".into()),
+            start_ns: Some(start_ns),
+            end_ns: Some(end_ns),
+            offset_ns: Some(i128::from(start_ns) - i128::from(first_time)),
+            session_key: Some(format!(
+                "utc:{}:{hash:016x}",
+                start_ns / 1_000_000_000 / 86_400
+            )),
+        }
     } else {
         ClockInfo {
             clock: None,
@@ -340,6 +352,47 @@ fn derive_clock(source: &dyn TelemetrySource, hash: u64) -> ClockInfo {
             session_key: None,
         }
     }
+}
+
+/// Earliest instant a logger could honestly report: 2000-01-01T00:00:00Z.
+const UNIX_CLOCK_MIN_S: f64 = 946_684_800.0;
+/// Latest: 2100-01-01T00:00:00Z. Anything outside is a counter, not a clock.
+const UNIX_CLOCK_MAX_S: f64 = 4_102_444_800.0;
+
+/// An absolute clock from a channel that logs Unix-epoch seconds directly —
+/// Cosworth's `Global Time`, for instance.
+///
+/// Returns `(first_sample_time_ns, start_ns, end_ns)`, where `start_ns` is the
+/// wall clock at the first sample. The channel is trusted only when every
+/// finite value is a plausible date, the values never run backwards, and the
+/// clock advances at the same rate as the sample timeline (within 2 % or two
+/// seconds, whichever is larger): a channel that fails any of those is
+/// counting something else.
+fn unix_clock(source: &dyn TelemetrySource) -> Option<(u64, u64, u64)> {
+    let index = names::find(source.channels(), &["globaltime", "unixtime", "epochtime"])?;
+    let values: Vec<(u64, f64)> = samples(source, index)
+        .into_iter()
+        .filter(|(_, value)| value.is_finite())
+        .collect();
+    let &(first_time, first_value) = values.first()?;
+    let &(last_time, last_value) = values.last()?;
+    if values.len() < 2
+        || values
+            .iter()
+            .any(|(_, value)| !(UNIX_CLOCK_MIN_S..=UNIX_CLOCK_MAX_S).contains(value))
+        || values.windows(2).any(|pair| pair[1].1 < pair[0].1)
+    {
+        return None;
+    }
+    let clock_span_s = last_value - first_value;
+    let sample_span_s = last_time.saturating_sub(first_time) as f64 / 1e9;
+    let tolerance_s = (sample_span_s * 0.02).max(2.0);
+    if (clock_span_s - sample_span_s).abs() > tolerance_s {
+        return None;
+    }
+    let start_ns = finite_u64(first_value * 1e9)?;
+    let end_ns = finite_u64(last_value * 1e9)?;
+    Some((first_time, start_ns, end_ns))
 }
 
 /// Distinct driver identifiers and their contiguous stints.
@@ -438,12 +491,12 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
     let (driver_ids, driver_stints) = driver_stints(source, duration_ns);
 
     let authoritative = laps::authoritative_laps(source);
-    let (lap_channel_index, counter_laps, counter_crossings, timer_laps) = match &authoritative {
-        Some(_) => (None, Vec::new(), 0, Vec::new()),
+    let (counter_laps, counter_crossings, timer_laps) = match &authoritative {
+        Some(_) => (Vec::new(), 0, Vec::new()),
         None => {
             let (index, counter_laps, crossings) = laps::counter_laps(source, duration_ns);
             let timer_laps = laps::timer_reset_laps(source, duration_ns, index);
-            (index, counter_laps, crossings, timer_laps)
+            (counter_laps, crossings, timer_laps)
         }
     };
     let mut laps = laps::pick_laps(
@@ -452,8 +505,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         counter_crossings,
         timer_laps,
     );
-    let mut fastest_lap =
-        laps::fastest_lap(source, &laps, authoritative.as_ref(), lap_channel_index);
+    let mut fastest_lap = laps::fastest_lap(source, &laps, authoritative.as_ref());
 
     stamp_lap_video_frames(source, &mut laps);
     if let Some(fastest) = &mut fastest_lap {
@@ -773,15 +825,89 @@ mod tests {
         let metadata = read_source_metadata(&source);
         assert_eq!(metadata.driver_ids, [3]);
         assert_eq!(metadata.laps.len(), 4);
-        assert_eq!(
-            metadata.fastest_lap.as_ref().unwrap().duration_ns,
-            18_000_000_000
-        );
+        // The fastest lap is one of the laps, never an interval rebuilt from
+        // a `Previous_LT` report (18 s here) that matches no lap boundary; a
+        // source and its `.telemetry` conversion must name the same lap.
+        let fastest = metadata.fastest_lap.as_ref().unwrap();
+        assert_eq!(fastest.duration_ns, 10_000_000_000);
+        assert!(metadata.laps.iter().any(|lap| lap == fastest));
         assert!(metadata
             .session_key
             .as_deref()
             .unwrap()
             .starts_with("test-session:"));
+    }
+
+    fn with_clock_channel(name: &str, values: Vec<f64>) -> MetadataSource {
+        let mut source = metadata_source("clock", 0, 3);
+        source.channels = vec![Channel {
+            id: 0,
+            name: name.into(),
+            unit: "s".into(),
+            unit_source: UnitSource::Declared,
+            sample_type: SampleType::F64,
+            chunks: vec![Chunk {
+                sample_period_ns: 1_000_000_000,
+                sample_count: values.len() as u64,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: 5_000_000_000,
+            }],
+            sample_count: values.len() as u64,
+            duration_ns: 5_000_000_000 + values.len() as u64 * 1_000_000_000,
+        }];
+        source.values = vec![values];
+        source
+    }
+
+    struct NoClock(MetadataSource);
+    impl TelemetrySource for NoClock {
+        fn path(&self) -> &str {
+            self.0.path()
+        }
+        fn format(&self) -> &'static str {
+            self.0.format()
+        }
+        fn channels(&self) -> &[Channel] {
+            self.0.channels()
+        }
+        fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
+            self.0.decode(channel_index, chunk_index, local_index)
+        }
+    }
+
+    #[test]
+    fn unix_seconds_channel_becomes_the_absolute_clock() {
+        // Cosworth `Global Time`: Unix seconds at 1 Hz, first sample 5 s into
+        // the file. The wall clock at t = 0 is therefore five seconds earlier.
+        let first = 1_737_644_480.0; // 2025-01-23T15:01:20Z
+        let values: Vec<f64> = (0..20).map(|i| first + i as f64).collect();
+        let source = NoClock(with_clock_channel("Global Time", values));
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.absolute_clock.as_deref(), Some("utc"));
+        assert_eq!(metadata.absolute_start_ns, Some(1_737_644_480_000_000_000));
+        assert_eq!(
+            metadata.clock_offset_ns,
+            Some(1_737_644_480_000_000_000 - 5_000_000_000)
+        );
+        assert!(metadata
+            .session_key
+            .as_deref()
+            .unwrap()
+            .starts_with("utc:20111:"));
+    }
+
+    #[test]
+    fn a_counter_that_is_not_wall_time_is_not_a_clock() {
+        // Plausible magnitude but advancing ten seconds per sample: that is
+        // not a clock running alongside the timeline.
+        let values: Vec<f64> = (0..20).map(|i| 1_737_644_480.0 + 10.0 * i as f64).collect();
+        let racing = NoClock(with_clock_channel("Global Time", values));
+        assert_eq!(read_source_metadata(&racing).absolute_clock, None);
+        // Right rate, impossible date.
+        let values: Vec<f64> = (0..20).map(|i| 12_345.0 + i as f64).collect();
+        let early = NoClock(with_clock_channel("Global Time", values));
+        assert_eq!(read_source_metadata(&early).absolute_clock, None);
     }
 
     #[test]

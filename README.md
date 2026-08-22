@@ -152,8 +152,18 @@ heuristics in `read_source_metadata`:
    (high-water ≥ 2). A 0/1 flag loses to `beaconEventCount` / `lap_beacon`
    counts. Shutdown resets are ignored.
 3. A running timer or progress channel that resets (`Current Lap Time`,
-   `Previous Lap Time` steps, `Lap Progression`).
+   `Lap Progression`). When a counter *and* a lap timer both exist, the
+   counter supplies the lap numbers and the timer supplies the boundaries:
+   a 10 Hz counter changes a sample after the beacon, while the timer resets
+   at the beacon and its first post-reset value says how long ago — so the
+   crossing is recovered to the timer's resolution and lap durations agree
+   with the logger's own reported lap times.
 4. Otherwise no laps. We do not invent in/out from “first/last incomplete”.
+
+The fastest lap is always one of those laps (the shortest plausible complete
+one). It is never an interval rebuilt from a `Previous Lap Time` report, so a
+source recording and its `.telemetry` conversion can never disagree about
+which lap was fastest.
 
 `.telemetry` stores the result in the header (`laps` plus the `valid_laps`
 scalar) so later `read_laps` / `read_valid_laps` do not scan samples.
@@ -292,6 +302,12 @@ lap   3: 1:31.907  top speed   277.1 km/h  max brake    81.5 bar
 compatible internal session key and absolute clock. Files without reliable
 internal identity remain separate; filenames are never used as evidence that
 two recordings belong together.
+
+The absolute clock comes, in order, from a range the format declares (MoTeC
+date/time, VBOX), from GPS week + iTOW channels, or from a channel that logs
+Unix-epoch seconds (Cosworth `Global Time`). A seconds channel is trusted
+only when every value is a plausible date, it never runs backwards, and it
+advances at the rate of the sample timeline.
 
 ```rust,no_run
 use motorsport_telemetry::open_sessions;

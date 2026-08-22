@@ -242,19 +242,39 @@ pub(crate) fn timer_reset_laps(
             .map(|(_, value)| *value)
             .filter(|value| value.is_finite())
             .fold(0.0_f64, f64::max);
-        let reset_threshold = if max_value > 1_000.0 { 5_000.0 } else { 5.0 };
+        // A timer above 1000 at its peak is counting milliseconds; anything
+        // smaller is seconds.
+        let milliseconds = max_value > 1_000.0;
+        let reset_threshold = if milliseconds { 5_000.0 } else { 5.0 };
         values
             .windows(2)
             .filter_map(|pair| {
                 let before = pair[0].1;
                 let after = pair[1].1;
-                let reset = if is_progress {
+                if !before.is_finite() || !after.is_finite() {
+                    return None;
+                }
+                if is_progress {
                     let full_lap = if max_value > 2.0 { 100.0 } else { 1.0 };
-                    before >= full_lap * 0.75 && after <= full_lap * 0.25
+                    return (before >= full_lap * 0.75 && after <= full_lap * 0.25)
+                        .then_some(pair[1].0);
+                }
+                if before - after <= reset_threshold {
+                    return None;
+                }
+                // The first sample after a reset already reads the time
+                // elapsed since the beacon; the crossing itself was that much
+                // earlier. Subtracting it recovers the beacon instant to the
+                // timer's own resolution instead of the channel's sample
+                // spacing, which is what makes the lap durations agree with
+                // the logger's reported lap times.
+                let elapsed_ns = if milliseconds {
+                    after.max(0.0) * 1e6
                 } else {
-                    before - after > reset_threshold
+                    after.max(0.0) * 1e9
                 };
-                (before.is_finite() && after.is_finite() && reset).then_some(pair[1].0)
+                let elapsed_ns = finite_u64(elapsed_ns).unwrap_or(0);
+                Some(pair[1].0.saturating_sub(elapsed_ns))
             })
             .collect::<Vec<_>>()
     })
@@ -301,7 +321,7 @@ pub(crate) fn pick_laps(
     if let Some(source_laps) = authoritative {
         source_laps.laps.clone()
     } else if counter_crossings > 0 {
-        counter_laps
+        refine_with_timer(counter_laps, &timer_laps)
     } else if !timer_laps.is_empty() {
         timer_laps
     } else {
@@ -309,21 +329,71 @@ pub(crate) fn pick_laps(
     }
 }
 
-/// Derives the fastest complete lap from the chosen laps and reported timing.
+/// How far a counter crossing may sit from a timer reset and still be the
+/// same beacon. A 10 Hz counter lags a 100 Hz timer by a sample or two; a
+/// second covers that with room for a logger that stamps the counter late.
+const TIMER_SNAP_WINDOW_NS: u64 = 1_500_000_000;
+
+/// Moves every counter-lap boundary onto the nearest timer reset within
+/// [`TIMER_SNAP_WINDOW_NS`], keeping the counter's lap numbers.
 ///
-/// Prefers an authoritative fastest lap. Otherwise scans the complete laps for
-/// the shortest plausible one. A `Previous Lap Time` / `Last Lap Time` channel
-/// (only when no authoritative laps are present) overrides that with the
-/// shortest reported plausible lap; a lap that would start before `t = 0` is
-/// dropped on underflow rather than clamped to zero.
+/// A lap counter only says which lap the car is on; it changes one sample
+/// after the beacon at its own (often 10 Hz) rate. The lap timer resets *at*
+/// the beacon and runs at 100 Hz, so where both describe the same crossing
+/// the timer's instant is the boundary. Boundaries with no reset nearby (the
+/// very first crossing of a recording that started mid-lap, a counter bump
+/// the timer never saw) stay where the counter put them.
+fn refine_with_timer(mut laps: Vec<LapMetadata>, timer_laps: &[LapMetadata]) -> Vec<LapMetadata> {
+    if timer_laps.is_empty() {
+        return laps;
+    }
+    let mut resets: Vec<u64> = timer_laps
+        .iter()
+        .filter(|lap| lap.complete || lap.start_ns > 0)
+        .map(|lap| lap.start_ns)
+        .collect();
+    resets.sort_unstable();
+    resets.dedup();
+    let snap = |boundary: u64| -> u64 {
+        let at = resets.partition_point(|reset| *reset < boundary);
+        let candidates = [at.checked_sub(1), (at < resets.len()).then_some(at)];
+        candidates
+            .into_iter()
+            .flatten()
+            .map(|index| resets[index])
+            .filter(|reset| reset.abs_diff(boundary) <= TIMER_SNAP_WINDOW_NS)
+            .min_by_key(|reset| reset.abs_diff(boundary))
+            .unwrap_or(boundary)
+    };
+    for lap in &mut laps {
+        lap.start_ns = snap(lap.start_ns);
+        // The recording's end is not a crossing; only snap a real one.
+        if lap.complete {
+            lap.end_ns = snap(lap.end_ns);
+        }
+    }
+    laps.retain(|lap| lap.end_ns > lap.start_ns);
+    for lap in &mut laps {
+        lap.duration_ns = lap.end_ns - lap.start_ns;
+    }
+    laps
+}
+
+/// Derives the fastest complete lap from the chosen laps.
+///
+/// Prefers an authoritative fastest lap. Otherwise the shortest plausible
+/// complete lap *of the list itself*: a `Ref Lap Time` channel only bounds
+/// what is plausible (half to one-and-a-half times the reference). It never
+/// manufactures an interval from a `Previous Lap Time` report — that produced
+/// a fastest lap that was in no lap list, so a recording and its own
+/// `.telemetry` conversion disagreed about which lap was fastest.
 pub(crate) fn fastest_lap(
     source: &dyn TelemetrySource,
     laps: &[LapMetadata],
     authoritative: Option<&SourceLapMetadata>,
-    lap_channel_index: Option<usize>,
 ) -> Option<LapMetadata> {
-    let no_authoritative = authoritative.is_none();
-    let reference_lap_ns = no_authoritative
+    let reference_lap_ns = authoritative
+        .is_none()
         .then(|| {
             names::find(source.channels(), &["reflaptime", "referencelaptime"]).and_then(|index| {
                 let values = samples(source, index);
@@ -350,60 +420,15 @@ pub(crate) fn fastest_lap(
             && reference_lap_ns.is_none_or(|reference| {
                 // checked_mul keeps the upper bound permissive on overflow
                 // instead of falsely dropping a plausible lap.
-                duration_ns >= reference / 2
-                    && duration_ns <= reference.checked_mul(3).unwrap_or(u64::MAX) / 2
+                duration_ns >= reference / 2 && duration_ns <= reference.saturating_mul(3) / 2
             })
     };
-    let mut fastest = authoritative
+    authoritative
         .and_then(|source| source.fastest_lap.clone())
         .or_else(|| {
             laps.iter()
                 .filter(|lap| lap.complete && plausible_lap(lap.duration_ns))
                 .min_by_key(|lap| lap.duration_ns)
                 .cloned()
-        });
-    if no_authoritative {
-        if let Some(previous_lap_index) = names::find(
-            source.channels(),
-            &["previouslt", "previouslaptime", "lastlaptime"],
-        ) {
-            let values = samples(source, previous_lap_index);
-            let max_value = values
-                .iter()
-                .map(|(_, value)| *value)
-                .filter(|value| value.is_finite())
-                .fold(0.0_f64, f64::max);
-            let scale = if max_value > 1_000.0 {
-                1_000_000.0
-            } else {
-                1_000_000_000.0
-            };
-            let reported = values
-                .into_iter()
-                .filter(|(_, value)| value.is_finite() && *value > 0.0)
-                .filter_map(|(time_ns, value)| {
-                    let duration_ns = finite_u64(value * scale)?;
-                    Some((time_ns, duration_ns))
-                })
-                .filter(|(_, duration_ns)| plausible_lap(*duration_ns))
-                .min_by_key(|(_, duration_ns)| *duration_ns);
-            if let Some((time_ns, duration_ns)) = reported {
-                let number = lap_channel_index
-                    .and_then(|channel| counter_lap_number_at(source, channel, time_ns, true))
-                    .unwrap_or(0);
-                if let Some(start_ns) = time_ns.checked_sub(duration_ns) {
-                    fastest = Some(LapMetadata {
-                        number,
-                        start_ns,
-                        end_ns: time_ns,
-                        duration_ns,
-                        complete: true,
-                        first_video_frame: None,
-                    });
-                }
-                // else: lap started before t = 0; keep the existing fastest
-            }
-        }
-    }
-    fastest
+        })
 }
