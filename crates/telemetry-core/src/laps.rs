@@ -365,10 +365,19 @@ fn refine_with_timer(mut laps: Vec<LapMetadata>, timer_laps: &[LapMetadata]) -> 
             .min_by_key(|reset| reset.abs_diff(boundary))
             .unwrap_or(boundary)
     };
-    for lap in &mut laps {
-        lap.start_ns = snap(lap.start_ns);
-        // The recording's end is not a crossing; only snap a real one.
-        if lap.complete {
+    let count = laps.len();
+    for (index, lap) in laps.iter_mut().enumerate() {
+        // The recording's own edges are not crossings: a head fragment
+        // starts where logging started and a tail fragment ends where it
+        // stopped. Every other boundary is a beacon and is snapped — the
+        // head fragment's *end* included, or it would overlap the lap that
+        // follows by the counter's lag.
+        let head = index == 0 && !lap.complete;
+        let tail = index + 1 == count && !lap.complete;
+        if !head {
+            lap.start_ns = snap(lap.start_ns);
+        }
+        if !tail {
             lap.end_ns = snap(lap.end_ns);
         }
     }
@@ -431,4 +440,69 @@ pub(crate) fn fastest_lap(
                 .min_by_key(|lap| lap.duration_ns)
                 .cloned()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lap(number: i64, start_s: f64, end_s: f64, complete: bool) -> LapMetadata {
+        let start_ns = (start_s * 1e9) as u64;
+        let end_ns = (end_s * 1e9) as u64;
+        LapMetadata {
+            number,
+            start_ns,
+            end_ns,
+            duration_ns: end_ns - start_ns,
+            complete,
+            first_video_frame: None,
+        }
+    }
+
+    #[test]
+    fn timer_resets_place_counter_boundaries() {
+        // A 10 Hz counter changes 0.3 s after each beacon; the 100 Hz timer
+        // resets at the beacon. Numbers come from the counter, instants from
+        // the timer. The head fragment's start and the tail fragment's end
+        // are recording edges and stay put; the head fragment's end is a
+        // crossing and moves like any other.
+        let counter = vec![
+            lap(1, 0.0, 120.3, false),
+            lap(2, 120.3, 240.3, true),
+            lap(3, 240.3, 360.3, true),
+            lap(4, 360.3, 400.0, false),
+        ];
+        let timer = vec![
+            lap(0, 0.0, 120.0, false),
+            lap(0, 120.0, 240.0, true),
+            lap(0, 240.0, 360.0, true),
+            lap(0, 360.0, 400.0, false),
+        ];
+        let refined = pick_laps(None, counter, 3, timer);
+        let bounds: Vec<(i64, u64, u64, bool)> = refined
+            .iter()
+            .map(|lap| (lap.number, lap.start_ns, lap.end_ns, lap.complete))
+            .collect();
+        assert_eq!(
+            bounds,
+            vec![
+                (1, 0, 120_000_000_000, false),
+                (2, 120_000_000_000, 240_000_000_000, true),
+                (3, 240_000_000_000, 360_000_000_000, true),
+                (4, 360_000_000_000, 400_000_000_000, false),
+            ]
+        );
+        assert!(refined
+            .iter()
+            .all(|lap| lap.duration_ns == lap.end_ns - lap.start_ns));
+    }
+
+    #[test]
+    fn counter_boundaries_without_a_nearby_reset_are_kept() {
+        let counter = vec![lap(1, 10.0, 130.0, true), lap(2, 130.0, 250.0, true)];
+        // A lone reset far from every crossing is not the same beacon.
+        let timer = vec![lap(0, 0.0, 60.0, false), lap(0, 60.0, 250.0, false)];
+        let refined = pick_laps(None, counter.clone(), 2, timer);
+        assert_eq!(refined, counter);
+    }
 }
