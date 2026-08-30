@@ -48,7 +48,7 @@ impl NativeRecording {
         Self::from_storage(display, storage)
     }
 
-    fn rewrite_migrated(&self, path: &Path) -> Result<(), TelemetryFormatError> {
+    fn rewrite_migrated(self, path: &Path) -> Result<(), TelemetryFormatError> {
         let mut catalog = self.catalog.clone();
         crate::migrate::apply(&mut catalog)
             .map_err(|err| TelemetryFormatError::Invalid(err.to_string()))?;
@@ -57,7 +57,7 @@ impl NativeRecording {
         // core placement (never inventing a value) instead of leaving the
         // migrated catalog without absolute placement.
         if catalog.format_version >= 4 {
-            let metadata = motorsport_telemetry_core::read_source_metadata(self);
+            let metadata = motorsport_telemetry_core::read_source_metadata(&self);
             if catalog.timezone.is_empty() {
                 catalog.timezone = metadata.timezone.clone();
             }
@@ -97,6 +97,10 @@ impl NativeRecording {
             let mut writer = zip.finish()?;
             writer.flush()?;
             drop(writer);
+            // Windows cannot replace a file while a mapped view of it is
+            // alive. The replacement is fully written now, so release the
+            // old mapping before the atomic rename (no payload copy needed).
+            drop(self);
             fs::rename(&tmp, path)?;
             Ok(())
         })();

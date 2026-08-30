@@ -110,11 +110,19 @@ facade, checks normalized pedals, converts it to native, and checks again.
 
 ## Validation and reproduction
 
-Final tree: **310 tests passed**, zero failed/ignored across workspace targets
+Final tree: **311 tests passed**, zero failed/ignored across workspace targets
 and doctests. `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo fmt --all --check`, and `git diff --check` passed. The five native
 archive conversions verified successfully; that does not remove the
 source-data warnings described above.
+
+Upstream CI now runs example regressions as well as library/integration tests
+and doctests on Linux, macOS and Windows. Packaging verifies the unpublished
+atlas/core workspace pair together using current stable Cargo. Windows CI
+also exposed a native-migration bug: replacing the old archive while its
+memory map was still alive failed with access denied. Migration now releases
+that map after writing the replacement and before renaming it. A synthetic
+regression checks byte-for-byte preservation of every non-catalog ZIP member.
 
 ```sh
 cargo test --workspace --all-targets

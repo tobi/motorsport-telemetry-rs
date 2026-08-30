@@ -408,6 +408,44 @@ mod tests {
     }
 
     #[test]
+    fn migration_replaces_the_file_without_changing_payload_members() {
+        let source =
+            cosworth_telemetry::CosworthFile::open(fixture("synthetic_cosworth.pds")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("migrate.telemetry");
+        write_from_source_version(&source, &dest, 1).unwrap();
+        let payloads = |bytes: &[u8]| {
+            let mut members: Vec<_> = crate::zip::parse_members(bytes)
+                .unwrap()
+                .into_iter()
+                .filter(|member| member.name != "metadata.fb")
+                .map(|member| {
+                    let start = member.offset as usize;
+                    let end = start + member.size as usize;
+                    (member.name, bytes[start..end].to_vec())
+                })
+                .collect();
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            members
+        };
+        let before = payloads(&std::fs::read(&dest).unwrap());
+        // This call used to fail on Windows: the migration's own mmap
+        // prevented replacement of the original, writable file.
+        let opened = NativeRecording::open(&dest).unwrap();
+        assert_eq!(opened.catalog().format_version, FORMAT_VERSION);
+        assert_eq!(payloads(&std::fs::read(&dest).unwrap()), before);
+        assert!(!dest.with_extension("telemetry.tmp").exists());
+        drop(opened);
+        assert_eq!(
+            NativeRecording::open(&dest)
+                .unwrap()
+                .catalog()
+                .format_version,
+            FORMAT_VERSION
+        );
+    }
+
+    #[test]
     fn open_leaves_read_only_older_files() {
         let source =
             cosworth_telemetry::CosworthFile::open(fixture("synthetic_cosworth.pds")).unwrap();
