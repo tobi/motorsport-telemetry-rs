@@ -2,8 +2,8 @@
 #![deny(missing_docs)]
 
 use motorsport_telemetry_core::{
-    names, Channel, Chunk, Diagnostic, SampleTimes, SampleType, Storage, TelemetrySource,
-    UnitSource, VideoFileRef,
+    names, Channel, Chunk, Diagnostic, LapMetadata, SampleTimes, SampleType, SourceLapMetadata,
+    Storage, TelemetrySource, UnitSource, VideoFileRef,
 };
 use std::path::Path;
 use thiserror::Error;
@@ -87,6 +87,7 @@ struct Sections<'a> {
     column_names: Vec<&'a str>,
     data: Vec<&'a str>,
     avi: Vec<&'a str>,
+    laptiming: Vec<&'a str>,
 }
 
 /// An opened Racelogic VBOX telemetry source.
@@ -106,6 +107,8 @@ pub struct RacelogicFile {
     pub videos: Vec<VideoFileRef>,
     values: Vec<Vec<f64>>,
     absolute_start_ns: u64,
+    /// Laps from GPS crossings of the `[laptiming]` start/finish gate.
+    laps: Option<SourceLapMetadata>,
     /// Recovery diagnostics collected during parse.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -144,6 +147,7 @@ fn sections(text: &str) -> Sections<'_> {
             }
             "data" => result.data.push(trimmed),
             "avi" => result.avi.push(trimmed),
+            "laptiming" => result.laptiming.push(trimmed),
             _ => {}
         }
     }
@@ -173,6 +177,8 @@ fn metadata_channel(name: &str) -> bool {
         names::normalize(name).as_str(),
         "time"
             | "tsample"
+            | "sats"
+            | "satellites"
             | "latitude"
             | "longitude"
             | "lat"
@@ -422,6 +428,35 @@ impl RacelogicFile {
             .unwrap_or(0)
             .saturating_add(sample_period);
 
+        // `[channel units]` declares one unit per custom (non-builtin) column.
+        // Real VBOX loggers (VBVDHD2 firmware 1.x) emit one extra leading entry
+        // covering the last builtin column (`avisynctime`, "s"), so the list
+        // is anchored at its *end*: the last custom column takes the last unit.
+        // Front-aligning those files shifted every unit by one and labelled
+        // `Vehicle_Speed` as `%`. When fewer units than custom columns are
+        // declared the start is the only anchor available, so fall back to it.
+        let custom_count = count.saturating_sub(BUILTIN_NAMES.len());
+        let unit_offset = parsed.units.len() as isize - custom_count as isize;
+        if custom_count > 0 && !parsed.units.is_empty() && unit_offset != 0 {
+            diagnostics.push(Diagnostic::info(
+                "vbo.channel_units_count_mismatch",
+                format!(
+                    "[channel units] lists {} entries for {custom_count} custom column(s); \
+                     units were aligned to the {} of the list",
+                    parsed.units.len(),
+                    if unit_offset > 0 { "end" } else { "start" }
+                ),
+            ));
+        }
+        let declared_unit = |index: usize| -> Option<&str> {
+            let position = index as isize - BUILTIN_NAMES.len() as isize + unit_offset.max(0);
+            usize::try_from(position)
+                .ok()
+                .and_then(|position| parsed.units.get(position))
+                .copied()
+                .filter(|unit| *unit != "(null)" && !unit.is_empty())
+        };
+
         let mut channels = Vec::with_capacity(count);
         for index in 0..count {
             let name: String = match parsed.header.get(index) {
@@ -429,23 +464,22 @@ impl RacelogicFile {
                 None if index < BUILTIN_NAMES.len() => BUILTIN_NAMES[index].to_owned(),
                 None => short_names[index].to_owned(),
             };
-            let custom_unit_index = index.saturating_sub(BUILTIN_NAMES.len());
             // Builtin VBOX columns have units fixed by the format spec; the
             // trailing custom columns declare theirs in [channel units].
             let (unit, unit_source) = if index < BUILTIN_NAMES.len() {
                 let builtin = builtin_unit(short_names[index]);
-                if builtin.is_empty() {
-                    (String::new(), UnitSource::Unknown)
-                } else {
+                if !builtin.is_empty() {
                     (builtin.to_owned(), UnitSource::SpecDefault)
+                } else if let Some(declared) = declared_unit(index) {
+                    // A surplus leading entry names a builtin the spec leaves
+                    // unitless (e.g. `avisynctime` -> "s").
+                    (declared.to_owned(), UnitSource::Declared)
+                } else {
+                    (String::new(), UnitSource::Unknown)
                 }
             } else {
-                match parsed
-                    .units
-                    .get(custom_unit_index)
-                    .filter(|unit| **unit != "(null)" && !unit.is_empty())
-                {
-                    Some(declared) => ((*declared).to_owned(), UnitSource::Declared),
+                match declared_unit(index) {
+                    Some(declared) => (declared.to_owned(), UnitSource::Declared),
                     None => (String::new(), UnitSource::Unknown),
                 }
             };
@@ -471,10 +505,19 @@ impl RacelogicFile {
             });
         }
         let videos = discover_videos(&parsed.avi, &short_names, &values);
+        let laps = gate_laps(
+            &parsed.laptiming,
+            &short_names,
+            &values,
+            &time_ns,
+            duration,
+            &mut diagnostics,
+        );
         Ok(Self {
             path: display,
             channels,
             time_ns,
+            laps,
             date: parsed.created_date,
             recording_time: parsed.created_time,
             videos,
@@ -483,6 +526,264 @@ impl RacelogicFile {
             diagnostics,
         })
     }
+}
+
+/// The start/finish marks declared in `[laptiming]`, as two points in the
+/// file's own coordinate convention (arc-minutes, longitude first, west
+/// positive — the same convention as the `lat` / `long` columns). See
+/// [`gate_metres`] for what the two points mean.
+///
+/// A line reads `Start <long1> <lat1> <long2> <lat2> ¬ <name>`. `Split`
+/// lines (sector gates) are ignored.
+fn parse_gate(laptiming: &[&str]) -> Option<[(f64, f64); 2]> {
+    laptiming.iter().find_map(|line| {
+        let rest = line.strip_prefix("Start")?;
+        let mut numbers = rest
+            .split_whitespace()
+            .take_while(|token| *token != "¬")
+            .map(|token| token.trim_start_matches('+').parse::<f64>().ok());
+        let long1 = numbers.next()??;
+        let lat1 = numbers.next()??;
+        let long2 = numbers.next()??;
+        let lat2 = numbers.next()??;
+        ((long1, lat1) != (long2, lat2)).then_some([(long1, lat1), (long2, lat2)])
+    })
+}
+
+/// Fraction along `a -> b` at which it crosses the segment `c -> d`, if it
+/// does (proper intersection, both parameters inside `0..=1`).
+fn segment_crossing(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> Option<f64> {
+    let r = (b.0 - a.0, b.1 - a.1);
+    let s = (d.0 - c.0, d.1 - c.1);
+    let denominator = r.0 * s.1 - r.1 * s.0;
+    if denominator.abs() < f64::EPSILON {
+        return None;
+    }
+    let qp = (c.0 - a.0, c.1 - a.1);
+    let t = (qp.0 * s.1 - qp.1 * s.0) / denominator;
+    let u = (qp.0 * r.1 - qp.1 * r.0) / denominator;
+    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then_some(t)
+}
+
+/// Two gate crossings closer than this are one crossing seen twice (GPS
+/// jitter while sitting on the line). Well below any lap.
+const GATE_DEBOUNCE_NS: u64 = 10_000_000_000;
+
+/// Consecutive fixes further apart than this speed implies are a position
+/// jump, not motion (150 m/s = 540 km/h). Such a pair can neither cross
+/// the gate nor be trusted.
+const GATE_MAX_SPEED_MPS: f64 = 150.0;
+
+/// When more than this fraction of consecutive fix pairs are jumps the
+/// receiver was not tracking and nothing it says about the gate is usable.
+/// Healthy sessions sit at zero; a failing antenna produced 2.3 %.
+const GATE_MAX_JUMP_FRACTION: f64 = 0.005;
+
+/// Minimum satellites for a fix to take part in gate timing.
+const GATE_MIN_SATELLITES: f64 = 4.0;
+
+/// Half-width of the timing gate, in metres, either side of its centre.
+///
+/// Inference policy, not a field stored in the file: use a 50 m line centred
+/// on the mark to cover a wide pit straight. Its width and the interpretation
+/// of the two marks were checked against this collection, not a vendor spec.
+const GATE_HALF_WIDTH_M: f64 = 25.0;
+
+/// Metres per arc-minute of latitude (and of longitude at the equator).
+const METRES_PER_ARCMIN: f64 = 1_852.0;
+
+/// Local planar metres for a `(long, lat)` arc-minute pair, relative to
+/// `origin`. Longitude is scaled by the cosine of the origin latitude so
+/// distances (and therefore the gate width) are right; the sign convention
+/// is irrelevant to intersection tests.
+fn local_metres(point: (f64, f64), origin: (f64, f64)) -> (f64, f64) {
+    let cos_lat = (origin.1 / 60.0).to_radians().cos();
+    (
+        (point.0 - origin.0) * METRES_PER_ARCMIN * cos_lat,
+        (point.1 - origin.1) * METRES_PER_ARCMIN,
+    )
+}
+
+/// The timing gate as a metric segment about `origin`.
+///
+/// The two `[laptiming]` points are not the gate's ends: on real files they
+/// sit a couple of metres apart *along* the racing line (the first marks the
+/// line's position, the second the direction of travel). The gate is the
+/// line through the first point perpendicular to that direction, extended
+/// [`GATE_HALF_WIDTH_M`] each side.
+fn gate_metres(marks: [(f64, f64); 2], origin: (f64, f64)) -> Option<[(f64, f64); 2]> {
+    let centre = local_metres(marks[0], origin);
+    let ahead = local_metres(marks[1], origin);
+    let travel = (ahead.0 - centre.0, ahead.1 - centre.1);
+    let length = (travel.0 * travel.0 + travel.1 * travel.1).sqrt();
+    if length == 0.0 || !length.is_finite() {
+        return None;
+    }
+    let across = (-travel.1 / length, travel.0 / length);
+    Some([
+        (
+            centre.0 - across.0 * GATE_HALF_WIDTH_M,
+            centre.1 - across.1 * GATE_HALF_WIDTH_M,
+        ),
+        (
+            centre.0 + across.0 * GATE_HALF_WIDTH_M,
+            centre.1 + across.1 * GATE_HALF_WIDTH_M,
+        ),
+    ])
+}
+
+/// Laps from GPS crossings of the declared start/finish gate.
+///
+/// These are inferred laps, not logger-reported times. GPS crossings can
+/// recover boundaries lost by the CAN `Lap_Number` channel during dash resets at driver changes and pit stops (the
+/// counter drops to 0 and counts up again, so a high-water-mark reading of
+/// it swallows every lap until the old maximum is passed — a 29-minute "lap"
+/// at racing speed). Files without a gate, without GPS, or whose GPS never
+/// crosses the gate return `None` and fall back to the generic counter and
+/// timer recovery. Laps are numbered from 1 in crossing order; the head and
+/// tail fragments are incomplete.
+fn gate_laps(
+    laptiming: &[&str],
+    short_names: &[&str],
+    values: &[Vec<f64>],
+    time_ns: &[u64],
+    duration_ns: u64,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<SourceLapMetadata> {
+    let gate = parse_gate(laptiming)?;
+    let column = |wanted: &[&str]| {
+        short_names
+            .iter()
+            .position(|name| wanted.iter().any(|w| names::eq(name, w)))
+            .filter(|index| values[*index].len() == time_ns.len())
+    };
+    let lat = column(&["lat", "latitude"])?;
+    let long = column(&["long", "lon", "longitude"])?;
+    let sats = column(&["sats", "satellites"]);
+    let fix = |row: usize| -> Option<(f64, f64)> {
+        let latitude = values[lat][row];
+        let longitude = values[long][row];
+        if !latitude.is_finite()
+            || !longitude.is_finite()
+            || latitude.abs() > 90.0 * 60.0
+            || longitude.abs() > 180.0 * 60.0
+            || (latitude == 0.0 && longitude == 0.0)
+        {
+            return None;
+        }
+        Some((longitude, latitude))
+    };
+    let usable = |row: usize| -> Option<(f64, f64)> {
+        if sats.is_some_and(|sats| {
+            !values[sats][row].is_finite() || values[sats][row] < GATE_MIN_SATELLITES
+        }) {
+            return None;
+        }
+        fix(row)
+    };
+    let origin = gate[0];
+    let gate = gate_metres(gate, origin)?;
+    let jump = |prev_row: usize, prev_point: (f64, f64), row: usize, point: (f64, f64)| {
+        let dt_s = time_ns[row].saturating_sub(time_ns[prev_row]) as f64 / 1e9;
+        let distance_m =
+            ((point.0 - prev_point.0).powi(2) + (point.1 - prev_point.1).powi(2)).sqrt();
+        dt_s <= 0.0 || distance_m > GATE_MAX_SPEED_MPS * dt_s
+    };
+
+    // Receiver health is judged on every reported fix, not just the ones
+    // that pass the satellite filter: a failing antenna reports positions
+    // jumping by degrees between samples, and a logger that still labels a
+    // fraction of them with a satellite count is not one to time laps with.
+    let mut pairs = 0usize;
+    let mut jumps = 0usize;
+    let mut previous: Option<(usize, (f64, f64))> = None;
+    for row in 0..time_ns.len() {
+        let Some(point) = fix(row).map(|point| local_metres(point, origin)) else {
+            continue;
+        };
+        if let Some((prev_row, prev_point)) = previous {
+            if prev_row + 1 == row {
+                pairs += 1;
+                if jump(prev_row, prev_point, row, point) {
+                    jumps += 1;
+                }
+            }
+        }
+        previous = Some((row, point));
+    }
+    if pairs > 0 && jumps as f64 > pairs as f64 * GATE_MAX_JUMP_FRACTION {
+        diagnostics.push(Diagnostic::warning(
+            "vbo.gate_laps_skipped_gps_unreliable",
+            format!(
+                "{jumps} of {pairs} consecutive GPS fixes imply more than {GATE_MAX_SPEED_MPS:.0} \
+                 m/s; the receiver was not tracking, so the [laptiming] gate was not used for \
+                 laps"
+            ),
+        ));
+        return None;
+    }
+
+    let mut crossings: Vec<u64> = Vec::new();
+    let mut previous: Option<(usize, (f64, f64))> = None;
+    for row in 0..time_ns.len() {
+        let Some(point) = usable(row).map(|point| local_metres(point, origin)) else {
+            continue;
+        };
+        if let Some((prev_row, prev_point)) = previous {
+            // Only consecutive fixes form a path; a dropout in between means
+            // the car could have crossed anywhere, and a jump is not a path.
+            if prev_row + 1 == row
+                && time_ns[row].saturating_sub(time_ns[prev_row]) <= 2_000_000_000
+                && !jump(prev_row, prev_point, row, point)
+            {
+                if let Some(t) = segment_crossing(prev_point, point, gate[0], gate[1]) {
+                    let t0 = time_ns[prev_row] as f64;
+                    let t1 = time_ns[row] as f64;
+                    let at = (t0 + (t1 - t0) * t).round() as u64;
+                    if crossings
+                        .last()
+                        .is_none_or(|last| at.saturating_sub(*last) >= GATE_DEBOUNCE_NS)
+                    {
+                        crossings.push(at);
+                    }
+                }
+            }
+        }
+        previous = Some((row, point));
+    }
+    if crossings.is_empty() {
+        return None;
+    }
+    let mut boundaries = Vec::with_capacity(crossings.len() + 2);
+    boundaries.push(0);
+    boundaries.extend(crossings.iter().copied());
+    boundaries.push(duration_ns.max(*crossings.last().unwrap()));
+    let count = boundaries.len() - 1;
+    let laps = boundaries
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| pair[1] > pair[0])
+        .map(|(index, pair)| LapMetadata {
+            number: index as i64 + 1,
+            start_ns: pair[0],
+            end_ns: pair[1],
+            duration_ns: pair[1] - pair[0],
+            complete: index > 0 && index + 1 < count,
+            first_video_frame: None,
+        })
+        .collect::<Vec<_>>();
+    diagnostics.push(Diagnostic::info(
+        "vbo.laps_from_gate",
+        format!(
+            "{} GPS crossing(s) of the [laptiming] start/finish gate define the laps; the CAN \
+             lap counter (if any) was not used; inferred with a 50 m gate",
+            crossings.len()
+        ),
+    ));
+    Some(SourceLapMetadata {
+        laps,
+        fastest_lap: None,
+    })
 }
 
 fn discover_videos(avi: &[&str], short_names: &[&str], values: &[Vec<f64>]) -> Vec<VideoFileRef> {
@@ -574,7 +875,7 @@ impl TelemetrySource for RacelogicFile {
         if self
             .channels
             .get(channel_index)
-            .map_or(true, |c| c.sample_count == 0)
+            .is_none_or(|c| c.sample_count == 0)
         {
             return SampleTimes::Explicit(&[]);
         }
@@ -583,6 +884,10 @@ impl TelemetrySource for RacelogicFile {
 
     fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
+        self.laps.clone()
     }
 }
 
@@ -665,6 +970,180 @@ mod tests {
         assert_eq!(at_second.file_index, Some(2));
     }
 
+    /// A VBO whose car drives a straight line north past the gate at 1 Hz
+    /// (rows 0..20), loses GPS for one row, then does it again (rows 21..41),
+    /// with a CAN `Lap_Number` that resets to 0 at the gap (a dash reset) so
+    /// the counter alone would swallow the second lap.
+    fn gate_fixture(gate: &str, lap_numbers: &[i32]) -> String {
+        // Gate at lat 1751.26125', long 4864.3685' (Daytona), direction of
+        // travel marked 0.001' further north along the same longitude, so the
+        // gate itself runs east-west.
+        let mut data = String::new();
+        for (row, lap) in lap_numbers.iter().enumerate() {
+            let time = 120_000.0 + row as f64;
+            if row == 20 {
+                data.push_str(&format!(
+                    "0 {time:.1} 0.0 0.0 0.0 0.0 0.0 0.0 1.0 0 0 0 {lap}\n"
+                ));
+                continue;
+            }
+            // 20 rows per pass: lat climbs 0.0005'/row (~0.9 m) from 0.005'
+            // south of the gate to 0.005' north of it.
+            let pass_row = if row < 20 { row } else { row - 21 };
+            let lat = 1751.26125 - 0.005 + pass_row as f64 * 0.000_5;
+            data.push_str(&format!(
+                "8 {time:.1} {lat:.6} 4864.368500 100.0 0.0 10.0 0.0 1.0 1 0 0 {lap}\n"
+            ));
+        }
+        let builtin = BUILTIN_SHORT.join(" ");
+        let builtin_header = BUILTIN_NAMES.join("\n");
+        format!(
+            "[header]\n{builtin_header}\nLap_Number\n[channel units]\n(null)\n\
+             {gate}[column names]\n{builtin} Lap_Number\n[data]\n{data}"
+        )
+    }
+
+    #[test]
+    fn laps_come_from_gps_crossings_of_the_laptiming_gate() {
+        let gate = "[laptiming]\nStart +4864.368500 +1751.261250 +4864.368500 +1751.262250 \u{ac} Start / Finish\n";
+        // Two passes; the counter reads 1 for the first and resets to 0 then
+        // 1 again for the second, which a high-water reading would ignore.
+        let mut counter = vec![1; 20];
+        counter.extend([0; 2]);
+        counter.extend([1; 19]);
+        let fixture = fixture(&gate_fixture(gate, &counter));
+        let file = RacelogicFile::open(fixture.path()).unwrap();
+        let laps = file.source_lap_metadata().expect("gate laps");
+        // The gate latitude is reached exactly at pass row 10: 10 s into the
+        // first pass and 31 s into the file for the second.
+        let bounds: Vec<(i64, u64, u64, bool)> = laps
+            .laps
+            .iter()
+            .map(|lap| (lap.number, lap.start_ns, lap.end_ns, lap.complete))
+            .collect();
+        assert_eq!(
+            bounds,
+            [
+                (1, 0, 10_000_000_000, false),
+                (2, 10_000_000_000, 31_000_000_000, true),
+                (3, 31_000_000_000, 41_000_000_000, false),
+            ]
+        );
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "vbo.laps_from_gate"));
+        // The generic recovery uses the authoritative laps, so the reset
+        // counter no longer produces one 3 s lap.
+        let metadata = motorsport_telemetry_core::read_source_metadata(&file);
+        assert_eq!(metadata.laps.len(), 3);
+        assert_eq!(metadata.valid_laps, 1);
+    }
+
+    #[test]
+    fn metadata_only_gate_laps_respect_invalid_satellite_counts() {
+        let gate = "[laptiming]\nStart +4864.368500 +1751.261250 +4864.368500 +1751.262250\n";
+        for count in ["0", "NaN"] {
+            let text = gate_fixture(gate, &[1; 41]).replace("\n8 ", &format!("\n{count} "));
+            let fixture = fixture(&text);
+            let full = RacelogicFile::open(fixture.path()).unwrap();
+            let header = RacelogicFile::open_metadata(fixture.path()).unwrap();
+            assert!(full.source_lap_metadata().is_none(), "{count}");
+            assert_eq!(
+                header.source_lap_metadata(),
+                full.source_lap_metadata(),
+                "{count}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_far_from_the_car_falls_back_to_the_counter() {
+        // Same drive, but the declared gate is at another circuit entirely.
+        let gate = "[laptiming]\nStart +4881.221190 +1647.013530 +4881.227000 +1647.013560 \u{ac} Start / Finish\n";
+        let fixture = fixture(&gate_fixture(gate, &[1; 41]));
+        let file = RacelogicFile::open(fixture.path()).unwrap();
+        assert!(file.source_lap_metadata().is_none());
+        assert!(!file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "vbo.laps_from_gate"));
+        // No [laptiming] at all: also no authoritative laps.
+        let no_gate = self::fixture(&gate_fixture("", &[1; 41]));
+        let file = RacelogicFile::open(no_gate.path()).unwrap();
+        assert!(file.source_lap_metadata().is_none());
+    }
+
+    #[test]
+    fn unreliable_gps_does_not_time_the_gate() {
+        // Every other fix teleports 8 degrees north: a receiver that is not
+        // tracking. The CAN counter must remain the lap source.
+        let gate = "[laptiming]\nStart +4864.368500 +1751.261250 +4864.368500 +1751.262250 \u{ac} Start / Finish\n";
+        let text = gate_fixture(gate, &[1; 41]);
+        let broken = text
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                if index % 2 == 0 && line.starts_with("8 ") {
+                    let mut tokens: Vec<String> = line.split(' ').map(str::to_owned).collect();
+                    tokens[2] = format!("{:.6}", tokens[2].parse::<f64>().unwrap() + 480.0);
+                    tokens.join(" ")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fixture = fixture(&broken);
+        let file = RacelogicFile::open(fixture.path()).unwrap();
+        assert!(file.source_lap_metadata().is_none());
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "vbo.gate_laps_skipped_gps_unreliable"));
+    }
+
+    #[test]
+    fn a_long_time_gap_does_not_define_a_gate_crossing() {
+        let gate = ["Start +4864.368500 +1751.261250 +4864.368500 +1751.262250"];
+        let values = vec![vec![1751.26, 1751.27], vec![4864.3685; 2]];
+        let mut diagnostics = Vec::new();
+        let laps = gate_laps(
+            &gate,
+            &["lat", "long"],
+            &values,
+            &[0, 60_000_000_000],
+            61_000_000_000,
+            &mut diagnostics,
+        );
+        assert!(
+            laps.is_none(),
+            "two fixes a minute apart cannot time a crossing"
+        );
+    }
+
+    #[test]
+    fn gate_marks_are_parsed_and_widened_perpendicular_to_travel() {
+        let marks = parse_gate(&[
+            "Split +1.0 +2.0 +3.0 +4.0 \u{ac} S1",
+            "Start +4864.368500 +1751.261250 +4864.367640 +1751.262290 \u{ac} Start / Finish",
+        ])
+        .unwrap();
+        assert_eq!(marks[0], (4864.3685, 1751.26125));
+        let gate = gate_metres(marks, marks[0]).unwrap();
+        // 50 m wide, centred on the first mark, perpendicular to the
+        // direction from the first mark to the second.
+        let width = ((gate[1].0 - gate[0].0).powi(2) + (gate[1].1 - gate[0].1).powi(2)).sqrt();
+        assert!((width - 2.0 * GATE_HALF_WIDTH_M).abs() < 1e-9);
+        let centre = ((gate[0].0 + gate[1].0) / 2.0, (gate[0].1 + gate[1].1) / 2.0);
+        assert!(centre.0.abs() < 1e-9 && centre.1.abs() < 1e-9);
+        let travel = local_metres(marks[1], marks[0]);
+        let along = (gate[1].0 - gate[0].0, gate[1].1 - gate[0].1);
+        assert!((travel.0 * along.0 + travel.1 * along.1).abs() < 1e-9);
+        // Identical marks give no direction and therefore no gate.
+        assert!(parse_gate(&["Start +1.0 +2.0 +1.0 +2.0 \u{ac} x"]).is_none());
+    }
+
     #[test]
     fn custom_channels_read_their_declared_units_in_order() {
         // The trailing non-builtin columns declare their units in `[channel
@@ -689,6 +1168,50 @@ mod tests {
         assert_eq!(file.channels[12].unit_source, UnitSource::Declared);
         assert_eq!(file.channels[13].unit, "custom-unit-b");
         assert_eq!(file.channels[13].unit_source, UnitSource::Declared);
+        assert!(file.diagnostics().is_empty(), "{:?}", file.diagnostics());
+    }
+
+    #[test]
+    fn surplus_leading_channel_unit_anchors_the_list_at_its_end() {
+        // VBVDHD2 loggers write one more `[channel units]` entry than there
+        // are custom columns: a leading "s" for `avisynctime`. Front-aligning
+        // shifted every custom unit by one (Vehicle_Speed became "%"). The
+        // last custom column must take the last unit, and the surplus entry
+        // lands on the otherwise-unitless trailing builtin.
+        let builtin = BUILTIN_SHORT.join(" ");
+        let builtin_header = BUILTIN_NAMES.join("\n");
+        let fixture = fixture(&format!(
+            "[header]\n{builtin_header}\nEngine_Speed\nBrake_Pressure_Front\n\
+             Throttle_Pedal\nVehicle_Speed\nGear\n\
+             [channel units]\ns\nRPM\nbar\n%\nkmh\n(null)\n\
+             [column names]\n{builtin} Engine_Speed Brake_Pressure_Front \
+             Throttle_Pedal Vehicle_Speed Gear\n\
+             [data]\n\
+             120000.0 1 2 3 4 5 6 7 8 9 10 11 6000 40 80 250 5\n\
+             120001.0 1 2 3 4 5 6 7 8 9 10 11 6000 40 80 250 5\n"
+        ));
+        let file = RacelogicFile::open(fixture.path()).unwrap();
+        assert_eq!(file.channels.len(), 17);
+        let unit_of = |name: &str| {
+            file.channels
+                .iter()
+                .find(|channel| channel.name == name)
+                .map(|channel| (channel.unit.as_str(), channel.unit_source))
+                .unwrap()
+        };
+        assert_eq!(unit_of("avisynctime"), ("s", UnitSource::Declared));
+        assert_eq!(unit_of("Engine_Speed"), ("RPM", UnitSource::Declared));
+        assert_eq!(
+            unit_of("Brake_Pressure_Front"),
+            ("bar", UnitSource::Declared)
+        );
+        assert_eq!(unit_of("Throttle_Pedal"), ("%", UnitSource::Declared));
+        assert_eq!(unit_of("Vehicle_Speed"), ("kmh", UnitSource::Declared));
+        assert_eq!(unit_of("Gear"), ("", UnitSource::Unknown));
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "vbo.channel_units_count_mismatch"));
     }
 
     #[test]

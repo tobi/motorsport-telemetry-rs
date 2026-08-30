@@ -26,8 +26,8 @@
 //! flag data a working sensor could legitimately produce.
 
 use crate::diag::{Diagnostic, Diagnostics, Severity};
-use crate::units::{lookup, Dimension};
-use crate::TelemetrySource;
+use crate::units::{convert, lookup, Dimension};
+use crate::{names, TelemetrySource};
 
 /// Inclusive range a working sensor could plausibly report, in the dimension's
 /// SI base unit.
@@ -102,6 +102,10 @@ pub struct ValidateOptions {
     /// into several decoded channels; their decoded footprint can legitimately
     /// exceed the source byte length.
     pub file_len: Option<u64>,
+    /// Whether to compare the recovered laps against the car's motion
+    /// against motion estimates. Costs at most 4096 speed lookups per
+    /// checked interval plus lap recovery; on by default.
+    pub check_laps: bool,
 }
 
 impl Default for ValidateOptions {
@@ -109,6 +113,7 @@ impl Default for ValidateOptions {
         Self {
             samples_per_channel: SAMPLES_PER_CHANNEL,
             file_len: None,
+            check_laps: true,
         }
     }
 }
@@ -150,7 +155,105 @@ pub fn validate_source_with(source: &dyn TelemetrySource, options: ValidateOptio
     // Put the summary before the channel details. On a completely misdecoded
     // 1400-channel log this keeps the decisive finding inside Diagnostics::CAP.
     diagnostics.extend(absurd_diagnostics);
+    if options.check_laps {
+        check_laps(source, &mut diagnostics);
+    }
     diagnostics
+}
+
+/// Speed channels the lap check may use, by [`names::eq`] spelling, in
+/// priority order. Only a channel with a unit convertible to m/s qualifies.
+const LAP_CHECK_SPEED_NAMES: &[&str] = &[
+    "groundspeed",
+    "speedref",
+    "corrspeed",
+    "vehiclespeed",
+    "vehrefspeed",
+    "speedwspdapp",
+    "speed",
+    "gpsspeed",
+    "velocitykmh",
+];
+
+/// A file with this much running and no laps merits a missing-lap warning.
+const MOVING_WITHOUT_LAPS_NS: u64 = 300_000_000_000;
+/// Review threshold, not a universal maximum: slow laps, long circuits and
+/// non-circuit recordings can legitimately exceed it.
+const LONG_LAP_NS: u64 = 720_000_000_000;
+/// Fraction of a long lap the car must be moving for it to count as
+/// "running": a red flag or a garage stint is a long lap but not a missing
+/// beacon.
+const LONG_LAP_MOVING_FRACTION: f64 = 0.6;
+
+/// Flags lap structures that contradict the car's motion.
+///
+/// The lap recovery in [`crate::laps`] is faithful to the counters and
+/// timers it finds; when those never advance (no beacon configured at a
+/// test, a receiver that missed every crossing) it reports one enormous lap
+/// or none at all. Neither is a decode error, but both mean the lap data is
+/// unusable, and a reader cannot know that — it takes a speed channel to see
+/// the car was lapping the whole time.
+fn check_laps(source: &dyn TelemetrySource, diagnostics: &mut Diagnostics) {
+    let channels = source.channels();
+    let Some(speed) = LAP_CHECK_SPEED_NAMES.iter().find_map(|wanted| {
+        channels.iter().position(|channel| {
+            channel.sample_count > 0
+                && names::eq(&channel.name, wanted)
+                && convert(1.0, &channel.unit, "m/s").is_ok()
+        })
+    }) else {
+        return;
+    };
+    let duration_ns = channels
+        .iter()
+        .map(|channel| channel.duration_ns)
+        .max()
+        .unwrap_or(0);
+    if duration_ns == 0 {
+        return;
+    }
+    let moving_between = |start_ns: u64, end_ns: u64| {
+        let motion = crate::motion::summarize_motion(source, speed, start_ns, end_ns);
+        (motion.moving_ns, motion.top_speed_mps.unwrap_or(0.0))
+    };
+    let laps = crate::read_source_metadata(source).laps;
+    if laps.is_empty() {
+        let (moving_ns, top_mps) = moving_between(0, duration_ns);
+        if moving_ns >= MOVING_WITHOUT_LAPS_NS {
+            diagnostics.warning(
+                "laps.none_while_moving",
+                format!(
+                    "no laps were recovered, yet speed samples indicate about {:.0} s \
+                     moving out of {:.0} s (up to {:.0} km/h); check for missing lap markers",
+                    moving_ns as f64 / 1e9,
+                    duration_ns as f64 / 1e9,
+                    top_mps * 3.6
+                ),
+            );
+        }
+        return;
+    }
+    for lap in &laps {
+        if lap.duration_ns < LONG_LAP_NS {
+            continue;
+        }
+        let (moving_ns, top_mps) = moving_between(lap.start_ns, lap.end_ns);
+        let fraction = moving_ns as f64 / lap.duration_ns as f64;
+        if fraction >= LONG_LAP_MOVING_FRACTION {
+            diagnostics.warning(
+                "laps.long_lap_while_moving",
+                format!(
+                    "lap {} spans {}:{:02} with an estimated {:.0}% moving time (up to \
+                     {:.0} km/h); review for missed crossings or a genuinely long lap",
+                    lap.number,
+                    lap.duration_ns / 60_000_000_000,
+                    lap.duration_ns % 60_000_000_000 / 1_000_000_000,
+                    fraction * 100.0,
+                    top_mps * 3.6
+                ),
+            );
+        }
+    }
 }
 
 /// Flags a decoded footprint larger than the file that supposedly holds it.
@@ -239,7 +342,8 @@ fn check_values(
     if channel.sample_count == 0 || budget == 0 {
         return;
     }
-    let band = lookup(&channel.unit).and_then(|def| plausible_band(def.dimension));
+    let band = lookup(&channel.unit)
+        .and_then(|def| plausible_band(def.dimension).map(|range| (def, range)));
     let mut nonfinite = 0u64;
     let mut absurd = 0u64;
     let mut out_of_band = 0u64;
@@ -266,8 +370,11 @@ fn check_values(
                 if value.abs() > ABSURD_MAGNITUDE {
                     absurd += 1;
                     first_absurd_ns.get_or_insert(time_ns);
-                } else if let Some((low, high)) = band {
-                    if value < low || value > high {
+                } else if let Some((def, (low, high))) = band {
+                    // Bands are SI/base-unit bounds. In particular, a
+                    // negative Celsius reading is not negative kelvin.
+                    let base = def.to_base(value);
+                    if !base.is_finite() || base < low || base > high {
                         out_of_band += 1;
                         first_out_of_band_ns.get_or_insert(time_ns);
                     }
@@ -385,6 +492,94 @@ mod tests {
                 duration_ns: values.len() as u64 * 20_000_000,
             }],
             values: vec![values],
+        }
+    }
+
+    /// A 1 Hz speed trace plus a 1 Hz lap counter of the same length.
+    fn lapping(speed_mps: Vec<f64>, counter: Vec<f64>) -> Fake {
+        let count = speed_mps.len() as u64;
+        let channel = |id, name: &str, unit: &str| Channel {
+            id,
+            name: name.into(),
+            unit: unit.into(),
+            unit_source: UnitSource::Declared,
+            sample_type: SampleType::F32,
+            chunks: vec![Chunk {
+                sample_period_ns: 1_000_000_000,
+                sample_count: count,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: 0,
+            }],
+            sample_count: count,
+            duration_ns: count * 1_000_000_000,
+        };
+        Fake {
+            channels: vec![channel(1, "Speed", "m/s"), channel(2, "Lap Number", "")],
+            values: vec![speed_mps, counter],
+        }
+    }
+
+    #[test]
+    fn running_for_twenty_minutes_with_a_frozen_lap_counter_is_flagged() {
+        // 1300 s at 60 m/s, counter stuck at 1: one 21-minute "lap".
+        let diagnostics = validate_source(&lapping(vec![60.0; 1300], vec![1.0; 1300]));
+        let found = diagnostics
+            .find("laps.long_lap_while_moving")
+            .expect("long lap");
+        assert!(found.message.contains("21:40"), "{}", found.message);
+        assert!(!implies_decode_fault(&diagnostics));
+
+        // Same counter, but the car sat in the garage: a long lap, not a
+        // missing beacon.
+        let mut parked = vec![0.0; 1300];
+        parked[..300].fill(60.0);
+        let diagnostics = validate_source(&lapping(parked, vec![1.0; 1300]));
+        assert!(diagnostics.find("laps.long_lap_while_moving").is_none());
+
+        // A counter that advances normally produces no finding.
+        let counter: Vec<f64> = (0..1300).map(|t| (t / 100) as f64).collect();
+        let diagnostics = validate_source(&lapping(vec![60.0; 1300], counter));
+        assert!(diagnostics.find("laps.long_lap_while_moving").is_none());
+        assert!(diagnostics.find("laps.none_while_moving").is_none());
+    }
+
+    #[test]
+    fn running_with_no_lap_information_at_all_is_flagged() {
+        let mut fake = lapping(vec![60.0; 400], vec![0.0; 400]);
+        fake.channels.truncate(1);
+        fake.values.truncate(1);
+        let diagnostics = validate_source(&fake);
+        assert!(
+            diagnostics.find("laps.none_while_moving").is_some(),
+            "{diagnostics}"
+        );
+        // Short runs (a system check in the garage) are not worth a warning.
+        let mut fake = lapping(vec![60.0; 200], vec![0.0; 200]);
+        fake.channels.truncate(1);
+        fake.values.truncate(1);
+        assert!(validate_source(&fake)
+            .find("laps.none_while_moving")
+            .is_none());
+    }
+
+    #[test]
+    fn physical_bands_are_checked_in_base_units_not_display_units() {
+        // The real VBOX ambient sensor reports -40 °C (233.15 K), not
+        // negative absolute temperature. Scale and offset both matter.
+        for (unit, value) in [("°C", -40.0), ("°F", -40.0), ("km/h", 1500.0)] {
+            let diagnostics = validate_source(&source(unit, SampleType::F64, vec![value]));
+            assert!(
+                diagnostics.find("value.out_of_range").is_none(),
+                "{unit}: {diagnostics}"
+            );
+        }
+        for (unit, value) in [("°C", -300.0), ("km/h", 3931.0)] {
+            let diagnostics = validate_source(&source(unit, SampleType::F64, vec![value]));
+            assert!(
+                diagnostics.find("value.out_of_range").is_some(),
+                "{unit}: {diagnostics}"
+            );
         }
     }
 

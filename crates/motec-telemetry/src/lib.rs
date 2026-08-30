@@ -251,6 +251,7 @@ impl MotecFile {
         let mut channels = Vec::new();
         let mut encodings = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut units_from_short_name: Vec<String> = Vec::new();
         let mut address = u32le(&data, 0x08).unwrap_or(0) as usize;
         while address > 0
             && address + CHANNEL_META_SIZE <= data.len()
@@ -278,7 +279,27 @@ impl MotecFile {
             // Per the LD layout the 124-byte channel block holds name at 0x20
             // (32 bytes), short name at 0x40 (8 bytes) and unit at 0x48 (12
             // bytes).
-            let unit = text(&data, address + 0x48, 12);
+            let mut unit = text(&data, address + 0x48, 12);
+            // Some third-party LD writers (e.g. TDS Racing exports) leave 0x48
+            // blank and put the unit in the 8-byte short-name slot at 0x40.
+            // Accept that only when the slot holds a recognised unit token that
+            // is not simply the start of the channel name, so a genuine MoTeC
+            // abbreviation ("Speed_R" for Speed_Ref, "gear" for gear) is never
+            // mistaken for one.
+            if unit.is_empty() {
+                let short = text(&data, address + 0x40, 8);
+                let is_abbreviation = !short.is_empty()
+                    && name
+                        .to_ascii_lowercase()
+                        .starts_with(&short.to_ascii_lowercase());
+                if !short.is_empty()
+                    && !is_abbreviation
+                    && motorsport_telemetry_core::units::lookup(&short).is_some()
+                {
+                    units_from_short_name.push(name.clone());
+                    unit = short;
+                }
+            }
             // LD channel blocks carry a real unit string; absent means unknown.
             let unit_source = if unit.is_empty() {
                 UnitSource::Unknown
@@ -431,6 +452,18 @@ impl MotecFile {
             (String::new(), String::new(), String::new())
         };
         let date = text(&data, 0x5e, 16);
+        if !units_from_short_name.is_empty() {
+            diagnostics.push(Diagnostic::info(
+                "ld.unit_in_short_name_field",
+                format!(
+                    "{} channel(s) declared no unit at 0x48 but carried a recognised unit \
+                     token in the short-name slot at 0x40; that token was used as the unit \
+                     (first: {})",
+                    units_from_short_name.len(),
+                    units_from_short_name[0]
+                ),
+            ));
+        }
         let time = text(&data, 0x7e, 16);
         if (!date.is_empty() || !time.is_empty()) && parse_datetime_ns(&date, &time).is_none() {
             diagnostics.push(Diagnostic::info(
@@ -633,6 +666,43 @@ mod tests {
         assert!((file.decode(1, 0, 0) - 42.3).abs() < 1e-10);
         assert!((file.decode(1, 0, 1) + 1.0).abs() < 1e-10);
         assert_eq!(file.sample_at(0, 250_000_000, true), Some(1.5));
+    }
+
+    #[test]
+    fn unit_in_short_name_slot_is_adopted_only_when_recognised() {
+        // TDS Racing style export: 0x48 blank, unit token sitting at 0x40.
+        let mut data = fixture_bytes();
+        let speed = 0x200;
+        data[speed + 0x48..speed + 0x54].fill(0);
+        data[speed + 0x40..speed + 0x43].copy_from_slice(b"m/s");
+        // A real abbreviation in the short-name slot must stay unitless.
+        let brake = 0x27c;
+        data[brake + 0x48..brake + 0x54].fill(0);
+        data[brake + 0x40..brake + 0x47].copy_from_slice(b"P_F_BRK");
+        let file = MotecFile::from_bytes("fixture.ld", data).unwrap();
+        assert_eq!(file.channels[0].unit, "m/s");
+        assert_eq!(file.channels[0].unit_source, UnitSource::Declared);
+        assert_eq!(file.channels[1].unit, "");
+        assert_eq!(file.channels[1].unit_source, UnitSource::Unknown);
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "ld.unit_in_short_name_field"));
+
+        // Regular files (unit at 0x48, abbreviation at 0x40) stay quiet, and
+        // an abbreviation that happens to be a unit word ("gear") is not a unit.
+        let mut regular = fixture_bytes();
+        regular[speed + 0x40..speed + 0x45].copy_from_slice(b"Speed");
+        regular[brake + 0x20..brake + 0x54].fill(0);
+        regular[brake + 0x20..brake + 0x24].copy_from_slice(b"gear");
+        regular[brake + 0x40..brake + 0x44].copy_from_slice(b"gear");
+        let file = MotecFile::from_bytes("fixture.ld", regular).unwrap();
+        assert_eq!(file.channels[0].unit, "m/s");
+        assert_eq!(file.channels[1].unit, "");
+        assert!(!file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "ld.unit_in_short_name_field"));
     }
 
     #[test]

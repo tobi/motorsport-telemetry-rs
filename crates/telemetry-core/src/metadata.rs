@@ -491,12 +491,16 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
     let (driver_ids, driver_stints) = driver_stints(source, duration_ns);
 
     let authoritative = laps::authoritative_laps(source);
-    let (counter_laps, counter_crossings, timer_laps) = match &authoritative {
-        Some(_) => (Vec::new(), 0, Vec::new()),
+    let (counter_laps, counter_crossings, timer_laps, snap_window_ns) = match &authoritative {
+        Some(_) => (Vec::new(), 0, Vec::new(), 0),
         None => {
             let (index, counter_laps, crossings) = laps::counter_laps(source, duration_ns);
             let timer_laps = laps::timer_reset_laps(source, duration_ns, index);
-            (counter_laps, crossings, timer_laps)
+            let snap_window_ns = laps::snap_window_ns(
+                laps::channel_period_ns(source, index),
+                laps::channel_period_ns(source, laps::timer_channel(source)),
+            );
+            (counter_laps, crossings, timer_laps, snap_window_ns)
         }
     };
     let mut laps = laps::pick_laps(
@@ -504,6 +508,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         counter_laps,
         counter_crossings,
         timer_laps,
+        snap_window_ns,
     );
     let mut fastest_lap = laps::fastest_lap(source, &laps, authoritative.as_ref());
 
@@ -961,6 +966,138 @@ mod tests {
             values: vec![values],
             absolute_start_ns: 1_000_000_000_000,
         }
+    }
+
+    #[test]
+    fn declared_timer_units_override_magnitude() {
+        // Cosworth's long installation runs use seconds even above 1000.
+        // A corrupt/high first value must not turn all subsequent seconds
+        // into milliseconds and hide ordinary 100-second laps.
+        for (unit, multiplier) in [("s", 1.0), ("ms", 1000.0)] {
+            let mut source = counter_source(
+                "Lap Time",
+                [1158.0, 0.5, 90.5, 100.5, 0.5, 10.5]
+                    .map(|v| v * multiplier)
+                    .to_vec(),
+            );
+            source.channels[0].unit = unit.into();
+            let laps = read_source_metadata(&source).laps;
+            assert_eq!(laps.len(), 3, "{unit}: {laps:?}");
+            assert_eq!(laps[0].end_ns, 9_500_000_000);
+            assert_eq!(laps[1].end_ns, 39_500_000_000);
+        }
+    }
+
+    #[test]
+    fn timer_boundary_before_the_recording_is_not_a_zero_length_lap() {
+        let mut source = counter_source("Lap Time", vec![20.0, 10.0, 15.0, 0.5, 10.5]);
+        source.channels[0].unit = "s".into();
+        let laps = read_source_metadata(&source).laps;
+        assert_eq!(laps.len(), 2, "{laps:?}");
+        assert!(laps.iter().all(|lap| lap.duration_ns > 0));
+        assert_eq!(laps[0].end_ns, 29_500_000_000);
+    }
+
+    #[test]
+    fn timer_reset_after_a_lagging_counter_advances_the_lap_number() {
+        // Real Cosworth race fragment: `beaconEventCount` sits at 22 for the
+        // whole 65 s file (active lap 23); `Lap Time` resets 0.6 s before
+        // the end and the 10 Hz counter never caught up. The tail fragment
+        // is lap 24, not a second lap 23.
+        let mut source = counter_source("beaconEventCount", vec![22.0; 7]);
+        let count = source.channels[0].sample_count;
+        source.channels.push(Channel {
+            id: 1,
+            name: "Lap Time".into(),
+            unit: "s".into(),
+            unit_source: UnitSource::Declared,
+            sample_type: SampleType::F64,
+            chunks: vec![Chunk {
+                sample_period_ns: 10_000_000_000,
+                sample_count: count,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: 0,
+            }],
+            sample_count: count,
+            duration_ns: count * 10_000_000_000,
+        });
+        source
+            .values
+            .push(vec![30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 0.5]);
+        let metadata = read_source_metadata(&source);
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(|lap| (lap.number, lap.complete))
+                .collect::<Vec<_>>(),
+            [(23, false), (24, false)]
+        );
+        assert!(metadata.laps.windows(2).all(|w| w[1].number > w[0].number));
+    }
+
+    #[test]
+    fn corrupt_counter_spike_does_not_swallow_later_laps() {
+        // Radio-received Cosworth log: one bit-flipped `Lap Number` sample
+        // reads 1_009_840_763 mid-file. It is not a crossing, and the laps
+        // counted after it must still be found.
+        let source = counter_source(
+            "Lap Number",
+            vec![1.0, 1.0, 2.0, 1_009_840_763.0, 2.0, 3.0, 3.0, 4.0],
+        );
+        let metadata = read_source_metadata(&source);
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(|lap| (lap.number, lap.complete))
+                .collect::<Vec<_>>(),
+            [(1, false), (2, true), (3, true), (4, false)]
+        );
+        // A genuine multi-lap jump that the next sample confirms (counter
+        // resumed after a logging gap) is still a crossing.
+        let source = counter_source("Lap Number", vec![1.0, 1.0, 4.0, 4.0, 5.0, 5.0]);
+        let metadata = read_source_metadata(&source);
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(|lap| lap.number)
+                .collect::<Vec<_>>(),
+            [1, 4, 5]
+        );
+    }
+
+    #[test]
+    fn timer_resync_to_a_large_value_is_not_a_lap_boundary() {
+        // AiM `Current_Lap_Time` (ms, 10 s period here): a power-on count is
+        // resynced to 126.65 s at sample 2, then genuinely resets (60 ms) at
+        // sample 5. Only the reset is a boundary; the resync would otherwise
+        // put one at `t = 0` (a zero-length lap) and another mid-lap.
+        let mut source = counter_source("Lap Number", vec![0.0; 8]);
+        source.channels[0].name = "Current_Lap_Time".into();
+        source.values[0] = vec![
+            31_458_000.0,
+            31_468_000.0,
+            126_650.0,
+            136_650.0,
+            146_650.0,
+            60.0,
+            10_060.0,
+            20_060.0,
+        ];
+        let metadata = read_source_metadata(&source);
+        let bounds: Vec<(u64, u64)> = metadata
+            .laps
+            .iter()
+            .map(|lap| (lap.start_ns, lap.end_ns))
+            .collect();
+        assert_eq!(
+            bounds,
+            [(0, 49_940_000_000), (49_940_000_000, 80_000_000_000)]
+        );
+        assert!(metadata.laps.iter().all(|lap| lap.duration_ns > 0));
     }
 
     #[test]

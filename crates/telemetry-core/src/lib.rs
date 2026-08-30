@@ -10,6 +10,7 @@ pub mod display;
 mod laps;
 /// Format-neutral file and session metadata derivation.
 pub mod metadata;
+pub mod motion;
 /// Punctuation- and case-insensitive channel-name matching.
 pub mod names;
 /// Provenance records for named, lossless processing passes.
@@ -626,14 +627,17 @@ pub trait TelemetrySource: Send + Sync {
                 if time_ns < first_start {
                     return None;
                 }
-                let chunk_index = channel.chunks.partition_point(|chunk| {
-                    chunk
-                        .time_base_ns
-                        .saturating_add(chunk.sample_count.saturating_mul(chunk.sample_period_ns))
-                        <= time_ns
-                });
+                // Pick the latest run that has actually started. Looking up
+                // by run ends instead returns a future run inside a gap.
+                let chunk_index = channel
+                    .chunks
+                    .partition_point(|chunk| chunk.time_base_ns <= time_ns)
+                    .checked_sub(1)?;
                 let chunk = channel.chunks.get(chunk_index)?;
-                if chunk.sample_count == 0 || chunk.sample_period_ns == 0 {
+                let end_ns = chunk
+                    .time_base_ns
+                    .saturating_add(chunk.sample_count.saturating_mul(chunk.sample_period_ns));
+                if time_ns >= end_ns || chunk.sample_count == 0 || chunk.sample_period_ns == 0 {
                     return None;
                 }
                 let relative = time_ns.saturating_sub(chunk.time_base_ns);
@@ -652,6 +656,11 @@ pub trait TelemetrySource: Send + Sync {
                         sample_time.saturating_add(chunk.sample_period_ns),
                     )
                 } else if let Some(next_chunk) = channel.chunks.get(chunk_index + 1) {
+                    // Interpolate across a contiguous chunk split, not across
+                    // an acquisition gap or into an overlapping run.
+                    if next_chunk.time_base_ns != end_ns || next_chunk.sample_count == 0 {
+                        return Some(a);
+                    }
                     (
                         self.decode(channel_index, chunk_index + 1, 0),
                         next_chunk.time_base_ns,

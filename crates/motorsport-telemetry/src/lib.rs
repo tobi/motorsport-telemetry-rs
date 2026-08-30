@@ -907,46 +907,94 @@ impl TelemetrySession {
     }
 }
 
+/// [`names::find`] restricted to channels that actually carry samples.
+///
+/// Cosworth PDS exports list every logger channel, including ones that were
+/// configured but never logged (`vehRefSpeed` with zero samples next to a
+/// populated `Speed_Wspd_App`). A role bound to an empty channel is useless,
+/// so priority order only applies among populated channels.
+fn find_sampled(channels: &[Channel], wanted: &[&str]) -> Option<usize> {
+    for name in wanted {
+        if let Some(index) = channels
+            .iter()
+            .position(|channel| channel.sample_count > 0 && names::eq(&channel.name, name))
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// [`find_sampled`] that prefers a candidate with a convertible speed unit.
+///
+/// A speed without a unit cannot be normalised, so a unitless CAN echo
+/// (AiM `Speed_Wspd_App` with no unit string) must not outrank a lower-priority
+/// channel that does say what it measures (`GPS Speed` in m/s). Priority order
+/// still decides among the unit-bearing candidates; only when none has a unit
+/// does the plain priority winner stand.
+fn find_sampled_with_unit(channels: &[Channel], wanted: &[&str]) -> Option<usize> {
+    for name in wanted {
+        if let Some(index) = channels.iter().position(|channel| {
+            channel.sample_count > 0
+                && motorsport_telemetry_core::can_convert(&channel.unit, "m/s")
+                && names::eq(&channel.name, name)
+        }) {
+            return Some(index);
+        }
+    }
+    find_sampled(channels, wanted)
+}
+
+const SPEED_NAMES: &[&str] = &[
+    "groundspeed",
+    "speedref",
+    "corrspeed",
+    "vehiclespeed",
+    "speedwspdapp",
+    "vehrefspeed",
+    "vcar",
+    "gpsspeed",
+    "speed",
+    "velocitykmh",
+];
+
 fn infer_roles(channels: &[Channel]) -> SignalRoles {
     SignalRoles {
-        speed: names::find(
+        speed: find_sampled_with_unit(channels, SPEED_NAMES),
+        // Driver demand first (pedal position), throttle-plate position last:
+        // Cosworth names the pedal `PPS` and the plate `TPS`.
+        throttle: find_sampled(
             channels,
             &[
-                "groundspeed",
-                "speedref",
-                "corrspeed",
-                "vehiclespeed",
-                "gpsspeed",
-                "speed",
-                "velocitykmh",
-            ],
-        ),
-        throttle: names::find(
-            channels,
-            &[
-                "throttlepos",
                 "driverthrottlepos",
                 "throttlepedal",
                 "pedalpos",
+                "pps",
+                "throttlepos",
                 "throttle",
+                "tps",
             ],
         ),
-        brake: names::find(
+        brake: find_sampled(
             channels,
             &[
                 "brakepedalpos",
                 "brakepedal",
+                "brakepos",
                 "driverbrakepressure",
                 "brakepressure",
+                "brakepressurefront",
                 "pbrakefront",
+                "pfbrake",
+                "pbrakef",
                 "brake",
             ],
         ),
-        clutch: names::find(
+        clutch: find_sampled(
             channels,
             &["clutchpos", "clutchpedal", "clutchpedalpos", "clutch"],
         ),
-        steering: names::find(
+        steering: find_sampled(
             channels,
             &[
                 "steeringangle",
@@ -954,12 +1002,25 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
                 "steeringpos",
                 "handwheelangle",
                 "swangle",
+                "steeringwheelangle",
                 "steering",
+                "steer",
+                "steer001",
             ],
         ),
-        gear: names::find(channels, &["gearpos", "selectedgear", "ngear", "gear"]),
-        rpm: names::find(channels, &["enginerpm", "engspeed", "rpm", "nmot"]),
-        lap_distance: names::find(
+        gear: find_sampled(channels, &["gearpos", "selectedgear", "ngear", "gear"]),
+        rpm: find_sampled(
+            channels,
+            &[
+                "enginerpm",
+                "engspeed",
+                "enginespeed",
+                "rpm",
+                "nmot",
+                "nengine",
+            ],
+        ),
+        lap_distance: find_sampled(
             channels,
             &[
                 "lapdistancecorrected",
@@ -973,7 +1034,7 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
                 "distance",
             ],
         ),
-        lap_number: names::find(
+        lap_number: find_sampled(
             channels,
             &[
                 "lapnumber",
@@ -984,7 +1045,7 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
                 "lap",
             ],
         ),
-        lap_time: names::find(
+        lap_time: find_sampled(
             channels,
             &[
                 "currentlaptime",
@@ -995,7 +1056,7 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
         ),
         // Pass-derived clean coordinates (gps.clean) are NaN-masked copies
         // of the raw fixes and always preferable when present.
-        latitude: names::find(
+        latitude: find_sampled(
             channels,
             &[
                 "gpslatitudeclean",
@@ -1005,7 +1066,7 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
                 "lat",
             ],
         ),
-        longitude: names::find(
+        longitude: find_sampled(
             channels,
             &[
                 "gpslongitudeclean",
@@ -1162,6 +1223,113 @@ fn project_segment(latitude: f64, longitude: f64, a: [f64; 2], b: [f64; 2]) -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motorsport_telemetry_core::{Chunk, SampleType, UnitSource};
+
+    fn channel(name: &str, unit: &str, sample_count: u64) -> Channel {
+        Channel {
+            id: 0,
+            name: name.into(),
+            unit: unit.into(),
+            unit_source: UnitSource::Declared,
+            sample_type: SampleType::F32,
+            chunks: (sample_count > 0)
+                .then_some(Chunk {
+                    sample_period_ns: 20_000_000,
+                    sample_count,
+                    data_ptr: 0,
+                    sample_base: 0,
+                    time_base_ns: 0,
+                })
+                .into_iter()
+                .collect(),
+            sample_count,
+            duration_ns: sample_count * 20_000_000,
+        }
+    }
+
+    #[test]
+    fn roles_recognise_cosworth_oreca_names_and_skip_empty_channels() {
+        // Channel set of a real ORECA 07 Cosworth PDS export: the preferred
+        // `vehRefSpeed` exists but was never logged, `PPS` is the pedal and
+        // `TPS` the throttle plate, `P_F_BRAKE` is front line pressure.
+        let channels = [
+            channel("vehRefSpeed", "m/s", 0),
+            channel("Speed_Wspd_App", "m/s", 100),
+            channel("fl_speed", "m/s", 100),
+            channel("TPS", "rad", 100),
+            channel("PPS", "rad", 100),
+            channel("P_R_BRAKE", "Pa", 100),
+            channel("P_F_BRAKE", "Pa", 100),
+            channel("STEER", "rad", 100),
+            channel("RPM", "rad/s", 100),
+            channel("gear_pos", "", 100),
+            channel("Lap Number", "", 100),
+        ];
+        let roles = infer_roles(&channels);
+        let name = |index: Option<usize>| index.map(|index| channels[index].name.as_str());
+        assert_eq!(name(roles.speed), Some("Speed_Wspd_App"));
+        assert_eq!(name(roles.throttle), Some("PPS"));
+        assert_eq!(name(roles.brake), Some("P_F_BRAKE"));
+        assert_eq!(name(roles.steering), Some("STEER"));
+        assert_eq!(name(roles.rpm), Some("RPM"));
+        assert_eq!(name(roles.gear), Some("gear_pos"));
+        assert_eq!(name(roles.lap_number), Some("Lap Number"));
+    }
+
+    #[test]
+    fn speed_role_prefers_a_candidate_with_a_declared_unit() {
+        // AiM SmartyCam aimd: the CAN echo of wheel speed has no unit string,
+        // the GPS speed does. Only the latter can be normalised.
+        let channels = [
+            channel("Speed_Wspd_App", "", 100),
+            channel("GPS Speed", "m/s", 100),
+            channel("STEER_001", "", 100),
+        ];
+        let roles = infer_roles(&channels);
+        assert_eq!(roles.speed, Some(1));
+        assert_eq!(roles.steering, Some(2));
+        // With no unit anywhere, priority order still decides.
+        let channels = [
+            channel("GPS Speed", "", 100),
+            channel("Speed_Wspd_App", "", 100),
+        ];
+        assert_eq!(infer_roles(&channels).speed, Some(1));
+    }
+
+    #[test]
+    fn role_selection_uses_compatible_units_and_the_driver_pedal() {
+        let channels = [
+            channel("Vehicle Speed", "%", 100),
+            channel("GPS Speed", "m/s", 100),
+            channel("Throttle Pos", "ratio", 100),
+            channel("Driver Throttle Pos", "ratio", 100),
+            channel("P_F_BRAKE", "bar", 100),
+            channel("Brake Pos", "ratio", 100),
+        ];
+        let roles = infer_roles(&channels);
+        assert_eq!(roles.speed, Some(1), "wrong dimension is not usable speed");
+        assert_eq!(roles.throttle, Some(3), "driver demand, not throttle plate");
+        assert_eq!(roles.brake, Some(5), "pedal fraction before line pressure");
+    }
+
+    #[test]
+    fn roles_recognise_vbox_can_channel_names() {
+        let channels = [
+            channel("velocity kmh", "km/h", 100),
+            channel("Engine_Speed", "RPM", 100),
+            channel("Brake_Pressure_Front", "bar", 100),
+            channel("Throttle_Pedal", "%", 100),
+            channel("Vehicle_Speed", "kmh", 100),
+            channel("Steering_Angle", "", 100),
+        ];
+        let roles = infer_roles(&channels);
+        let name = |index: Option<usize>| index.map(|index| channels[index].name.as_str());
+        assert_eq!(name(roles.speed), Some("Vehicle_Speed"));
+        assert_eq!(name(roles.rpm), Some("Engine_Speed"));
+        assert_eq!(name(roles.brake), Some("Brake_Pressure_Front"));
+        assert_eq!(name(roles.throttle), Some("Throttle_Pedal"));
+        assert_eq!(name(roles.steering), Some("Steering_Angle"));
+    }
 
     #[test]
     fn decodes_vbox_packed_coordinates_before_other_conventions() {

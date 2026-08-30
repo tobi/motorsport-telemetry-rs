@@ -147,7 +147,8 @@ Lap progress is the trickiest role. The normalizer tries, in order:
 Vendor files almost never agree on lap identity. Readers feed the same
 heuristics in `read_source_metadata`:
 
-1. Authoritative source laps (MoTeC LDX, a `.telemetry` catalog).
+1. Source-provided laps (MoTeC LDX, a `.telemetry` catalog, or VBO
+   GPS-gate inference when usable; see below).
 2. An incrementing counter. `Lap Number` is preferred when it actually counts
    (high-water ≥ 2). A 0/1 flag loses to `beaconEventCount` / `lap_beacon`
    counts. Shutdown resets are ignored.
@@ -159,6 +160,21 @@ heuristics in `read_source_metadata`:
    crossing is recovered to the timer's resolution and lap durations agree
    with the logger's own reported lap times.
 4. Otherwise no laps. We do not invent in/out from “first/last incomplete”.
+
+VBO `[laptiming]` marks can recover crossings despite a CAN lap counter
+resetting at driver changes. Those times are **inferred**, using a 50 m gate
+and GPS-quality checks, not vendor-reported lap times. The reader emits
+`vbo.laps_from_gate`; unreliable GPS falls back to counter/timer recovery.
+See [the VBO reader](crates/racelogic-telemetry/README.md) for limits.
+
+Declared timer units take precedence over value magnitude: a 20-minute
+Cosworth timer in seconds must not be mistaken for milliseconds. Resyncs to
+large nonzero values are not crossings. Sampling inside a grid acquisition
+gap returns `None`, not the following chunk's value.
+
+Validation also flags missing laps during sustained motion and unusually
+long moving laps. These are review hints, not proof of a decoder defect or
+permission to fabricate missing boundaries.
 
 The fastest lap is always one of those laps (the shortest plausible complete
 one). It is never an interval rebuilt from a `Previous Lap Time` report, so a

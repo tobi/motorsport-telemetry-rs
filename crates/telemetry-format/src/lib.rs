@@ -414,7 +414,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("readonly.telemetry");
         write_from_source_version(&source, &dest, 1).unwrap();
-        let mut permissions = std::fs::metadata(&dest).unwrap().permissions();
+        let original_permissions = std::fs::metadata(&dest).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
         std::fs::set_permissions(&dest, permissions).unwrap();
 
@@ -423,15 +424,9 @@ mod tests {
         assert!(opened.needs_update());
         assert_eq!(read_format_version(&dest).unwrap(), 1);
 
-        let mut permissions = std::fs::metadata(&dest).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            permissions.set_mode(permissions.mode() | 0o200);
-        }
-        #[cfg(not(unix))]
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&dest, permissions).unwrap();
+        // Restore the exact original permissions on every platform instead
+        // of making the file broadly writable during temporary-file cleanup.
+        std::fs::set_permissions(&dest, original_permissions).unwrap();
     }
 
     #[test]

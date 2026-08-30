@@ -491,6 +491,9 @@ fn check_invariants(
         ValidateOptions {
             samples_per_channel: MAX_SAMPLES_PER_CHANNEL,
             file_len,
+            // Lap plausibility needs a speed trace; mutated fixtures are
+            // about layout survival, not lap structure.
+            check_laps: false,
         },
     );
     if let Some(len) = file_len.filter(|len| *len > 0) {

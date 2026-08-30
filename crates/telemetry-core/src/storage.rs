@@ -1,6 +1,7 @@
 //! Byte storage shared by memory-mapped and in-memory parsers.
 
 use std::fmt;
+use std::io::Read;
 use std::ops::Deref;
 use std::path::Path;
 
@@ -17,15 +18,31 @@ pub enum Storage {
 }
 
 impl Storage {
-    /// Memory-maps `path` read-only. Falls back to owned bytes only via
-    /// [`Storage::from_vec`]; this method always maps.
+    /// Memory-maps `path` read-only, reading it into owned bytes when the
+    /// filesystem refuses to map it.
+    ///
+    /// Some network filesystems (observed on an SMB/NAS mount, where `rg`
+    /// fails the same way) return `EINVAL` from `mmap` for ordinary regular
+    /// files. The bytes are still readable, so that is not a reason to fail
+    /// the open; an empty file cannot be mapped at all and is returned as an
+    /// empty buffer for the parser to reject with its own message.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let file = std::fs::File::open(path)?;
+        let mut file = std::fs::File::open(path)?;
+        if file.metadata()?.len() == 0 {
+            return Ok(Self::Owned(Vec::new()));
+        }
         // SAFETY: the file is mapped read-only; the caller must ensure no
         // external process truncates or mutates it while samples are decoded,
         // the same contract every mmap-based parser already holds.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(Self::Mapped(mmap))
+        match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(mmap) => Ok(Self::Mapped(mmap)),
+            Err(_) => {
+                // Read the already-open file, not a possibly replaced path.
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                Ok(Self::Owned(bytes))
+            }
+        }
     }
 
     /// Wraps an owned buffer.
@@ -74,5 +91,17 @@ mod tests {
         let storage = Storage::open(&path).unwrap();
         assert_eq!(&*storage, &[10, 20, 30, 40]);
         assert_eq!(format!("{storage:?}"), "Mapped(4)");
+    }
+
+    #[test]
+    fn open_returns_an_empty_buffer_for_an_empty_file() {
+        // `mmap` of a zero-length file fails with EINVAL; that must surface as
+        // an empty buffer, not an I/O error, so the parser can say "too small".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        std::fs::write(&path, []).unwrap();
+        let storage = Storage::open(&path).unwrap();
+        assert!(storage.is_empty());
+        assert_eq!(format!("{storage:?}"), "Owned(0)");
     }
 }

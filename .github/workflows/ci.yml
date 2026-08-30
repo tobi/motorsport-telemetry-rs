@@ -21,12 +21,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # Include example tests (the audit probe has NaN/unit regressions),
+      # then run doctests separately: --all-targets does not include them.
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
 
   package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo package -p motorsport-telemetry-core --allow-dirty
-      - run: cargo package -p motorsport-track-atlas --allow-dirty
+      # Core depends on the atlas, which need not be published yet. Modern
+      # Cargo stages selected workspace packages together for verification.
+      # Use stable explicitly; rust-toolchain.toml pins the library's MSRV.
+      - run: cargo +stable package -p motorsport-track-atlas -p motorsport-telemetry-core --allow-dirty

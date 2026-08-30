@@ -108,6 +108,28 @@ struct RawChunk {
     sample_period_ticks: u32,
     sample_count: u64,
     data_ptr: u64,
+    /// Absolute first-sample instant in [`TICK_NS`] ticks (descriptor
+    /// `+0x10`, 64-bit), zero when the descriptor does not carry one.
+    start_ticks: u64,
+    /// Absolute last-sample instant in ticks (descriptor `+0x28`, 64-bit).
+    end_ticks: u64,
+}
+
+/// Whether a descriptor's timestamps describe its own sample run: the end
+/// stamp must sit exactly `(count - 1) * period` after the start stamp.
+///
+/// Native logger files satisfy this for every chunk; Pi Toolbox exports
+/// and synthetic fixtures leave both stamps zero. A table where any stamped
+/// chunk fails the check is treated as unstamped so a misread field can
+/// never move samples in time.
+fn chunk_stamps_consistent(chunk: &RawChunk) -> bool {
+    chunk.start_ticks > 0
+        && chunk
+            .sample_count
+            .checked_sub(1)
+            .and_then(|n| n.checked_mul(u64::from(chunk.sample_period_ticks)))
+            .and_then(|span| chunk.start_ticks.checked_add(span))
+            == Some(chunk.end_ticks)
 }
 
 enum ChannelDispatch {
@@ -367,6 +389,46 @@ const LAYOUTS: &[LayoutSpec] = &[
         marker: false,
     },
 ];
+
+/// Explains why no layout matched, distinguishing the common real-world case
+/// — a directory whose definitions entry is populated but whose chunk entry
+/// is empty — from a file with no recognisable directory at all.
+///
+/// Loggers write the chunk index when a recording is finalised. A file cut
+/// short (power loss, telemetry receiver dump) keeps its channel definitions
+/// and megabytes of sample bytes but has nothing that says which bytes
+/// belong to which channel, so the samples are not recoverable without
+/// guessing. A file whose tail is all zero bytes was truncated in transit.
+fn describe_unindexed(data: &[u8]) -> String {
+    let trailing_zeros = data.iter().rev().take_while(|byte| **byte == 0).count();
+    if trailing_zeros >= 1 << 20 {
+        return format!(
+            "no valid directory/definitions/chunk layout found; the last {trailing_zeros} \
+             bytes are zero, so the file was truncated or only partially copied"
+        );
+    }
+    for spec in LAYOUTS {
+        let entries = read_entries_at(data, spec.dir_offset);
+        let defs = entries.iter().find(|entry| {
+            entry.class_b == 1
+                && entry.count > 0
+                && entry.offset > 0
+                && entry.offset < data.len() as u64
+        });
+        let empty_chunks = entries
+            .iter()
+            .any(|entry| entry.offset == 0 && entry.count == 0);
+        if let (Some(defs), true) = (defs, empty_chunks) {
+            return format!(
+                "{} channel definitions are present but the chunk directory is empty; the \
+                 recording was never indexed (not finalised by the logger), so its samples \
+                 cannot be attributed to channels",
+                defs.count
+            );
+        }
+    }
+    "no valid directory/definitions/chunk layout found".to_owned()
+}
 
 /// Tries [`LAYOUTS`] in order and returns the first matching [`Layout`] and
 /// the spec that validated it.
@@ -751,6 +813,8 @@ fn parse_chunks(data: &[u8], layout: Layout, is_export: bool) -> Vec<RawChunk> {
                     sample_period_ticks: period,
                     sample_count: count,
                     data_ptr: ptr,
+                    start_ticks: u64le(data, pos + 0x10).unwrap_or(0),
+                    end_ticks: u64le(data, pos + 0x28).unwrap_or(0),
                 });
             }
         }
@@ -776,6 +840,8 @@ fn parse_chunks(data: &[u8], layout: Layout, is_export: bool) -> Vec<RawChunk> {
                 sample_period_ticks: period,
                 sample_count: count,
                 data_ptr: ptr,
+                start_ticks: u64le(data, pos + 0x10).unwrap_or(0),
+                end_ticks: u64le(data, pos + 0x28).unwrap_or(0),
             });
         }
     }
@@ -806,10 +872,7 @@ impl CosworthFile {
             return Err(invalid(&display, "file is smaller than 256 bytes"));
         }
         let Some((layout, spec)) = discover_layout(&data) else {
-            return Err(invalid(
-                &display,
-                "no valid directory/definitions/chunk layout found",
-            ));
+            return Err(invalid(&display, describe_unindexed(&data)));
         };
         // The standard 0x80 layouts (marker-framed and markerless) are the
         // primary specs and stay silent. A non-standard directory offset is
@@ -849,7 +912,17 @@ impl CosworthFile {
             marked
         };
         if raw_defs.is_empty() {
-            return Err(invalid(&display, "no channel definitions found"));
+            let trailing_zeros = data.iter().rev().take_while(|byte| **byte == 0).count();
+            let message = if layout.defs_offset >= data.len() - trailing_zeros {
+                format!(
+                    "no channel definitions found: the directory points into the zero-filled \
+                     tail of the file (last {trailing_zeros} bytes), so the file was truncated \
+                     or only partially copied"
+                )
+            } else {
+                "no channel definitions found".to_owned()
+            };
+            return Err(invalid(&display, message));
         }
         let raw_chunks = parse_chunks(&data, layout, is_export);
         if raw_chunks.is_empty() {
@@ -878,13 +951,50 @@ impl CosworthFile {
             })
             .collect::<Vec<_>>();
         let by_id = ChannelDispatch::new(&channels);
-        // Deliberately preserve chunk-index table order. `order` and data_ptr
-        // are not temporal keys in interrupted native logs. Convert each raw
-        // descriptor directly into its final channel instead of building and
-        // then copying through a second set of per-channel vectors.
+        // Native logger descriptors stamp every chunk with its absolute first
+        // and last sample instant. Those stamps are the only truthful time
+        // axis: a channel's chunks are separated by acquisition gaps (radio
+        // telemetry dropouts, conditional logging) and different channels
+        // start at different instants. Concatenating chunks back to back
+        // compressed those gaps — a 526 s lap counter became 264 s and grew
+        // 6 s "laps" — and slid channels against each other by up to a
+        // second. Placement is used only when every chunk self-validates;
+        // otherwise (Toolbox exports, fixtures) table order is preserved,
+        // because `order` and data_ptr are not temporal keys either.
+        let stamped = !raw_chunks.is_empty() && raw_chunks.iter().all(chunk_stamps_consistent);
+        let stamped_count = raw_chunks.iter().filter(|c| c.start_ticks > 0).count();
+        if !stamped && stamped_count > 0 {
+            diagnostics.warning(
+                "pds.chunk_timestamps_inconsistent",
+                format!(
+                    "{} of {} chunk descriptors carry start/end stamps that disagree with \
+                     their sample count and period; chunks were placed back to back in \
+                     table order instead",
+                    raw_chunks
+                        .iter()
+                        .filter(|c| !chunk_stamps_consistent(c))
+                        .count(),
+                    raw_chunks.len()
+                ),
+            );
+        }
+        let origin_ticks = raw_chunks
+            .iter()
+            .map(|chunk| chunk.start_ticks)
+            .min()
+            .unwrap_or(0);
+        let mut raw_chunks = raw_chunks;
+        if stamped {
+            // Stable: equal stamps keep table order.
+            raw_chunks.sort_by_key(|chunk| (chunk.channel_id, chunk.start_ticks));
+        }
         let mut unknown_chunks = 0usize;
         let mut clamped_chunks = 0usize;
         let mut empty_chunks = 0usize;
+        let mut overlapping_chunks = 0usize;
+        let mut gap_total_ns = 0u64;
+        let mut gap_channels = 0usize;
+        let mut last_gap_channel = u32::MAX;
         for raw in raw_chunks {
             let Some(index) = by_id.get(raw.channel_id) else {
                 unknown_chunks += 1;
@@ -901,18 +1011,62 @@ impl CosworthFile {
                 empty_chunks += 1;
                 continue;
             }
+            let period_ns = raw.sample_period_ticks as u64 * TICK_NS;
+            let time_base_ns = if stamped {
+                let placed = (raw.start_ticks - origin_ticks).saturating_mul(TICK_NS);
+                if !channel.chunks.is_empty() && placed > channel.duration_ns {
+                    gap_total_ns = gap_total_ns.saturating_add(placed - channel.duration_ns);
+                    if last_gap_channel != raw.channel_id {
+                        last_gap_channel = raw.channel_id;
+                        gap_channels += 1;
+                    }
+                }
+                if channel.chunks.last().is_some_and(|previous| {
+                    let last_sample = previous.time_base_ns.saturating_add(
+                        (previous.sample_count - 1).saturating_mul(previous.sample_period_ns),
+                    );
+                    placed <= last_sample
+                }) {
+                    // Equal/overlapping timestamps do not establish equal
+                    // samples. Keep the bytes and their stamps, flag the
+                    // ambiguity, and let callers choose a recovery policy.
+                    overlapping_chunks += 1;
+                }
+                // A run may re-phase between the previous last sample and
+                // its nominal end. That is valid, not an overlap to trim.
+                placed
+            } else {
+                channel.duration_ns
+            };
             channel.chunks.push(Chunk {
-                sample_period_ns: raw.sample_period_ticks as u64 * TICK_NS,
+                sample_period_ns: period_ns,
                 sample_count: count,
                 data_ptr: raw.data_ptr,
                 sample_base: channel.sample_count,
-                time_base_ns: channel.duration_ns,
+                time_base_ns,
             });
             channel.sample_count = channel.sample_count.saturating_add(count);
-            channel.duration_ns = channel.duration_ns.saturating_add(
-                count
-                    .saturating_mul(raw.sample_period_ticks as u64)
-                    .saturating_mul(TICK_NS),
+            channel.duration_ns = channel
+                .duration_ns
+                .max(time_base_ns.saturating_add(count.saturating_mul(period_ns)));
+        }
+        if gap_total_ns > 0 {
+            diagnostics.info(
+                "pds.chunk_gaps_placed",
+                format!(
+                    "{gap_channels} channel(s) have acquisition gaps between chunks totalling \
+                     {:.1} s; chunks were placed at their recorded instants",
+                    gap_total_ns as f64 / 1e9
+                ),
+            );
+        }
+        if overlapping_chunks > 0 {
+            diagnostics.warning(
+                "pds.chunk_overlap",
+                format!(
+                    "{overlapping_chunks} chunk(s) overlap earlier sample instants; all raw \
+                     samples and timestamps were preserved, but time lookup is ambiguous"
+                ),
             );
         }
         if unknown_chunks > 0 {
@@ -1157,6 +1311,110 @@ mod tests {
         assert_eq!(file.channels[1].sample_count, 6);
     }
 
+    fn u64_at(data: &mut [u8], offset: usize, value: u64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Stamps descriptor `index` of the table at `chunks` with absolute
+    /// first/last sample ticks the way a native logger does.
+    fn stamp_chunk(data: &mut [u8], chunks: usize, index: usize, start_ticks: u64, count: u64) {
+        let at = chunks + index * 0x40;
+        u64_at(data, at + 0x10, start_ticks);
+        u64_at(data, at + 0x28, start_ticks + (count - 1) * 10_000_000);
+    }
+
+    #[test]
+    fn stamped_chunks_are_placed_at_their_recorded_instants() {
+        // Table order: Speed[10,11] Gear[3,3] Speed[12,13] Gear[4,4], 1 Hz.
+        // Stamps (ticks since an arbitrary epoch E, 1 s = 10_000_000 ticks):
+        //   Gear  chunk 0 at E+0 s  -> the file origin
+        //   Speed chunk 0 at E+1 s  -> Speed starts a second late
+        //   Speed chunk 1 at E+5 s  -> 2 s acquisition gap after 1,2 s
+        //   Gear  chunk 1 at E+2 s  -> contiguous
+        let fixture = fixture();
+        let mut data = std::fs::read(fixture.path()).unwrap();
+        let chunks = 0x380;
+        let e = 7_900_000_000_000_000u64;
+        stamp_chunk(&mut data, chunks, 0, e + 10_000_000, 2);
+        stamp_chunk(&mut data, chunks, 1, e, 2);
+        stamp_chunk(&mut data, chunks, 2, e + 50_000_000, 2);
+        stamp_chunk(&mut data, chunks, 3, e + 20_000_000, 2);
+        let file = CosworthFile::from_bytes("stamped.pds", data.clone()).unwrap();
+        let speed = channel_index(&file, "Speed");
+        let gear = channel_index(&file, "Gear");
+        let s = 1_000_000_000u64;
+        assert_eq!(file.channels[speed].chunks[0].time_base_ns, s);
+        assert_eq!(file.channels[speed].chunks[1].time_base_ns, 5 * s);
+        assert_eq!(file.channels[speed].duration_ns, 7 * s);
+        assert_eq!(file.channels[gear].chunks[0].time_base_ns, 0);
+        assert_eq!(file.channels[gear].chunks[1].time_base_ns, 2 * s);
+        assert_eq!(file.channels[gear].duration_ns, 4 * s);
+        // Sample values stay bound to their chunks.
+        assert_eq!(file.decode(speed, 1, 0), 12.0);
+        assert_eq!(file.sample_time_ns(speed, 1, 1), 6 * s);
+        // Nothing is interpolated across the gap: 2.5 s is after the first
+        // run's last sample and before the second run starts.
+        assert_eq!(file.sample_at(speed, 1_500_000_000, true), Some(10.5));
+        // Hold the last sample for its own period, but never interpolate
+        // towards a future run or fill the acquisition gap with its value.
+        assert_eq!(file.sample_at(speed, 2_500_000_000, true), Some(11.0));
+        assert_eq!(file.sample_at(speed, 3 * s, false), None);
+        assert_eq!(file.sample_at(speed, 4 * s, true), None);
+        assert_eq!(file.sample_at(speed, 5 * s, false), Some(12.0));
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "pds.chunk_gaps_placed"));
+
+        // Sorting by stamp must also reorder a table that lists a channel's
+        // later run first.
+        let mut swapped = data.clone();
+        stamp_chunk(&mut swapped, chunks, 0, e + 50_000_000, 2);
+        stamp_chunk(&mut swapped, chunks, 2, e + 10_000_000, 2);
+        let file = CosworthFile::from_bytes("swapped.pds", swapped).unwrap();
+        assert_eq!(file.decode(speed, 0, 0), 12.0);
+        assert_eq!(file.channels[speed].chunks[0].time_base_ns, s);
+        assert_eq!(file.decode(speed, 1, 0), 10.0);
+        assert_eq!(file.channels[speed].chunks[1].time_base_ns, 5 * s);
+
+        // An overlapping timestamp does NOT establish duplicate values:
+        // Speed[11] and Speed[12] share a timestamp but differ. Preserve both
+        // for raw decoding and diagnose the conflict. A sub-period re-phase
+        // (Gear at 1.6 s, after its last sample at 1 s) is valid and must not
+        // be shifted to 2 s or lose a sample.
+        let mut overlapping = data.clone();
+        stamp_chunk(&mut overlapping, chunks, 2, e + 20_000_000, 2);
+        stamp_chunk(&mut overlapping, chunks, 3, e + 16_000_000, 2);
+        let file = CosworthFile::from_bytes("overlap.pds", overlapping).unwrap();
+        assert_eq!(file.channels[speed].chunks[1].sample_count, 2);
+        assert_eq!(file.channels[speed].chunks[1].time_base_ns, 2 * s);
+        assert_eq!(file.decode(speed, 1, 0), 12.0);
+        assert_eq!(file.decode(speed, 1, 1), 13.0);
+        assert_eq!(file.channels[speed].sample_count, 4);
+        assert_eq!(file.channels[gear].chunks[1].sample_count, 2);
+        assert_eq!(file.channels[gear].chunks[1].time_base_ns, 1_600_000_000);
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "pds.chunk_overlap" && d.message.contains("preserved")));
+
+        // One stamp that contradicts its own count/period disqualifies the
+        // table: placement falls back to back-to-back table order.
+        let mut broken = data;
+        u64_at(&mut broken, chunks + 2 * 0x40 + 0x28, e + 99_000_000);
+        let file = CosworthFile::from_bytes("broken.pds", broken).unwrap();
+        assert_eq!(file.channels[speed].chunks[0].time_base_ns, 0);
+        assert_eq!(file.channels[speed].chunks[1].time_base_ns, 2 * s);
+        assert!(file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "pds.chunk_timestamps_inconsistent"));
+        assert!(!file
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "pds.chunk_gaps_placed"));
+    }
+
     #[test]
     fn decodes_native_markerless_type_codes() {
         let defs = 0x200usize;
@@ -1202,6 +1460,33 @@ mod tests {
         assert_eq!(file.decode(0, 0, 1), -2.25);
         assert_eq!(file.channels[1].sample_type, SampleType::I16);
         assert_eq!(file.decode(1, 0, 0), -30_000.0);
+    }
+
+    #[test]
+    fn unindexed_and_truncated_files_are_described_not_just_rejected() {
+        // A logger that died before finalising: definitions present, chunk
+        // directory entry zeroed.
+        let fixture = fixture();
+        let mut unindexed = std::fs::read(fixture.path()).unwrap();
+        unindexed[0xa0..0xc0].fill(0);
+        let error = CosworthFile::from_bytes("unindexed.pds", unindexed).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("2 channel definitions are present but the chunk directory is empty"),
+            "{message}"
+        );
+
+        // A partial copy: valid directory, but everything it points at is
+        // zero-filled.
+        let mut truncated = std::fs::read(fixture.path()).unwrap();
+        truncated[0x200..].fill(0);
+        truncated.resize(0x200 + (1 << 20), 0);
+        let error = CosworthFile::from_bytes("truncated.pds", truncated).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("truncated or only partially copied"),
+            "{message}"
+        );
     }
 
     #[test]

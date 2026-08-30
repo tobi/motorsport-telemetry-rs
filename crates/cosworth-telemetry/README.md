@@ -1,6 +1,6 @@
 # cosworth-telemetry
 
-Standalone memory-mapped Pi/Cosworth PDS parser. It supports marker and markerless definitions, typed values, compact exports, bounds checking, and authoritative chunk-table ordering.
+Standalone memory-mapped Pi/Cosworth PDS parser. It supports marker and markerless definitions, typed values, compact exports, bounds checking, and recorded chunk timestamps.
 
 ## Library contract
 
@@ -14,6 +14,21 @@ native files and `from_bytes` for embedded input.
 summary; `read_metadata_from_bytes` is the owned-buffer form.
 PDS has no universally reliable absolute session key, so that field remains
 empty unless the format exposes one.
+
+## Timing and gaps
+
+Native chunk descriptors store first/last sample stamps in 100 ns ticks.
+When every descriptor satisfies `last = first + (count - 1) * period`, the
+reader uses a shared origin and places each channel's runs at their recorded
+times. This preserves channel start offsets and radio-acquisition gaps.
+Unstamped/inconsistent tables retain the legacy table-order placement, with
+a warning for inconsistent stamps.
+
+A run may restart between the previous last sample and its nominal end;
+that re-phasing is valid. Actual overlapping sample instants are diagnosed,
+not silently shifted or trimmed: the reader preserves all raw sample values.
+Point lookup in an overlap selects the latest-starting run; raw chunk decode
+is available for callers needing to inspect the ambiguity.
 
 ## Definition-layout detection
 

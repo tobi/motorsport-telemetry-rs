@@ -130,52 +130,64 @@ fn increasing_counter_laps(
     let mut high_water: Option<i64> = None;
     let mut crossings = 0;
 
-    for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
-        for local_index in 0..chunk.sample_count {
-            let value = source.decode(channel_index, chunk_index, local_index);
-            let Some(counter) = finite_i64(value) else {
-                continue;
-            };
-            if counter < 0 {
-                continue;
-            }
-            let time_ns = source.sample_time_ns(channel_index, chunk_index, local_index);
-            let Some(before) = high_water else {
-                high_water = Some(counter);
-                // counter + beacon offset overflowed i64: drop this sample
-                let Some(number) = counter.checked_add(number_offset) else {
-                    continue;
-                };
-                current = Some((number, time_ns, false));
-                continue;
-            };
-            if counter <= before {
-                // Shutdown resets and transient backwards values are not lap
-                // crossings. Keep the high-water mark so a later 0 -> 1 does
-                // not create a second, overlapping lap sequence.
-                continue;
-            }
-            // counter + beacon offset overflowed i64: drop this crossing
+    // Only finite, non-negative samples take part; the look-ahead below needs
+    // them as a flat list.
+    let values: Vec<(u64, i64)> = samples(source, channel_index)
+        .into_iter()
+        .filter_map(|(time_ns, value)| {
+            finite_i64(value)
+                .filter(|counter| *counter >= 0)
+                .map(|counter| (time_ns, counter))
+        })
+        .collect();
+
+    for (position, &(time_ns, counter)) in values.iter().enumerate() {
+        let Some(before) = high_water else {
+            high_water = Some(counter);
+            // counter + beacon offset overflowed i64: drop this sample
             let Some(number) = counter.checked_add(number_offset) else {
                 continue;
             };
-            if let Some((prev_number, start_ns, start_known)) =
-                current.replace((number, time_ns, true))
-            {
-                if prev_number > 0 && time_ns > start_ns {
-                    laps.push(LapMetadata {
-                        number: prev_number,
-                        start_ns,
-                        end_ns: time_ns,
-                        duration_ns: time_ns - start_ns,
-                        complete: start_known,
-                        first_video_frame: None,
-                    });
-                }
-            }
-            high_water = Some(counter);
-            crossings += 1;
+            current = Some((number, time_ns, false));
+            continue;
+        };
+        if counter <= before {
+            // Shutdown resets and transient backwards values are not lap
+            // crossings. Keep the high-water mark so a later 0 -> 1 does
+            // not create a second, overlapping lap sequence.
+            continue;
         }
+        // A counter that jumps by more than one lap and is not held by
+        // the very next sample is a corrupt sample (radio bit errors in
+        // telemetry-received logs put a 1e9 into `Lap Number`). Taking
+        // it would raise the high-water mark above every real lap that
+        // follows and silence lap detection for the rest of the file.
+        if counter - before > 1
+            && values
+                .get(position + 1)
+                .is_some_and(|&(_, next)| next < counter)
+        {
+            continue;
+        }
+        // counter + beacon offset overflowed i64: drop this crossing
+        let Some(number) = counter.checked_add(number_offset) else {
+            continue;
+        };
+        if let Some((prev_number, start_ns, start_known)) = current.replace((number, time_ns, true))
+        {
+            if prev_number > 0 && time_ns > start_ns {
+                laps.push(LapMetadata {
+                    number: prev_number,
+                    start_ns,
+                    end_ns: time_ns,
+                    duration_ns: time_ns - start_ns,
+                    complete: start_known,
+                    first_video_frame: None,
+                });
+            }
+        }
+        high_water = Some(counter);
+        crossings += 1;
     }
     if let Some((number, start_ns, _)) = current {
         if number > 0 && duration_ns > start_ns {
@@ -220,65 +232,69 @@ pub(crate) fn timer_reset_laps(
     duration_ns: u64,
     lap_channel_index: Option<usize>,
 ) -> Vec<LapMetadata> {
-    let timer_resets = names::find(
-        source.channels(),
-        &[
-            "currentlaptime",
-            "lapcurrentlaptime",
-            "laptime",
-            "laptimerunning",
-            "lapprogression",
-            "lapprogress",
-            "lapprogresspct",
-        ],
-    )
-    .map(|index| {
-        let values = samples(source, index);
-        let is_progress = ["lapprogression", "lapprogress", "lapprogresspct"]
-            .iter()
-            .any(|wanted| names::eq(&source.channels()[index].name, wanted));
-        let max_value = values
-            .iter()
-            .map(|(_, value)| *value)
-            .filter(|value| value.is_finite())
-            .fold(0.0_f64, f64::max);
-        // A timer above 1000 at its peak is counting milliseconds; anything
-        // smaller is seconds.
-        let milliseconds = max_value > 1_000.0;
-        let reset_threshold = if milliseconds { 5_000.0 } else { 5.0 };
-        values
-            .windows(2)
-            .filter_map(|pair| {
-                let before = pair[0].1;
-                let after = pair[1].1;
-                if !before.is_finite() || !after.is_finite() {
-                    return None;
-                }
-                if is_progress {
-                    let full_lap = if max_value > 2.0 { 100.0 } else { 1.0 };
-                    return (before >= full_lap * 0.75 && after <= full_lap * 0.25)
-                        .then_some(pair[1].0);
-                }
-                if before - after <= reset_threshold {
-                    return None;
-                }
-                // The first sample after a reset already reads the time
-                // elapsed since the beacon; the crossing itself was that much
-                // earlier. Subtracting it recovers the beacon instant to the
-                // timer's own resolution instead of the channel's sample
-                // spacing, which is what makes the lap durations agree with
-                // the logger's reported lap times.
-                let elapsed_ns = if milliseconds {
-                    after.max(0.0) * 1e6
-                } else {
-                    after.max(0.0) * 1e9
-                };
-                let elapsed_ns = finite_u64(elapsed_ns).unwrap_or(0);
-                Some(pair[1].0.saturating_sub(elapsed_ns))
-            })
-            .collect::<Vec<_>>()
-    })
-    .unwrap_or_default();
+    let timer_resets = timer_channel(source)
+        .map(|index| {
+            let values = samples(source, index);
+            let is_progress = ["lapprogression", "lapprogress", "lapprogresspct"]
+                .iter()
+                .any(|wanted| names::eq(&source.channels()[index].name, wanted));
+            let max_value = values
+                .iter()
+                .map(|(_, value)| *value)
+                .filter(|value| value.is_finite())
+                .fold(0.0_f64, f64::max);
+            // Stored units win: a 20-minute timer in seconds is not a
+            // millisecond timer. Keep the legacy magnitude fallback only for
+            // unitless dash/CAN exports (e.g. AiM Current_Lap_Time).
+            let seconds_per_unit =
+                timer_seconds_per_unit(&source.channels()[index].unit, max_value);
+            // The first sample after a genuine reset reads at most one sample
+            // period plus logger latency. A drop to a value of many seconds is
+            // a *resync* — the dash adopting a lap time from elsewhere (AiM
+            // `Current_Lap_Time` falling from 8.7 h of power-on count to
+            // 126.65 s) — not a beacon, and "correcting" by that much would
+            // place a boundary minutes off or at `t = 0`.
+            let period_ns = source.channels()[index]
+                .chunks
+                .first()
+                .map_or(0, |chunk| chunk.sample_period_ns);
+            let max_elapsed_ns = 2_000_000_000u64.saturating_add(period_ns.saturating_mul(2));
+            values
+                .windows(2)
+                .filter_map(|pair| {
+                    let before = pair[0].1;
+                    let after = pair[1].1;
+                    if !before.is_finite() || !after.is_finite() {
+                        return None;
+                    }
+                    if is_progress {
+                        let full_lap = if max_value > 2.0 { 100.0 } else { 1.0 };
+                        return (before >= full_lap * 0.75 && after <= full_lap * 0.25)
+                            .then_some(pair[1].0);
+                    }
+                    let seconds_per_unit = seconds_per_unit?;
+                    if after < 0.0 || (before - after) * seconds_per_unit <= 5.0 {
+                        return None;
+                    }
+                    // The first sample after a reset already reads the time
+                    // elapsed since the beacon; the crossing itself was that much
+                    // earlier. Subtracting it recovers the beacon instant to the
+                    // timer's own resolution instead of the channel's sample
+                    // spacing, which is what makes the lap durations agree with
+                    // the logger's reported lap times.
+                    let elapsed_ns = finite_u64(after * seconds_per_unit * 1e9)?;
+                    if elapsed_ns > max_elapsed_ns {
+                        return None;
+                    }
+                    Some(pair[1].0.saturating_sub(elapsed_ns))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut timer_resets = timer_resets;
+    timer_resets.retain(|&at| at > 0 && at < duration_ns);
+    timer_resets.sort_unstable();
+    timer_resets.dedup();
     if timer_resets.is_empty() {
         return Vec::new();
     }
@@ -287,13 +303,24 @@ pub(crate) fn timer_reset_laps(
     boundaries.extend(timer_resets);
     boundaries.push(duration_ns);
     let count = boundaries.len() - 1;
+    // The counter is sampled slower than the timer and changes a sample or
+    // two *after* the beacon. A fragment that begins at a reset the counter
+    // has not caught up with yet (typically the tail of a recording that
+    // stopped right after a crossing) would repeat the previous number; a
+    // timer reset is a crossing, so the number must advance.
+    let mut last_number: Option<i64> = None;
     boundaries
         .windows(2)
         .enumerate()
         .filter_map(|(index, pair)| {
-            let number = lap_channel_index
+            let counted = lap_channel_index
                 .and_then(|channel| counter_lap_number_at(source, channel, pair[0], false))
                 .unwrap_or(index as i64 + 1);
+            let number = match last_number {
+                Some(previous) if counted <= previous => previous.checked_add(1)?,
+                _ => counted,
+            };
+            last_number = Some(number);
             // inverted boundary: drop rather than report a zero-duration lap
             let duration_ns = pair[1].checked_sub(pair[0])?;
             (number > 0).then_some(LapMetadata {
@@ -308,6 +335,55 @@ pub(crate) fn timer_reset_laps(
         .collect()
 }
 
+/// Convert declared timer units, retaining magnitude inference only when no
+/// unit was stored. Unknown non-empty units must not be interpreted as time.
+fn timer_seconds_per_unit(unit: &str, max_value: f64) -> Option<f64> {
+    if unit.trim().is_empty() {
+        Some(if max_value > 1_000.0 { 0.001 } else { 1.0 })
+    } else {
+        crate::convert(1.0, unit, "s").ok()
+    }
+}
+
+/// The running lap-timer / lap-progress channel [`timer_reset_laps`] reads.
+pub(crate) fn timer_channel(source: &dyn TelemetrySource) -> Option<usize> {
+    names::find(
+        source.channels(),
+        &[
+            "currentlaptime",
+            "lapcurrentlaptime",
+            "laptime",
+            "laptimerunning",
+            "lapprogression",
+            "lapprogress",
+            "lapprogresspct",
+        ],
+    )
+}
+
+/// Sample period of a channel's first run, or zero when it has none.
+pub(crate) fn channel_period_ns(source: &dyn TelemetrySource, index: Option<usize>) -> u64 {
+    index
+        .and_then(|index| source.channels().get(index))
+        .and_then(|channel| channel.chunks.first())
+        .map_or(0, |chunk| chunk.sample_period_ns)
+}
+
+/// How far a counter crossing may sit from a timer reset and still be the
+/// same beacon, given the two channels' sample periods.
+///
+/// The counter changes up to one of its own samples after the beacon; the
+/// timer's first post-reset sample (whose elapsed value is subtracted to
+/// recover the beacon instant) can itself be a full timer period late. Both
+/// lags add, on top of a fixed allowance for a logger that stamps the
+/// counter late. With 1 Hz `Lap Number` and `Lap Time` (Cosworth dash
+/// channels) that is 3.5 s; with 10 Hz / 100 Hz it stays near 1.6 s.
+pub(crate) fn snap_window_ns(counter_period_ns: u64, timer_period_ns: u64) -> u64 {
+    TIMER_SNAP_WINDOW_NS
+        .saturating_add(counter_period_ns)
+        .saturating_add(timer_period_ns)
+}
+
 /// Applies the lap-recovery precedence: authoritative > counter > timer.
 ///
 /// A counter with zero crossings falls through to timer laps when any exist,
@@ -317,11 +393,12 @@ pub(crate) fn pick_laps(
     counter_laps: Vec<LapMetadata>,
     counter_crossings: usize,
     timer_laps: Vec<LapMetadata>,
+    snap_window_ns: u64,
 ) -> Vec<LapMetadata> {
     if let Some(source_laps) = authoritative {
         source_laps.laps.clone()
     } else if counter_crossings > 0 {
-        refine_with_timer(counter_laps, &timer_laps)
+        refine_with_timer(counter_laps, &timer_laps, snap_window_ns)
     } else if !timer_laps.is_empty() {
         timer_laps
     } else {
@@ -329,13 +406,12 @@ pub(crate) fn pick_laps(
     }
 }
 
-/// How far a counter crossing may sit from a timer reset and still be the
-/// same beacon. A 10 Hz counter lags a 100 Hz timer by a sample or two; a
-/// second covers that with room for a logger that stamps the counter late.
+/// Fixed part of the snap window (see [`snap_window_ns`]): a logger that
+/// stamps the counter late, independent of sample rates.
 const TIMER_SNAP_WINDOW_NS: u64 = 1_500_000_000;
 
 /// Moves every counter-lap boundary onto the nearest timer reset within
-/// [`TIMER_SNAP_WINDOW_NS`], keeping the counter's lap numbers.
+/// `snap_window_ns`, keeping the counter's lap numbers.
 ///
 /// A lap counter only says which lap the car is on; it changes one sample
 /// after the beacon at its own (often 10 Hz) rate. The lap timer resets *at*
@@ -343,7 +419,11 @@ const TIMER_SNAP_WINDOW_NS: u64 = 1_500_000_000;
 /// the timer's instant is the boundary. Boundaries with no reset nearby (the
 /// very first crossing of a recording that started mid-lap, a counter bump
 /// the timer never saw) stay where the counter put them.
-fn refine_with_timer(mut laps: Vec<LapMetadata>, timer_laps: &[LapMetadata]) -> Vec<LapMetadata> {
+fn refine_with_timer(
+    mut laps: Vec<LapMetadata>,
+    timer_laps: &[LapMetadata],
+    snap_window_ns: u64,
+) -> Vec<LapMetadata> {
     if timer_laps.is_empty() {
         return laps;
     }
@@ -361,7 +441,7 @@ fn refine_with_timer(mut laps: Vec<LapMetadata>, timer_laps: &[LapMetadata]) -> 
             .into_iter()
             .flatten()
             .map(|index| resets[index])
-            .filter(|reset| reset.abs_diff(boundary) <= TIMER_SNAP_WINDOW_NS)
+            .filter(|reset| reset.abs_diff(boundary) <= snap_window_ns)
             .min_by_key(|reset| reset.abs_diff(boundary))
             .unwrap_or(boundary)
     };
@@ -411,11 +491,8 @@ pub(crate) fn fastest_lap(
                     .map(|(_, value)| *value)
                     .filter(|value| value.is_finite())
                     .fold(0.0_f64, f64::max);
-                let scale = if max_value > 1_000.0 {
-                    1_000_000.0
-                } else {
-                    1_000_000_000.0
-                };
+                let scale =
+                    timer_seconds_per_unit(&source.channels()[index].unit, max_value)? * 1e9;
                 values
                     .into_iter()
                     .map(|(_, value)| value)
@@ -478,7 +555,7 @@ mod tests {
             lap(0, 240.0, 360.0, true),
             lap(0, 360.0, 400.0, false),
         ];
-        let refined = pick_laps(None, counter, 3, timer);
+        let refined = pick_laps(None, counter, 3, timer, TIMER_SNAP_WINDOW_NS);
         let bounds: Vec<(i64, u64, u64, bool)> = refined
             .iter()
             .map(|lap| (lap.number, lap.start_ns, lap.end_ns, lap.complete))
@@ -498,11 +575,46 @@ mod tests {
     }
 
     #[test]
+    fn snap_window_grows_with_one_hertz_dash_channels() {
+        // Cosworth dash `Lap Number` and `Lap Time` both run at 1 Hz. The
+        // counter flipped at 304.9 s while the timer's first post-reset
+        // sample read 1.78 s, putting the beacon at 303.12 s: 1.78 s apart,
+        // outside the fixed window but inside the rate-aware one. The
+        // logger's own `Previous Lap Time` (1:47.434 / 1:42.592) agrees
+        // with the snapped boundaries, not the counter's.
+        let counter = vec![lap(2, 195.69, 304.9, true), lap(3, 304.9, 405.7, true)];
+        let timer = vec![
+            lap(0, 0.0, 195.69, false),
+            lap(0, 195.69, 303.12, true),
+            lap(0, 303.12, 405.7, true),
+            lap(0, 405.7, 500.0, false),
+        ];
+        let fixed = pick_laps(
+            None,
+            counter.clone(),
+            2,
+            timer.clone(),
+            TIMER_SNAP_WINDOW_NS,
+        );
+        assert_eq!(
+            fixed[0].end_ns, 304_900_000_000,
+            "fixed window must not snap"
+        );
+        let window = snap_window_ns(1_000_000_000, 1_000_000_000);
+        assert_eq!(window, 3_500_000_000);
+        let refined = pick_laps(None, counter, 2, timer, window);
+        assert_eq!(refined[0].end_ns, 303_120_000_000);
+        assert_eq!(refined[1].start_ns, 303_120_000_000);
+        assert_eq!(refined[0].duration_ns, 107_430_000_000);
+        assert_eq!(refined[1].duration_ns, 102_580_000_000);
+    }
+
+    #[test]
     fn counter_boundaries_without_a_nearby_reset_are_kept() {
         let counter = vec![lap(1, 10.0, 130.0, true), lap(2, 130.0, 250.0, true)];
         // A lone reset far from every crossing is not the same beacon.
         let timer = vec![lap(0, 0.0, 60.0, false), lap(0, 60.0, 250.0, false)];
-        let refined = pick_laps(None, counter.clone(), 2, timer);
+        let refined = pick_laps(None, counter.clone(), 2, timer, TIMER_SNAP_WINDOW_NS);
         assert_eq!(refined, counter);
     }
 }
