@@ -27,6 +27,11 @@ irregular timestamps, custom channels, and native `avifileindex` /
 `avisynctime` unit are right-aligned so speed, throttle and brake units do
 not shift onto neighbouring channels.
 
+`utc_start_ns()` is the header date (`File created on dd/mm/yyyy at|@ …`)
+combined with the first UTC time-of-day sample, so a VBO with a header date
+places on the absolute axis without a timezone. The header's clock time is
+the logger's local time and is only reported as identity.
+
 ### Inferred GPS laps
 
 When `[laptiming]` declares start/finish marks, the reader can infer lap

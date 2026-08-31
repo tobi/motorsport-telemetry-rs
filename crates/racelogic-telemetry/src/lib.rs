@@ -126,7 +126,12 @@ fn sections(text: &str) -> Sections<'_> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(created) = trimmed.strip_prefix("File created on ") {
-            if let Some((date, time)) = created.split_once(" at ") {
+            // VBOX Tools writes `26/01/2025 @ 12:23:57`; older exports and
+            // Circuit Tools write `31/07/2006 at 09:55:20`.
+            if let Some((date, time)) = created
+                .split_once(" at ")
+                .or_else(|| created.split_once(" @ "))
+            {
                 result.created_date = date.trim().to_owned();
                 result.created_time = time.trim().to_owned();
             }
@@ -152,6 +157,29 @@ fn sections(text: &str) -> Sections<'_> {
         }
     }
     result
+}
+
+/// Days since the Unix epoch for a `dd/mm/yyyy` header date (proleptic
+/// Gregorian, UTC). `None` for anything that does not parse as a real date.
+fn header_date_days(date: &str) -> Option<i64> {
+    let mut parts = date.trim().split('/');
+    let day: i64 = parts.next()?.trim().parse().ok()?;
+    let month: i64 = parts.next()?.trim().parse().ok()?;
+    let year: i64 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if !(1980..=2200).contains(&year) {
+        return None;
+    }
+    // Howard Hinnant's days_from_civil.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
 }
 
 fn time_seconds(raw: f64) -> f64 {
@@ -871,6 +899,15 @@ impl TelemetrySource for RacelogicFile {
             ..Default::default()
         }
     }
+    /// The VBOX `time` column is UTC time of day by specification; the header
+    /// date names the day. Together they are a true Unix instant, so this is
+    /// a derivation of stored values, not a decorative stamp. `None` without a
+    /// parseable header date.
+    fn utc_start_ns(&self) -> Option<u64> {
+        let days = header_date_days(&self.date)?;
+        let midnight_ns = u64::try_from(days.checked_mul(86_400_000_000_000)?).ok()?;
+        midnight_ns.checked_add(self.absolute_start_ns)
+    }
     fn sample_times(&self, channel_index: usize) -> SampleTimes<'_> {
         if self
             .channels
@@ -1294,5 +1331,30 @@ mod tests {
             .diagnostics()
             .iter()
             .any(|d| d.code == "vbo.time_rollover_corrected"));
+    }
+
+    #[test]
+    fn vbo_time_of_day_plus_header_date_is_a_utc_instant() {
+        // 26 Jan 2025 00:00:00 UTC = 1737849600 s; 12:00:00 UTC time of day.
+        let fixture = fixture("File created on 26/01/2025 @ 12:23:57\n[column names]\ntime velocity\n[data]\n120000.00 10\n120000.50 20\n");
+        let source = RacelogicFile::open(fixture.path()).unwrap();
+        assert_eq!(
+            source.utc_start_ns(),
+            Some((1_737_849_600 + 12 * 3600) * 1_000_000_000)
+        );
+        assert_eq!(source.identity().date, "26/01/2025");
+        assert_eq!(source.identity().time, "12:23:57");
+    }
+
+    #[test]
+    fn vbo_without_a_header_date_has_no_utc_start() {
+        let fixture =
+            fixture("[column names]\ntime velocity\n[data]\n120000.00 10\n120000.50 20\n");
+        let source = RacelogicFile::open(fixture.path()).unwrap();
+        assert_eq!(source.utc_start_ns(), None);
+        assert_eq!(header_date_days("31/13/2006"), None);
+        assert_eq!(header_date_days("01/01/1970"), None); // before any VBOX
+        assert_eq!(header_date_days("01/01/1980"), Some(3_652));
+        assert_eq!(header_date_days("26/01/2025"), Some(20_114));
     }
 }
