@@ -207,6 +207,36 @@ fn u64le(data: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
+/// A channel definition is only believed when its name looks like one.
+///
+/// Definition records are UTF-16 in the file, so any byte pattern decodes to
+/// *some* string: a definition region that was never written (zero fill, or a
+/// repeated filler word such as `0x2710`) decodes to runs of a single exotic
+/// code point, or to a soup of halfwidth/fullwidth forms when sample bytes
+/// are read as text. Every one of the 1,020 distinct names in the audited
+/// archive is printable ASCII; Latin-1 symbols (`°`, `µ`, `²`) are allowed
+/// for unseen firmware. Requiring that, plus one ASCII alphanumeric, rejects
+/// the filler without touching any real name, and lets the caller report a
+/// missing index instead of dying later on the garbage.
+fn plausible_channel_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().any(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| matches!(c, ' '..='~' | '\u{a0}'..='\u{ff}'))
+}
+
+/// Share of the definition region that is zero bytes, for the truncated /
+/// unindexed diagnostic. `None` when the region is empty or out of bounds.
+fn zero_fraction(data: &[u8], start: usize, end: usize) -> Option<f64> {
+    let end = end.min(data.len());
+    if start >= end {
+        return None;
+    }
+    let zeros = data[start..end].iter().filter(|byte| **byte == 0).count();
+    Some(zeros as f64 / (end - start) as f64)
+}
+
 fn utf16le(data: &[u8], offset: usize, max_bytes: usize) -> String {
     let end = offset.saturating_add(max_bytes).min(data.len());
     let units = (offset..end.saturating_sub(1))
@@ -490,7 +520,15 @@ fn marker_present(data: &[u8], layout: Layout) -> bool {
         .any(|pos| u64le(data, pos) == Some(MARKER))
 }
 
-fn marker_defs(data: &[u8], layout: Layout) -> Vec<RawChannelDef<'_>> {
+/// Channel definitions plus the number of records that carried a non-empty
+/// but implausible name (see [`plausible_channel_name`]). Callers treat a
+/// region where the rejects outnumber the accepted records as unwritten.
+struct ParsedDefs<'a> {
+    defs: Vec<RawChannelDef<'a>>,
+    rejected: usize,
+}
+
+fn marker_defs(data: &[u8], layout: Layout) -> ParsedDefs<'_> {
     let scan_end = layout
         .chunk_offset
         .min(layout.defs_offset.saturating_add(8192))
@@ -498,8 +536,12 @@ fn marker_defs(data: &[u8], layout: Layout) -> Vec<RawChannelDef<'_>> {
     let marker_pos = (layout.defs_offset..scan_end.saturating_sub(7))
         .step_by(2)
         .find(|&pos| u64le(data, pos) == Some(MARKER));
+    let empty = ParsedDefs {
+        defs: Vec::new(),
+        rejected: 0,
+    };
     let Some(first) = marker_pos else {
-        return Vec::new();
+        return empty;
     };
     let probe_end = layout.chunk_offset.min(first + 1024).min(data.len());
     let record_size = ((first + 16)..probe_end.saturating_sub(7))
@@ -508,51 +550,49 @@ fn marker_defs(data: &[u8], layout: Layout) -> Vec<RawChannelDef<'_>> {
         .map(|pos| pos - first)
         .unwrap_or(304);
     if record_size < 0xdc {
-        return Vec::new();
+        return empty;
     }
 
     // Pass 1: collect records so the unit and sample-type fields can both be
     // detected from the file. Their offsets vary with logger firmware.
     let mut raw: Vec<(u32, String, &[u8])> = Vec::new();
+    let mut rejected = 0usize;
     let mut pos = first;
     while pos + 0xdc <= layout.chunk_offset.min(data.len()) {
         if u64le(data, pos) == Some(MARKER) {
             let id = u32le(data, pos + 8).unwrap_or(0);
             let name = utf16le(data, pos + 0x10, 112);
-            if id != 0 && !name.is_empty() {
+            if id != 0 && plausible_channel_name(&name) {
                 let end = (pos + record_size).min(data.len());
                 raw.push((id, name, &data[pos..end]));
+            } else if !name.is_empty() {
+                rejected += 1;
             }
         }
         pos += record_size;
     }
 
-    let records: Vec<&[u8]> = raw.iter().map(|(_, _, record)| *record).collect();
-    let def_layout = DefLayout::detect(&records, 0x10);
-    raw.into_iter()
-        .map(|(id, name, record)| {
-            let (unit, unit_source) = def_layout.resolve(record);
-            RawChannelDef {
-                id,
-                name,
-                unit,
-                unit_source,
-                record,
-            }
-        })
-        .collect()
+    ParsedDefs {
+        defs: finish_defs(raw, 0x10),
+        rejected,
+    }
 }
 
-fn markerless_defs(data: &[u8], layout: Layout) -> Vec<RawChannelDef<'_>> {
+fn markerless_defs(data: &[u8], layout: Layout) -> ParsedDefs<'_> {
+    let empty = ParsedDefs {
+        defs: Vec::new(),
+        rejected: 0,
+    };
     if layout.defs_count == 0 {
-        return Vec::new();
+        return empty;
     }
     let span = layout.chunk_offset.saturating_sub(layout.defs_offset);
     let record_size = span / layout.defs_count;
     if !(100..=1024).contains(&record_size) {
-        return Vec::new();
+        return empty;
     }
     let mut raw: Vec<(u32, String, &[u8])> = Vec::new();
+    let mut rejected = 0usize;
     for i in 0..layout.defs_count {
         let pos = layout.defs_offset + i * record_size;
         if pos + 16 > data.len() {
@@ -563,15 +603,27 @@ fn markerless_defs(data: &[u8], layout: Layout) -> Vec<RawChannelDef<'_>> {
         if name.is_empty() {
             continue;
         }
+        if !plausible_channel_name(&name) {
+            rejected += 1;
+            continue;
+        }
         let end = (pos + record_size).min(data.len());
         raw.push((id, name, &data[pos..end]));
     }
 
-    // Toolbox exports can drop the human-readable unit but retain its quantity
-    // code. Resolving it dynamically is already the established pattern; the
-    // sample-type detector below applies the same rule to type codes.
+    ParsedDefs {
+        defs: finish_defs(raw, 8),
+        rejected,
+    }
+}
+
+/// Resolves units for collected records. Toolbox exports can drop the
+/// human-readable unit but retain its quantity code; resolving it dynamically
+/// is the established pattern, and the sample-type detector applies the same
+/// rule to type codes. `name_offset` is where the UTF-16 name sits in a record.
+fn finish_defs(raw: Vec<(u32, String, &[u8])>, name_offset: usize) -> Vec<RawChannelDef<'_>> {
     let records: Vec<&[u8]> = raw.iter().map(|(_, _, record)| *record).collect();
-    let def_layout = DefLayout::detect(&records, 8);
+    let def_layout = DefLayout::detect(&records, name_offset);
     raw.into_iter()
         .map(|(id, name, record)| {
             let (unit, unit_source) = def_layout.resolve(record);
@@ -903,21 +955,48 @@ impl CosworthFile {
         let marked = if spec.marker {
             marker_defs(&data, layout)
         } else {
-            Vec::new()
+            ParsedDefs {
+                defs: Vec::new(),
+                rejected: 0,
+            }
         };
-        let is_export = marked.is_empty() && layout.defs_count <= 200;
-        let raw_defs = if marked.is_empty() {
+        let is_export = marked.defs.is_empty() && layout.defs_count <= 200;
+        let parsed = if marked.defs.is_empty() {
             markerless_defs(&data, layout)
         } else {
             marked
         };
+        // A definition region that was never written decodes to hundreds of
+        // implausible names and, by chance, a handful of short ASCII ones
+        // ("d", "TTTT"). When the rejects outnumber the accepted records the
+        // region is not a definition table and the survivors are noise, not
+        // channels. Unwritten (all-zero) slots do not count either way, so a
+        // sparse but clean table is still accepted.
+        let raw_defs = if parsed.rejected > parsed.defs.len() {
+            Vec::new()
+        } else {
+            parsed.defs
+        };
         if raw_defs.is_empty() {
             let trailing_zeros = data.iter().rev().take_while(|byte| **byte == 0).count();
+            let region_zero = zero_fraction(&data, layout.defs_offset, layout.chunk_offset);
             let message = if layout.defs_offset >= data.len() - trailing_zeros {
                 format!(
                     "no channel definitions found: the directory points into the zero-filled \
                      tail of the file (last {trailing_zeros} bytes), so the file was truncated \
                      or only partially copied"
+                )
+            } else if let Some(fraction) = region_zero.filter(|fraction| *fraction >= 0.25) {
+                format!(
+                    "no channel definitions found: the directory names {} definitions at \
+                     0x{:x} but that region is {:.0}% zero bytes and holds no readable \
+                     channel names, so the logger never wrote its index (the recording was \
+                     cut short before finalisation) and the {} sample bytes cannot be \
+                     attributed to channels",
+                    layout.defs_count,
+                    layout.defs_offset,
+                    fraction * 100.0,
+                    layout.defs_offset
                 )
             } else {
                 "no channel definitions found".to_owned()
@@ -1487,6 +1566,94 @@ mod tests {
             message.contains("truncated or only partially copied"),
             "{message}"
         );
+    }
+
+    /// Indianapolis 2025 test, CT3 Run007B (`250907110047_…_ST_MQ12Di_LMP2
+    /// #443.pds`, 21.3 MB): the directory at 0x80 is intact and names 1,021
+    /// definitions and 2,315 chunks, the sample area holds 20 MB of data, but
+    /// the 310 KB definition region is 53 % zero bytes and the rest is the
+    /// filler word `0x2710` plus stray sample bytes — the logger stopped before
+    /// writing its index. Read as UTF-16 that region decodes to runs of
+    /// U+2710 and a soup of halfwidth/fullwidth forms, with two records that
+    /// happen to spell `"d"` and `"TTTT"`. The markerless fallback used to
+    /// accept 568 of those as channels (duplicate ids, nonsense names) and the
+    /// file then failed deep in type resolution with "no sample-type field
+    /// agrees with the channel definition and chunk layout" — true, but
+    /// pointing at the wrong layer. This synthetic layout reproduces the
+    /// shape without the real bytes.
+    #[test]
+    fn unwritten_definition_region_is_reported_as_missing_index() {
+        let defs = 0x200usize;
+        let stride = 0xe0usize;
+        let declared = 300usize;
+        let chunks = defs + stride * declared;
+        let end = chunks + 0x80;
+        let mut data = vec![0u8; end + 0x80];
+        directory(&mut data, 0x80, defs as u32, declared as u32, 1, 2);
+        directory(&mut data, 0xa0, chunks as u32, 2, 3, 0);
+        directory(&mut data, 0xc0, end as u32, 0, 1, 0);
+        // Half the region: the 0x2710 filler word. A quarter: sample-like
+        // bytes that decode to halfwidth/fullwidth forms with the odd ASCII
+        // letter. Last quarter: zeros. Two slots spell plausible short names
+        // by accident.
+        for (index, slot) in (defs..chunks).step_by(stride).enumerate() {
+            let record = &mut data[slot..slot + stride];
+            match index * 4 / declared {
+                0 | 1 => record
+                    .chunks_exact_mut(2)
+                    .for_each(|b| b.copy_from_slice(&[0x10, 0x27])),
+                2 => record.iter_mut().enumerate().for_each(|(i, b)| {
+                    *b = [0x38, 0xff, 0x64, 0x00, 0xdc, 0xff, 0xd4, 0xfb][i % 8]
+                }),
+                _ => {}
+            }
+        }
+        for (slot, name) in [(defs + stride * 10, "d"), (defs + stride * 220, "TTTT")] {
+            data[slot..slot + stride].fill(0);
+            u32_at(&mut data, slot, 77);
+            utf16_at(&mut data, slot + 8, name);
+        }
+        // A believable chunk table pointing at real-looking floats, so the
+        // failure cannot come from the chunk side.
+        for index in 0..2usize {
+            let chunk = chunks + index * 0x40;
+            let ptr = end + index * 0x20;
+            u32_at(&mut data, chunk, index as u32);
+            u32_at(&mut data, chunk + 4, 771 + index as u32);
+            u32_at(&mut data, chunk + 8, 771 + index as u32);
+            u32_at(&mut data, chunk + 0x18, 10_000_000);
+            u32_at(&mut data, chunk + 0x1c, 4);
+            u32_at(&mut data, chunk + 0x38, ptr as u32);
+            for sample in 0..4 {
+                data[ptr + sample * 4..ptr + sample * 4 + 4]
+                    .copy_from_slice(&(sample as f32).to_le_bytes());
+            }
+        }
+        let error = CosworthFile::from_bytes("unwritten-defs.pds", data).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("no channel definitions found"),
+            "{message}"
+        );
+        assert!(
+            message.contains("names 300 definitions") && message.contains("never wrote its index"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("sample-type"),
+            "must not fail at type resolution on garbage definitions: {message}"
+        );
+    }
+
+    #[test]
+    fn channel_names_are_ascii_identifiers() {
+        assert!(plausible_channel_name("P_F_BRAKE"));
+        assert!(plausible_channel_name("Alarm ECP High"));
+        assert!(plausible_channel_name("Temp °C 2"));
+        assert!(!plausible_channel_name(""));
+        assert!(!plausible_channel_name("✐✐✐✐"));
+        assert!(!plausible_channel_name("Ｘdￜdﻔ"));
+        assert!(!plausible_channel_name("___"));
     }
 
     #[test]
