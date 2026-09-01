@@ -582,6 +582,23 @@ fn unitless_channels_are_read_by_range_and_laps_fill_the_gaps() {
     let slow = build(vec![("Speed", "", t(&|_| 90.0))]);
     assert_eq!(slow.normalizer().units().speed, None);
     assert_eq!(slow.normalizer().sample(1_000_000_000).speed_mps, None);
+    // ...and then a lower-priority GPS speed with a declared unit is used.
+    let gps = build(vec![
+        ("Speed_Wspd_App", "", t(&|_| 90.0)),
+        ("GPS Speed", "m/s", t(&|_| 25.0)),
+    ]);
+    let n = gps.normalizer();
+    assert_eq!(n.roles().speed, Some(1));
+    assert_eq!(n.sample(1_000_000_000).speed_mps, Some(25.0));
+    // But a provably-km/h dash speed outranks GPS by priority.
+    let dash = build(vec![
+        ("Speed_Wspd_App", "", t(&|_| 180.0)),
+        ("GPS Speed", "m/s", t(&|_| 25.0)),
+    ]);
+    let n = dash.normalizer();
+    assert_eq!(n.roles().speed, Some(0));
+    assert_eq!(n.units().speed.as_deref(), Some("km/h"));
+    assert!((n.sample(1_000_000_000).speed_mps.unwrap() - 50.0).abs() < 1e-9);
 
     // Without any timer or counter channel the same values come from the laps.
     let bare = Synthetic {

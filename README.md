@@ -157,7 +157,7 @@ for lap in recording.metadata().laps.iter().filter(|lap| lap.kind.is_flying()) {
 
 | Field | Unit | What it is | Resolved from (first match wins) |
 |---|---|---|---|
-| `speed_mps` | m/s | vehicle speed | `Ground Speed`, `Speed_Ref`, `Corr Speed`, `Vehicle_Speed`, `Speed_Wspd_App`, `vehRefSpeed`, `vCar`, `GPS Speed`, `Speed`, `velocity kmh` — a candidate with a convertible unit outranks a unitless one |
+| `speed_mps` | m/s | vehicle speed | `Ground Speed`, `Speed_Ref`, `Corr Speed`, `Vehicle_Speed`, `Speed_Wspd_App`, `vehRefSpeed`, `vCar`, `GPS Speed`, `Speed`, `velocity kmh` — first candidate in this order whose unit is declared *or* provable from its range wins (a dash's unitless wheel speed reaching 270 outranks a gappy GPS speed in m/s) |
 | `throttle_fraction` | 0–1 | driver throttle demand (pedal), not throttle-plate | `Driver Throttle Pos`, `Throttle Pedal`, `Pedal_Pos`, `PPS`, `Throttle Pos`, `Throttle`, `TPS` |
 | `brake_fraction` | 0–1 | brake **pedal position** | `Brake Pedal Pos`, `Brake Pedal`, `Brake Pos`, `Brake` |
 | `brake_pressure_bar` | bar | brake **line pressure** (front or total) | `Driver Brake Pressure`, `Brake_Pressure_Front`, `P_F_BRAKE`, `P_Brake_Front`, `Brake Pressure` |

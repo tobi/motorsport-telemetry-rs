@@ -396,7 +396,42 @@ pub trait SourceExt: TelemetrySource {
     where
         Self: Sized,
     {
-        TelemetryNormalizer::new(self, self.signal_roles(), self.match_track())
+        TelemetryNormalizer::new(self, self.resolved_roles(), self.match_track())
+    }
+
+    /// [`Self::signal_roles`] with the speed role settled the way the
+    /// normalizer will read it: the highest-priority speed channel whose unit
+    /// is declared **or provable from its value range** (see [`RoleUnits`]).
+    ///
+    /// Name-only inference prefers any channel with a declared unit, which on
+    /// an AiM dash picks the 25 Hz `GPS Speed` (m/s, with dropouts) over the
+    /// dash's own unitless wheel speed. Once the range proves that channel is
+    /// km/h it is the better source and outranks GPS by priority.
+    fn resolved_roles(&self) -> SignalRoles
+    where
+        Self: Sized,
+    {
+        let mut roles = self.signal_roles();
+        let channels = self.channels();
+        for name in SPEED_NAMES {
+            let Some(index) = channels
+                .iter()
+                .position(|channel| channel.sample_count > 0 && names::eq(&channel.name, name))
+            else {
+                continue;
+            };
+            let unit = channels[index].unit.trim();
+            let resolvable = if unit.is_empty() {
+                channel_extent(self, index).is_some_and(|(_, max)| max > 130.0)
+            } else {
+                motorsport_telemetry_core::can_convert(unit, "m/s")
+            };
+            if resolvable {
+                roles.speed = Some(index);
+                break;
+            }
+        }
+        roles
     }
 
     /// Matches sampled GPS positions to the nearest track within 50 km.
