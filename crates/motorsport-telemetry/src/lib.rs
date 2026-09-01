@@ -512,8 +512,11 @@ pub struct SignalRoles {
     pub speed: Option<usize>,
     /// Driver throttle pedal channel.
     pub throttle: Option<usize>,
-    /// Driver brake pedal channel.
+    /// Driver brake pedal *position* channel (a fraction or percent).
     pub brake: Option<usize>,
+    /// Brake line pressure channel (a pressure unit), when the source logs
+    /// hydraulic pressure instead of or in addition to pedal travel.
+    pub brake_pressure: Option<usize>,
     /// Driver clutch pedal channel.
     pub clutch: Option<usize>,
     /// Handwheel / steering-angle channel.
@@ -534,18 +537,27 @@ pub struct SignalRoles {
     pub longitude: Option<usize>,
 }
 
-/// Format-neutral values sampled at one file-relative timestamp.
+/// Format-neutral values sampled at one file-relative timestamp — the
+/// "blessed channels" every client can rely on regardless of logger.
 ///
-/// Values remain `None` when no suitable source channel exists or its unit
-/// cannot be converted safely.
+/// Units are fixed per field (m/s, 0–1, deg, rpm, bar, s). A field is `Some`
+/// only when the source declares a convertible unit, or — for a channel that
+/// declares none — when its value range leaves exactly one physical reading
+/// (see [`RoleUnits`]). Otherwise it stays `None`; nothing is guessed. The
+/// full contract, per-format availability and inference rules are in the
+/// crate README under "The client contract".
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NormalizedSample {
     /// Speed in metres per second.
     pub speed_mps: Option<f64>,
     /// Throttle pedal in the inclusive range `0.0..=1.0`.
     pub throttle_fraction: Option<f64>,
-    /// Brake pedal in the inclusive range `0.0..=1.0`.
+    /// Brake pedal in the inclusive range `0.0..=1.0`. Pedal position only;
+    /// a source that logs pressure alone leaves this `None` and fills
+    /// [`Self::brake_pressure_bar`].
     pub brake_fraction: Option<f64>,
+    /// Front (or total) brake line pressure in bar, when the source logs it.
+    pub brake_pressure_bar: Option<f64>,
     /// Clutch pedal in the inclusive range `0.0..=1.0`.
     pub clutch_fraction: Option<f64>,
     /// Steering wheel angle in degrees (positive as the source reports).
@@ -589,6 +601,39 @@ pub struct TelemetryNormalizer<'a> {
     track: Option<TrackContext>,
     laps: OnceLock<Vec<motorsport_telemetry_core::LapMetadata>>,
     clock: OnceLock<Option<(i128, String)>>,
+    units: OnceLock<RoleUnits>,
+}
+
+/// The unit each role is read in: the channel's declared unit, or — for a
+/// channel that declares none — the unit its value range proves.
+///
+/// Declared units always win. Inference runs only on unitless channels
+/// (AiM `aimd` CAN echoes, VBOX CAN columns, stripped exports) and only where
+/// the physical range leaves one reading: a pedal that reaches 99 is percent,
+/// a steering trace spanning 300 is degrees not radians, an engine speed
+/// topping 7981 is rpm not rad/s, a lap timer counting to 331460 is
+/// milliseconds. Where the range is ambiguous the role stays unresolved and
+/// the sample field is `None`. Ranges come from at most 4096 probes per
+/// channel, taken once per normalizer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoleUnits {
+    /// Unit `speed_mps` converts from.
+    pub speed: Option<String>,
+    /// Unit `throttle_fraction` converts from (`%`, `ratio`, or an angle for
+    /// Cosworth pedals, see [`NormalizedSample::throttle_fraction`]).
+    pub throttle: Option<String>,
+    /// Unit `brake_fraction` converts from.
+    pub brake: Option<String>,
+    /// Unit `brake_pressure_bar` converts from.
+    pub brake_pressure: Option<String>,
+    /// Unit `clutch_fraction` converts from.
+    pub clutch: Option<String>,
+    /// Unit `steering_deg` converts from.
+    pub steering: Option<String>,
+    /// Unit `rpm` converts from.
+    pub rpm: Option<String>,
+    /// Unit `lap_time_s` converts from.
+    pub lap_time: Option<String>,
 }
 
 impl std::fmt::Debug for TelemetryNormalizer<'_> {
@@ -614,7 +659,14 @@ impl<'a> TelemetryNormalizer<'a> {
             track,
             laps: OnceLock::new(),
             clock: OnceLock::new(),
+            units: OnceLock::new(),
         }
+    }
+
+    /// The unit each role is read in, declared or inferred (see [`RoleUnits`]).
+    pub fn units(&self) -> &RoleUnits {
+        self.units
+            .get_or_init(|| resolve_role_units(self.source, &self.roles))
     }
 
     /// Returns the channel roles used by this normalizer.
@@ -641,7 +693,75 @@ impl<'a> TelemetryNormalizer<'a> {
                 lap_at(laps, time_ns)
             },
             self.clock.get_or_init(|| file_clock(self.source)).as_ref(),
+            self.units(),
         )
+    }
+}
+
+/// Bounded value range of a channel: at most 4096 evenly spaced probes.
+fn channel_extent(source: &dyn TelemetrySource, index: usize) -> Option<(f64, f64)> {
+    let channel = source.channels().get(index)?;
+    if channel.sample_count == 0 || channel.duration_ns == 0 {
+        return None;
+    }
+    let start = channel.chunks.first().map_or(0, |chunk| chunk.time_base_ns);
+    let span = channel.duration_ns.saturating_sub(start);
+    let probes = channel.sample_count.clamp(1, 4096);
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for probe in 0..probes {
+        let at = start + (u128::from(span) * u128::from(probe) / u128::from(probes)) as u64;
+        if let Some(value) = source
+            .sample_at(index, at, false)
+            .filter(|value| value.is_finite())
+        {
+            min = min.min(value);
+            max = max.max(value);
+        }
+    }
+    (min <= max).then_some((min, max))
+}
+
+fn resolve_role_units(source: &dyn TelemetrySource, roles: &SignalRoles) -> RoleUnits {
+    let declared = |index: usize| {
+        let unit = source.channels()[index].unit.trim();
+        (!unit.is_empty()).then(|| unit.to_owned())
+    };
+    let extent = |index: usize| channel_extent(source, index);
+    let resolve = |index: Option<usize>, infer: &dyn Fn((f64, f64)) -> Option<&'static str>| {
+        let index = index?;
+        declared(index).or_else(|| infer(extent(index)?).map(str::to_owned))
+    };
+    let pedal = |(min, max): (f64, f64)| -> Option<&'static str> {
+        if min < -0.05 {
+            None
+        } else if max <= 1.05 && max > 0.0 {
+            Some("ratio")
+        } else if max <= 105.0 && max > 1.05 {
+            Some("%")
+        } else {
+            None
+        }
+    };
+    RoleUnits {
+        // A unitless speed above 130 cannot be m/s (468 km/h); below that
+        // km/h and m/s overlap and nothing is inferred.
+        speed: resolve(roles.speed, &|(_, max)| (max > 130.0).then_some("km/h")),
+        throttle: resolve(roles.throttle, &pedal),
+        brake: resolve(roles.brake, &pedal),
+        // Pressure ranges overlap between bar and psi; never inferred.
+        brake_pressure: resolve(roles.brake_pressure, &|_| None),
+        clutch: resolve(roles.clutch, &pedal),
+        // A trace exceeding 2π in magnitude cannot be radians of steering.
+        steering: resolve(roles.steering, &|(min, max)| {
+            (max.abs().max(min.abs()) > std::f64::consts::TAU).then_some("deg")
+        }),
+        // Engine speed above 3000 is rpm; rad/s tops out near 1000 (9550 rpm).
+        rpm: resolve(roles.rpm, &|(_, max)| (max > 3000.0).then_some("rpm")),
+        // Mirrors the lap recovery rule for unitless dash timers.
+        lap_time: resolve(roles.lap_time, &|(_, max)| {
+            Some(if max > 1000.0 { "ms" } else { "s" })
+        }),
     }
 }
 
@@ -660,49 +780,66 @@ fn normalize_sample(
     track: Option<&TrackContext>,
     lap_lookup: impl FnOnce() -> Option<motorsport_telemetry_core::LapMetadata>,
     clock: Option<&(i128, String)>,
+    units: &RoleUnits,
 ) -> NormalizedSample {
     let value = |index: Option<usize>, linear| {
         index
             .and_then(|index| source.sample_at(index, time_ns, linear))
             .filter(|value| value.is_finite())
     };
+    fn unit(unit: &Option<String>) -> &str {
+        unit.as_deref().unwrap_or("")
+    }
     let speed_mps = roles.speed.and_then(|index| {
         let raw = value(Some(index), true)?;
-        normalize_speed(raw, &source.channels()[index].unit)
+        normalize_speed(raw, unit(&units.speed))
     });
-    let throttle_fraction = roles.throttle.and_then(|index| {
-        normalize_fraction(value(Some(index), true)?, &source.channels()[index].unit)
+    let throttle_fraction = roles
+        .throttle
+        .and_then(|index| normalize_fraction(value(Some(index), true)?, unit(&units.throttle)));
+    let brake_fraction = roles
+        .brake
+        .and_then(|index| normalize_fraction(value(Some(index), true)?, unit(&units.brake)));
+    let brake_pressure_bar = roles.brake_pressure.and_then(|index| {
+        let raw = value(Some(index), true)?;
+        motorsport_telemetry_core::convert(raw, unit(&units.brake_pressure), "bar").ok()
     });
-    let brake_fraction = roles.brake.and_then(|index| {
-        normalize_fraction(value(Some(index), true)?, &source.channels()[index].unit)
-    });
-    let clutch_fraction = roles.clutch.and_then(|index| {
-        normalize_fraction(value(Some(index), true)?, &source.channels()[index].unit)
-    });
-    let steering_deg = roles.steering.and_then(|index| {
-        normalize_angle_deg(value(Some(index), true)?, &source.channels()[index].unit)
-    });
+    let clutch_fraction = roles
+        .clutch
+        .and_then(|index| normalize_fraction(value(Some(index), true)?, unit(&units.clutch)));
+    let steering_deg = roles
+        .steering
+        .and_then(|index| normalize_angle_deg(value(Some(index), true)?, unit(&units.steering)));
     let gear = value(roles.gear, false).map(|value| value.round() as i64);
-    let rpm = roles.rpm.and_then(|index| {
-        normalize_rpm(value(Some(index), false)?, &source.channels()[index].unit)
-    });
+    let rpm = roles
+        .rpm
+        .and_then(|index| normalize_rpm(value(Some(index), false)?, unit(&units.rpm)));
     let latitude_deg = roles.latitude.and_then(|index| {
         normalize_coordinate(value(Some(index), true)?, &source.channels()[index].unit)
     });
     let longitude_deg = roles.longitude.and_then(|index| {
         normalize_longitude(value(Some(index), true)?, &source.channels()[index].unit)
     });
-    let stint_lap_number = value(roles.lap_number, false).map(|value| value.round() as i64);
     let lap = lap_lookup();
+    let stint_lap_number = value(roles.lap_number, false)
+        .map(|value| value.round() as i64)
+        .or_else(|| lap.as_ref().map(|lap| lap.stint_lap));
     let lap_number = lap.as_ref().map(|lap| lap.number).or(stint_lap_number);
     let stint = lap.as_ref().map(|lap| lap.stint);
     let lap_kind = lap.as_ref().map(|lap| lap.kind);
     let lap_label = lap
         .as_ref()
         .map(motorsport_telemetry_core::LapMetadata::label);
-    let lap_time_s = roles.lap_time.and_then(|index| {
-        normalize_duration_s(value(Some(index), true)?, &source.channels()[index].unit)
-    });
+    // The dash's running lap timer when it has one; otherwise time since the
+    // classified lap's start, which is the same quantity to the resolution
+    // of the lap boundary.
+    let lap_time_s = roles
+        .lap_time
+        .and_then(|index| normalize_duration_s(value(Some(index), true)?, unit(&units.lap_time)))
+        .or_else(|| {
+            lap.as_ref()
+                .map(|lap| time_ns.saturating_sub(lap.start_ns) as f64 / 1e9)
+        });
     let lap_progress = roles
         .lap_distance
         .and_then(|index| {
@@ -735,6 +872,7 @@ fn normalize_sample(
         speed_mps,
         throttle_fraction,
         brake_fraction,
+        brake_pressure_bar,
         clutch_fraction,
         steering_deg,
         gear,
@@ -1028,13 +1166,21 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
                 "brakepedalpos",
                 "brakepedal",
                 "brakepos",
+                "brakepedalposition",
+                "brake",
+            ],
+        ),
+        brake_pressure: find_sampled(
+            channels,
+            &[
                 "driverbrakepressure",
-                "brakepressure",
                 "brakepressurefront",
+                "brakepressuref",
                 "pbrakefront",
                 "pfbrake",
                 "pbrakef",
-                "brake",
+                "brakepressure",
+                "brakepress",
             ],
         ),
         clutch: find_sampled(
@@ -1150,6 +1296,11 @@ fn normalize_fraction(value: f64, unit: &str) -> Option<f64> {
     match unit.trim().to_ascii_lowercase().as_str() {
         "%" | "percent" => Some((value / 100.0).clamp(0.0, 1.0)),
         "ratio" | "fraction" => Some(value.clamp(0.0, 1.0)),
+        // Cosworth PDS stores pedal position as an *angle* whose value in
+        // degrees is the percent (`PPS` 0.035..1.763 rad = 2..101 deg): the
+        // quantity code is angle, the meaning is pedal travel.
+        "rad" | "radian" | "radians" => Some((value.to_degrees() / 100.0).clamp(0.0, 1.0)),
+        "deg" | "degree" | "degrees" | "°" => Some((value / 100.0).clamp(0.0, 1.0)),
         _ => None,
     }
 }
@@ -1316,7 +1467,8 @@ mod tests {
         let name = |index: Option<usize>| index.map(|index| channels[index].name.as_str());
         assert_eq!(name(roles.speed), Some("Speed_Wspd_App"));
         assert_eq!(name(roles.throttle), Some("PPS"));
-        assert_eq!(name(roles.brake), Some("P_F_BRAKE"));
+        assert_eq!(name(roles.brake), None, "pressure is not a pedal position");
+        assert_eq!(name(roles.brake_pressure), Some("P_F_BRAKE"));
         assert_eq!(name(roles.steering), Some("STEER"));
         assert_eq!(name(roles.rpm), Some("RPM"));
         assert_eq!(name(roles.gear), Some("gear_pos"));
@@ -1373,7 +1525,8 @@ mod tests {
         let name = |index: Option<usize>| index.map(|index| channels[index].name.as_str());
         assert_eq!(name(roles.speed), Some("Vehicle_Speed"));
         assert_eq!(name(roles.rpm), Some("Engine_Speed"));
-        assert_eq!(name(roles.brake), Some("Brake_Pressure_Front"));
+        assert_eq!(name(roles.brake), None);
+        assert_eq!(name(roles.brake_pressure), Some("Brake_Pressure_Front"));
         assert_eq!(name(roles.throttle), Some("Throttle_Pedal"));
         assert_eq!(name(roles.steering), Some("Steering_Angle"));
     }

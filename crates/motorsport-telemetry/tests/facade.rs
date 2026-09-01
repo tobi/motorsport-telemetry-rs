@@ -456,3 +456,144 @@ fn legacy_zip_and_zstd_mtj_telemetry_files_open_side_by_side() {
     assert!(modern_report.compressed);
     assert_eq!(legacy_report.laps, modern_report.laps);
 }
+
+/// A source whose channels declare no unit (AiM CAN echoes, VBOX CAN columns)
+/// plus a Cosworth-style pedal-as-angle channel. The normalizer must read the
+/// pedal, steering, rpm and lap time by their proven ranges, keep the pressure
+/// unresolved, and fall back to the classified laps for the running lap time
+/// and the stint lap counter.
+#[test]
+fn unitless_channels_are_read_by_range_and_laps_fill_the_gaps() {
+    use motorsport_telemetry::motorsport_telemetry_core::{Channel, Chunk, SampleType, UnitSource};
+    struct Synthetic {
+        channels: Vec<Channel>,
+        values: Vec<Vec<f64>>,
+    }
+    impl TelemetrySource for Synthetic {
+        fn path(&self) -> &str {
+            "unitless"
+        }
+        fn format(&self) -> &'static str {
+            "synthetic"
+        }
+        fn channels(&self) -> &[Channel] {
+            &self.channels
+        }
+        fn decode(&self, c: usize, _: usize, i: u64) -> f64 {
+            self.values[c][i as usize]
+        }
+    }
+    let n = 120u64; // 1 s samples, 120 s
+    let mk = |id: u32, name: &str, unit: &str| Channel {
+        id,
+        name: name.into(),
+        unit: unit.into(),
+        unit_source: if unit.is_empty() {
+            UnitSource::Unknown
+        } else {
+            UnitSource::Declared
+        },
+        sample_type: SampleType::F64,
+        chunks: vec![Chunk {
+            sample_period_ns: 1_000_000_000,
+            sample_count: n,
+            data_ptr: 0,
+            sample_base: 0,
+            time_base_ns: 0,
+        }],
+        sample_count: n,
+        duration_ns: n * 1_000_000_000,
+    };
+    let t = |f: &dyn Fn(u64) -> f64| (0..n).map(f).collect::<Vec<_>>();
+    let build = |specs: Vec<(&str, &str, Vec<f64>)>| Synthetic {
+        channels: specs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, unit, _))| mk(i as u32, name, unit))
+            .collect(),
+        values: specs.into_iter().map(|(_, _, v)| v).collect(),
+    };
+    let source = build(vec![
+        // Lap counter 1,2,3 every 40 s; unitless lap timer in milliseconds.
+        ("Lap_Number", "", t(&|i| (1 + i / 40) as f64)),
+        (
+            "Current_Lap_Time",
+            "",
+            t(&|i| ((i % 40) * 1000 + 50) as f64),
+        ),
+        ("Speed_Wspd_App", "", t(&|_| 180.0)), // km/h by range
+        ("STEER_001", "", t(&|i| (i as f64 - 60.0) * 3.0)), // -180..177 -> degrees
+        ("RPM", "", t(&|_| 6500.0)),           // rpm by range
+        ("P_Brake_Front", "", t(&|_| 45.0)),   // pressure: never inferred
+        ("PPS", "rad", t(&|_| 50.0_f64.to_radians())), // Cosworth angle-pedal: 50 deg = 50 %
+    ]);
+    let normalizer = source.normalizer();
+    let units = normalizer.units();
+    assert_eq!(units.speed.as_deref(), Some("km/h"));
+    assert_eq!(
+        units.throttle.as_deref(),
+        Some("rad"),
+        "declared unit is kept"
+    );
+    assert_eq!(units.steering.as_deref(), Some("deg"));
+    assert_eq!(units.rpm.as_deref(), Some("rpm"));
+    assert_eq!(units.lap_time.as_deref(), Some("ms"));
+    assert_eq!(
+        units.brake_pressure, None,
+        "bar vs psi is ambiguous without a unit"
+    );
+
+    let sample = normalizer.sample(50_000_000_000); // 50 s: lap 2, 10 s in
+    assert!((sample.speed_mps.unwrap() - 50.0).abs() < 1e-9);
+    assert!(
+        (sample.throttle_fraction.unwrap() - 0.5).abs() < 1e-9,
+        "50 deg of pedal angle is 50 %"
+    );
+    assert!((sample.steering_deg.unwrap() - (-30.0)).abs() < 1e-9);
+    assert_eq!(sample.rpm, Some(6500.0));
+    assert_eq!(sample.brake_pressure_bar, None);
+    assert!(
+        (sample.lap_time_s.unwrap() - 10.05).abs() < 1e-9,
+        "unitless ms timer"
+    );
+    assert_eq!(sample.stint_lap_number, Some(2));
+    assert_eq!(sample.lap_number, Some(2));
+    assert_eq!(sample.lap_label.as_deref(), Some("S1 L2"));
+
+    // A unitless pedal that reaches 99 is percent; one that never exceeds 1 is a ratio.
+    let percent = build(vec![("Pedal_Pos", "", t(&|i| (i % 100) as f64))]);
+    assert_eq!(percent.normalizer().units().throttle.as_deref(), Some("%"));
+    assert!(
+        (percent
+            .normalizer()
+            .sample(50_000_000_000)
+            .throttle_fraction
+            .unwrap()
+            - 0.5)
+            .abs()
+            < 1e-9
+    );
+    let ratio = build(vec![("Pedal_Pos", "", t(&|i| (i % 100) as f64 / 100.0))]);
+    assert_eq!(
+        ratio.normalizer().units().throttle.as_deref(),
+        Some("ratio")
+    );
+    // A unitless speed that never exceeds 130 is ambiguous and stays None.
+    let slow = build(vec![("Speed", "", t(&|_| 90.0))]);
+    assert_eq!(slow.normalizer().units().speed, None);
+    assert_eq!(slow.normalizer().sample(1_000_000_000).speed_mps, None);
+
+    // Without any timer or counter channel the same values come from the laps.
+    let bare = Synthetic {
+        channels: source.channels()[2..].to_vec(),
+        values: source.values[2..].to_vec(),
+    };
+    let bare_n = bare.normalizer();
+    let s = bare_n.sample(50_000_000_000);
+    assert_eq!(
+        s.lap_number, None,
+        "no laps at all without a counter or timer"
+    );
+    assert_eq!(s.lap_time_s, None);
+    assert!((s.throttle_fraction.unwrap() - 0.5).abs() < 1e-9);
+}

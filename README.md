@@ -113,37 +113,187 @@ fault; ordinary warnings keep the file usable.
 signal roles and track context once, and lazily computes lap metadata at most
 once when lap progress needs that fallback.
 
-## Core channels
+## The client contract: blessed channels, laps, video, clocks
 
-`SourceExt::normalizer().sample(time_ns)` is the stable way to read the
-driver-facing signals. Names are matched after stripping punctuation and case;
-units are converted only when the registry can do so honestly. Missing or
-incompatible inputs stay `None`.
+Everything a client application needs is on this page. Two rules hold across
+every format:
 
-| Role | `NormalizedSample` field | Unit | Typical source names |
+1. **Source-exact first.** `TelemetrySource::channels()` / `sample_at()`
+   return what the file stored, in its own units (`Channel::unit`, provenance
+   in `unit_source`). Nothing is renamed or rescaled behind your back.
+2. **Blessed channels on top.** `SourceExt::normalizer().sample(time_ns)`
+   returns a [`NormalizedSample`](crates/motorsport-telemetry/src/lib.rs) with
+   a fixed set of fields in fixed units, resolved from the source's channel
+   names and units. A field is `Some` only when the library can stand behind
+   the number; otherwise it is `None` — never a guess.
+
+Everything below is in **file-relative integer nanoseconds** (`time_ns`,
+`start_ns`, `end_ns`, `duration_ns`): zero is the first sample of the
+recording, and there is no other time axis inside a file.
+
+```rust,no_run
+use motorsport_telemetry::{open, motorsport_telemetry_core::TelemetrySource, SourceExt};
+
+let recording = open("run.mp4")?;                 // .pds .ld .vbo .mp4 .telemetry
+let normalizer = recording.normalizer();
+for lap in recording.metadata().laps.iter().filter(|lap| lap.kind.is_flying()) {
+    let mid = (lap.start_ns + lap.end_ns) / 2;
+    let s = normalizer.sample(mid);
+    println!(
+        "{:<8} {:>6.2}s  {:>5.1} km/h  thr {:.0}%  brake {:?} bar  gear {:?}  frame {:?}",
+        lap.label(),
+        lap.duration_ns as f64 / 1e9,
+        s.speed_mps.unwrap_or(f64::NAN) * 3.6,
+        s.throttle_fraction.unwrap_or(f64::NAN) * 100.0,
+        s.brake_pressure_bar,
+        s.gear,
+        recording.video_frame_at(mid),
+    );
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### Blessed channels (`NormalizedSample`)
+
+| Field | Unit | What it is | Resolved from (first match wins) |
 |---|---|---|---|
-| Speed | `speed_mps` | m/s | `Speed`, `Ground Speed`, `GPS Speed` |
-| Throttle | `throttle_fraction` | 0–1 | `Throttle Pos`, `Throttle Pedal` |
-| Brake | `brake_fraction` | 0–1 | `Brake Pedal Pos`, `Brake` |
-| Clutch | `clutch_fraction` | 0–1 | `Clutch Pos`, `Clutch Pedal` |
-| Steering | `steering_deg` | deg | `Steering Angle`, `SW Angle` |
-| Gear | `gear` | count | `Gear`, `Gear Pos` |
-| RPM | `rpm` | rpm | `RPM`, `Engine RPM` |
-| Lap number | `lap_number` | count | virtual session lap from the classified laps (see below); falls back to the counter |
-| Stint lap | `stint_lap_number` | count | `Lap Number`, `Current Lap` — the dash's own counter, which restarts per stint |
-| Stint / kind / label | `stint`, `lap_kind`, `lap_label` | — | from the containing classified lap: `S2 L3`, `S1 in`, `S1 pit L5` |
-| Lap progress | `lap_progress` | 0–1 | see below |
-| Current lap time | `lap_time_s` | s | `Lap Time`, `Current Lap Time` |
-| Latitude | `latitude_deg` | deg | `GPS Latitude` |
-| Longitude | `longitude_deg` | deg | `GPS Longitude` |
-| Time of day | `time_of_day_ns` | ns since midnight | GPS/UTC clock, or VBOX time-of-day |
-| Absolute time | `absolute_time_ns` | ns on the source clock | same clock + file-relative time |
+| `speed_mps` | m/s | vehicle speed | `Ground Speed`, `Speed_Ref`, `Corr Speed`, `Vehicle_Speed`, `Speed_Wspd_App`, `vehRefSpeed`, `vCar`, `GPS Speed`, `Speed`, `velocity kmh` — a candidate with a convertible unit outranks a unitless one |
+| `throttle_fraction` | 0–1 | driver throttle demand (pedal), not throttle-plate | `Driver Throttle Pos`, `Throttle Pedal`, `Pedal_Pos`, `PPS`, `Throttle Pos`, `Throttle`, `TPS` |
+| `brake_fraction` | 0–1 | brake **pedal position** | `Brake Pedal Pos`, `Brake Pedal`, `Brake Pos`, `Brake` |
+| `brake_pressure_bar` | bar | brake **line pressure** (front or total) | `Driver Brake Pressure`, `Brake_Pressure_Front`, `P_F_BRAKE`, `P_Brake_Front`, `Brake Pressure` |
+| `clutch_fraction` | 0–1 | clutch pedal | `Clutch Pos`, `Clutch Pedal`, `Clutch` |
+| `steering_deg` | deg, sign as logged | steering-wheel angle | `Steering Angle`, `Steer Angle`, `Handwheel Angle`, `SW Angle`, `STEER`, `STEER_001` |
+| `gear` | count | selected gear as logged (0/neutral and reverse conventions are the logger's) | `Gear Pos`, `Selected Gear`, `nGear`, `Gear` |
+| `rpm` | rpm | engine speed | `Engine RPM`, `Eng Speed`, `RPM`, `nmot` |
+| `lap_number` | count, 1-based | **virtual session lap**: strictly increasing across the whole recording and every stint (§ Laps). Falls back to the raw counter only when the recording has no laps at all | `FileMetadata::laps` |
+| `stint_lap_number` | count | the number the dash displayed: the vendor counter, which restarts per stint (0 on an AiM out-lap). Falls back to the classified lap's `stint_lap` when there is no counter channel | `Lap Number`, `Lap_Number`, `Lap Count`, `Current Lap`, `Lap` |
+| `stint` | 1-based | stint index of the containing lap | `FileMetadata::laps` |
+| `lap_kind` | `LapKind` | `Flying`, `Out`, `In`, `OutIn`, `Pit` (§ Laps) | `FileMetadata::laps` |
+| `lap_label` | text | `S1 out`, `S2 L3`, `S1 pit L5` | `FileMetadata::laps` |
+| `lap_progress` | 0–1 | position within the current lap | lap-distance/progress channel → GPS on the matched centerline → time fraction of the classified lap |
+| `lap_time_s` | s | running time within the current lap | `Current Lap Time`, `Lap Time`; otherwise `time_ns − lap.start_ns` of the classified lap |
+| `latitude_deg` / `longitude_deg` | deg, WGS84, east-positive | GPS fix; pass-cleaned copies (`GPS Latitude Clean`) preferred | `GPS Latitude`/`Longitude`, `latitude`/`longitude` (VBOX arc-minutes are converted and west-positive longitude flipped) |
+| `time_of_day_ns` | ns since local midnight on the source clock | wall clock | GPS / UTC clock, VBOX time-of-day |
+| `absolute_time_ns` | ns on the source clock | `file_relative + clock_offset` | see § Clocks |
 
-Lap progress is the trickiest role. The normalizer tries, in order:
+Name matching ignores case, spaces and punctuation (`Brake_Pressure_Front` ≡
+`brakepressurefront`). The per-role result is visible: `normalizer.roles()`
+tells you which channel index was chosen for each field, `normalizer.units()`
+which unit it is read in.
 
-1. A lap-distance or lap-progress channel (`Lap Distance Corrected`, `%` progress, …).
-2. GPS projected onto a matched track centerline.
-3. Time through the current derived lap (`(t - lap.start) / lap.duration`). That last step is what you get from speed and time when there is no GPS: first recover lap bounds, then treat the lap as a time interval.
+**Units are never guessed from names.** Declared units convert through the
+registry (`rad/s` → rpm, `Pa` → bar, `kmh` → m/s, arc-minutes → degrees).
+Two documented exceptions make real dash data usable:
+
+- **Cosworth pedals are angles.** Pi/Cosworth PDS stores `PPS`/`TPS` with the
+  quantity code *angle*: 0.035–1.763 rad = 2–101 **degrees**, and the degree
+  value is the percent. A pedal role whose channel declares an angle unit is
+  read as `degrees / 100`.
+- **Unitless channels are read by their value range, only where one reading
+  is physically possible.** AiM `aimd` CAN echoes and VBOX CAN columns carry
+  no unit string. For those channels (and only those) the normalizer probes
+  the channel's range once (≤ 4096 samples) and decides:
+
+  | Role | Range proves | Otherwise |
+  |---|---|---|
+  | pedal (throttle/brake/clutch) | max ≤ 1.05 → ratio; 1.05 < max ≤ 105 → percent | `None` |
+  | steering | max magnitude > 2π (6.28) → degrees (radians of steering never get there) | `None` |
+  | rpm | max > 3000 → rpm (rad/s tops out near 1000 ≈ 9550 rpm) | `None` |
+  | lap time | max > 1000 → milliseconds, else seconds | — |
+  | speed | max > 130 → km/h (m/s would be 468 km/h) | `None` (m/s and km/h overlap) |
+  | brake pressure | never (bar and psi overlap) | `None` |
+
+  `normalizer.units()` reports the inferred unit so a client can show or
+  override it. To force a unit, pass a `channel_map` rule (DuckDB) or rename
+  the channel yourself; the normalizer honours declared units first.
+
+What each format gives you (Oreca 07 LMP2 data as measured):
+
+| Field | AC sim MoTeC `.ld` | real MoTeC `.ld` export | Cosworth `.pds` | AiM `.mp4` (aimd) | VBOX `.vbo` |
+|---|---|---|---|---|---|
+| speed / throttle / steering / gear | ✓ | ✓ (gear absent in reduced exports) | ✓ (pedal = angle rule) | ✓ (range rule) | ✓ (range rule for steering) |
+| brake_fraction | ✓ | ✓ | – (pressure only) | – | – |
+| brake_pressure_bar | ✓ per wheel available raw | – | ✓ `P_F_BRAKE` Pa | – (unitless) | ✓ `bar` |
+| rpm | ✓ | – | ✓ (rad/s) | ✓ (range rule) | ✓ |
+| laps / stints / labels | ✓ (`Lap Progression` resets) | ✓ (LDX beacons) | ✓ (`Lap Number` + `Lap Time`) | ✓ (counter + timer, pit resets folded) | ✓ (GPS gate or counter) |
+| lap_progress | channel | time fraction | `Lap Distance` needs a track match, else time fraction | GPS on centerline | GPS on centerline |
+| latitude / longitude | – (world X/Y/Z only) | – | – (`FIA_Gps*` are flat) | ✓ | ✓ |
+| video | – | – | – | ✓ | ✓ when the VBOX recorded video |
+| time_of_day / absolute | ✓ (MoTeC date/time) | ✓ | ✓ (`Global Time`) | ✓ (GPS) | ✓ (GPS) |
+
+`.telemetry` files carry whatever their vendor source had; everything above
+survives the conversion.
+
+### Laps (`FileMetadata::laps`)
+
+`recording.metadata().laps` (or `read_lap_metadata(path)` without opening the
+samples) is a `Vec<LapMetadata>`, sorted by `start_ns`, gap-free within a
+stint:
+
+| Field | Meaning |
+|---|---|
+| `number` | virtual session lap, 1-based, strictly increasing over the whole recording. **Use this to identify a lap.** |
+| `stint` | 1-based stint index |
+| `stint_lap` | the dash's own counter value (0 for an AiM out-lap), or the position in the stint when no counter exists |
+| `kind` | `Flying` (beacon → beacon, moving) · `Out` (stint start → first beacon) · `In` (last beacon → stint end) · `OutIn` (a stint with no beacon) · `Pit` (beacon → beacon but ≥ 15 s standing still inside) |
+| `label()` | `S1 out`, `S1 L2`, `S2 L3`, `S1 pit L5` — stint-local numbers match the dash |
+| `start_ns`, `end_ns`, `duration_ns` | file-relative bounds; `complete` = both bounds are inside the recording |
+| `first_video_frame` | presentation-order frame at `start_ns`, when video is linked |
+
+`valid_laps` counts flying laps. `fastest_lap` is the shortest plausible
+**flying** lap — an in-lap fragment cut by a pit-box counter reset, or a lap
+with a stop in it, is never a candidate. Why this model exists: § Stints and
+lap kinds.
+
+### Video (`docs/VIDEO_SYNC.md`)
+
+For AiM MP4 recordings, VBOX video, and `.telemetry` converted from them:
+
+| Call on any opened source | Returns |
+|---|---|
+| `video_files()` | `VideoFileRef { filename, index, blake3, frame_count, presentation_offset_ns }` per linked file |
+| `video_frame_at(time_ns)` | presentation-order frame index for a telemetry instant |
+| `video_presentation_time_ns(time_ns)` | player seek position (`telemetry_ns + presentation_offset_ns`) |
+| `video_reference_at(time_ns)` | all of the above plus the source file index in one struct |
+| `video_frame_count()` / `video_presentation_times_ns()` | the stored per-frame timestamp table (frame rate is *not* assumed constant) |
+
+Never compute `time / frame_rate` yourself; MP4 edit lists shift the
+presentation timeline per file (101.3 ms and 104 ms measured on back-to-back
+files from one camera). The three rules are in
+[`docs/VIDEO_SYNC.md`](docs/VIDEO_SYNC.md).
+
+### Clocks and identity (`FileMetadata`)
+
+| Field | Meaning |
+|---|---|
+| `absolute_clock` / `absolute_start_ns` / `absolute_end_ns` | the source clock (`gps`, `utc`, MoTeC date+time) and the recording's span on it |
+| `clock_offset_ns` | `absolute_ns = file_relative_ns + clock_offset_ns` |
+| `utc_start_ns`, `timezone` | Unix-epoch ns at `t = 0` and the venue's IANA zone, when known (never invented) |
+| `session_key` | groups files of one outing across formats (`gps:<week>:<schema hash>`) — see § Multi-file sessions |
+| `identity` | driver, vehicle, venue, event, session, date, time as the file states them |
+| `driver_ids` / `driver_stints` | internal driver identifiers and their intervals |
+| `source_format` / `source_path` | for a `.telemetry`, the vendor format and path it was converted from |
+
+### Cost model
+
+| Call | Vendor file | `.telemetry` (zstd MTJ) |
+|---|---|---|
+| `read_metadata` / `read_lap_metadata` / `read_valid_laps` / `telemetry_format::read_channels` | mmap + index parse; speed probed for lap classification | **first two lines only** (~0.3 ms) |
+| `open()` + `channels()` | mmap, no decode | full decompress + parse (~0.4 s / 9 MB) |
+| `normalizer().sample()` | decodes the chosen channels at that instant | array lookup |
+
+Header-only reads are what the DuckDB extension's `telemetry_file_metadata`,
+`telemetry_laps` and `telemetry_metadata` use; a catalog scan never touches
+channel data.
+
+### Same contract in SQL
+
+The [DuckDB extension](https://github.com/tobi/duckdb_motorsport_telemetry)
+exposes the same model: `telemetry_laps(path)` is `FileMetadata::laps` with
+one row per lap (`lap_number`, `stint`, `stint_lap`, `kind`, `label`,
+`flying`, bounds), `telemetry_file_metadata(path)` is `FileMetadata`,
+`telemetry_metadata(path)` the channel directory, and `read_telemetry(path,
+channels := …)` the source-exact samples on a shared timeline.
 
 ### How laps are recovered
 
