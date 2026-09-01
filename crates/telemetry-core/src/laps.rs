@@ -7,15 +7,60 @@
 //!    LDX, a `.telemetry` catalog).
 //! 2. [`counter_laps`] — an incrementing counter. `Lap Number` wins only when
 //!    it actually counts (high-water >= 2); a 0/1 flag loses to
-//!    `beaconEventCount` / `lap_beacon` counts. Shutdown resets are ignored.
+//!    `beaconEventCount` / `lap_beacon` counts. A counter that drops and
+//!    stays down is a **stint boundary** (pit stop, logger restart): the
+//!    interval ending there is an in-lap, the one starting there an out-lap,
+//!    and the climb that follows is a new stint's laps. A drop that recovers
+//!    within [`RESET_CONFIRM_NS`] is a transient and ignored.
 //! 3. [`timer_reset_laps`] — a running timer or progress channel that resets.
 //! 4. Otherwise no laps.
 //!
-//! [`pick_laps`] applies that precedence; [`fastest_lap`] derives the fastest
-//! complete lap from the chosen laps and any reported previous-lap channel.
+//! [`pick_laps`] applies that precedence. [`classify_laps`] then turns the
+//! intervals into the normalised lap model: stints, [`LapKind`], the vendor
+//! counter as `stint_lap`, and a virtual session lap `number` that is
+//! monotonic across stints. [`fastest_lap`] derives the fastest *flying* lap
+//! from the classified laps and any reported previous-lap channel.
 
-use crate::metadata::{finite_i64, finite_u64, samples, LapMetadata, SourceLapMetadata};
-use crate::{names, TelemetrySource};
+use crate::metadata::{finite_i64, finite_u64, samples, LapKind, LapMetadata, SourceLapMetadata};
+use crate::motion::longest_stop_ns;
+use crate::{convert, names, TelemetrySource};
+
+/// A counter drop that has not recovered this long after it happened is a
+/// stint reset, not a transient glitch.
+pub(crate) const RESET_CONFIRM_NS: u64 = 5_000_000_000;
+/// Standing still at least this long inside an interval marks a pit stop.
+/// A driver-change or refuel stop is 30 s and up; a splash-and-go or a
+/// practice stop without killing the engine is around 15 s; nothing on a
+/// flying lap approaches it.
+pub(crate) const PIT_STOP_NS: u64 = 15_000_000_000;
+/// Unrecorded time between consecutive laps that separates two stints.
+pub(crate) const STINT_GAP_NS: u64 = 10_000_000_000;
+
+/// Speed channels used for stop detection, by [`names::eq`] spelling, in
+/// priority order. Only a channel with a unit convertible to m/s qualifies.
+pub(crate) const SPEED_NAMES: &[&str] = &[
+    "groundspeed",
+    "speedref",
+    "corrspeed",
+    "vehiclespeed",
+    "vehrefspeed",
+    "speedwspdapp",
+    "speed",
+    "gpsspeed",
+    "velocitykmh",
+];
+
+/// The best speed channel for motion checks, if any.
+pub(crate) fn speed_channel(source: &dyn TelemetrySource) -> Option<usize> {
+    let channels = source.channels();
+    SPEED_NAMES.iter().find_map(|wanted| {
+        channels.iter().position(|channel| {
+            channel.sample_count > 0
+                && names::eq(&channel.name, wanted)
+                && convert(1.0, &channel.unit, "m/s").is_ok()
+        })
+    })
+}
 
 const LAP_COUNTER_NAMES: &[&str] = &[
     "lapnumber",
@@ -117,6 +162,17 @@ fn select_lap_counter(
     }
 }
 
+/// One lap in progress while walking the counter.
+#[derive(Clone, Copy)]
+struct OpenLap {
+    /// Counter value (plus beacon-count offset) for this interval.
+    stint_lap: i64,
+    start_ns: u64,
+    /// True when the interval began at a counter increment (a beacon), false
+    /// when it began at the recording start or at a stint reset.
+    starts_at_beacon: bool,
+}
+
 fn increasing_counter_laps(
     source: &dyn TelemetrySource,
     channel_index: usize,
@@ -126,9 +182,11 @@ fn increasing_counter_laps(
     let completed_count = is_completed_lap_counter(channel);
     let number_offset = i64::from(completed_count);
     let mut laps = Vec::new();
-    let mut current: Option<(i64, u64, bool)> = None;
+    let mut current: Option<OpenLap> = None;
     let mut high_water: Option<i64> = None;
     let mut crossings = 0;
+    let mut stint = 1u32;
+    let mut last_reset_ns: Option<u64> = None;
 
     // Only finite, non-negative samples take part; the look-ahead below needs
     // them as a flat list.
@@ -141,20 +199,97 @@ fn increasing_counter_laps(
         })
         .collect();
 
+    let close =
+        |laps: &mut Vec<LapMetadata>, open: OpenLap, end_ns: u64, at_beacon: bool, stint: u32| {
+            if end_ns <= open.start_ns {
+                return;
+            }
+            let kind = match (open.starts_at_beacon, at_beacon) {
+                (true, true) => LapKind::Unknown, // flying or pit: needs the speed trace
+                (false, true) => LapKind::Out,
+                (true, false) => LapKind::In,
+                (false, false) => LapKind::OutIn,
+            };
+            laps.push(LapMetadata {
+                number: 0,
+                start_ns: open.start_ns,
+                end_ns,
+                duration_ns: end_ns - open.start_ns,
+                complete: open.starts_at_beacon && at_beacon,
+                first_video_frame: None,
+                stint,
+                stint_lap: open.stint_lap,
+                kind,
+            });
+        };
+
     for (position, &(time_ns, counter)) in values.iter().enumerate() {
         let Some(before) = high_water else {
             high_water = Some(counter);
             // counter + beacon offset overflowed i64: drop this sample
-            let Some(number) = counter.checked_add(number_offset) else {
+            let Some(stint_lap) = counter.checked_add(number_offset) else {
                 continue;
             };
-            current = Some((number, time_ns, false));
+            current = Some(OpenLap {
+                stint_lap,
+                start_ns: time_ns,
+                starts_at_beacon: false,
+            });
             continue;
         };
-        if counter <= before {
-            // Shutdown resets and transient backwards values are not lap
-            // crossings. Keep the high-water mark so a later 0 -> 1 does
-            // not create a second, overlapping lap sequence.
+        if counter == before {
+            continue;
+        }
+        if counter < before {
+            // A transient backwards value (radio bit error, a dash
+            // re-sending a stale frame) recovers within seconds. A drop
+            // that stays down is the counter starting over: the car
+            // stopped in the pits (AiM resets `Lap_Number` to 0 there) or
+            // the logger was power-cycled. Either way the lap in progress
+            // ended without a beacon and a new stint begins here.
+            let recovers = values[position + 1..]
+                .iter()
+                .take_while(|&&(later_ns, _)| later_ns.saturating_sub(time_ns) <= RESET_CONFIRM_NS)
+                .any(|&(_, later)| later >= before);
+            if recovers {
+                continue;
+            }
+            if let Some(open) = current.take() {
+                // An AiM dash closes the running lap when the car stops in
+                // the box — counter +1, `Previous_LT` published — and resets
+                // to 0 a second or two later. That increment is the pit
+                // event, not a beacon: the interval it closed is the in-lap
+                // (it ends here, at the reset) and the seconds-long
+                // fragment it opened is nothing.
+                let pit_event = open.starts_at_beacon
+                    && time_ns.saturating_sub(open.start_ns) <= RESET_CONFIRM_NS
+                    && laps
+                        .last()
+                        .is_some_and(|lap: &LapMetadata| lap.end_ns == open.start_ns);
+                if pit_event {
+                    let mut in_lap = laps.pop().expect("checked above");
+                    in_lap.end_ns = time_ns;
+                    in_lap.duration_ns = time_ns - in_lap.start_ns;
+                    in_lap.complete = false;
+                    in_lap.kind = if in_lap.kind == LapKind::Out {
+                        LapKind::OutIn
+                    } else {
+                        LapKind::In
+                    };
+                    laps.push(in_lap);
+                    crossings -= 1;
+                } else {
+                    close(&mut laps, open, time_ns, false, stint);
+                }
+            }
+            stint += 1;
+            high_water = Some(counter);
+            last_reset_ns = Some(time_ns);
+            current = counter.checked_add(number_offset).map(|stint_lap| OpenLap {
+                stint_lap,
+                start_ns: time_ns,
+                starts_at_beacon: false,
+            });
             continue;
         }
         // A counter that jumps by more than one lap and is not held by
@@ -170,36 +305,31 @@ fn increasing_counter_laps(
             continue;
         }
         // counter + beacon offset overflowed i64: drop this crossing
-        let Some(number) = counter.checked_add(number_offset) else {
+        let Some(stint_lap) = counter.checked_add(number_offset) else {
             continue;
         };
-        if let Some((prev_number, start_ns, start_known)) = current.replace((number, time_ns, true))
-        {
-            if prev_number > 0 && time_ns > start_ns {
-                laps.push(LapMetadata {
-                    number: prev_number,
-                    start_ns,
-                    end_ns: time_ns,
-                    duration_ns: time_ns - start_ns,
-                    complete: start_known,
-                    first_video_frame: None,
-                });
+        // The same dash arms the next lap with 0 -> 1 a second or two after
+        // the reset, still parked. Part of the reset sequence, not a beacon:
+        // the out-lap fragment keeps its start and takes the new count.
+        if last_reset_ns.is_some_and(|reset| time_ns.saturating_sub(reset) <= RESET_CONFIRM_NS) {
+            if let Some(open) = &mut current {
+                open.stint_lap = stint_lap;
             }
+            high_water = Some(counter);
+            continue;
+        }
+        if let Some(open) = current.replace(OpenLap {
+            stint_lap,
+            start_ns: time_ns,
+            starts_at_beacon: true,
+        }) {
+            close(&mut laps, open, time_ns, true, stint);
         }
         high_water = Some(counter);
         crossings += 1;
     }
-    if let Some((number, start_ns, _)) = current {
-        if number > 0 && duration_ns > start_ns {
-            laps.push(LapMetadata {
-                number,
-                start_ns,
-                end_ns: duration_ns,
-                duration_ns: duration_ns - start_ns,
-                complete: false,
-                first_video_frame: None,
-            });
-        }
+    if let Some(open) = current {
+        close(&mut laps, open, duration_ns, false, stint);
     }
     (laps, crossings)
 }
@@ -322,15 +452,13 @@ pub(crate) fn timer_reset_laps(
             };
             last_number = Some(number);
             // inverted boundary: drop rather than report a zero-duration lap
-            let duration_ns = pair[1].checked_sub(pair[0])?;
-            (number > 0).then_some(LapMetadata {
+            pair[1].checked_sub(pair[0])?;
+            (number > 0).then_some(LapMetadata::interval(
                 number,
-                start_ns: pair[0],
-                end_ns: pair[1],
-                duration_ns,
-                complete: index > 0 && index + 1 < count,
-                first_video_frame: None,
-            })
+                pair[0],
+                pair[1],
+                index > 0 && index + 1 < count,
+            ))
         })
         .collect()
 }
@@ -468,10 +596,107 @@ fn refine_with_timer(
     laps
 }
 
-/// Derives the fastest complete lap from the chosen laps.
+/// Resolves stints, [`LapKind`]s, stint-local numbers and the virtual
+/// session lap number for `laps`, in place.
+///
+/// Stint boundaries come from three signals, any of which is enough:
+///
+/// * the counter walk already split the recording (every lap has `stint > 0`);
+/// * more than [`STINT_GAP_NS`] of unrecorded time between two laps, or an
+///   incomplete lap followed by another incomplete one (an in-lap and the
+///   next out-lap that no counter separated);
+/// * a complete lap in which the car stood still for [`PIT_STOP_NS`] — a
+///   logger that keeps counting through the pits produces one
+///   beacon-to-beacon interval holding both the in- and the out-lap. That
+///   lap is [`LapKind::Pit`] and closes its stint.
+///
+/// Kinds a reader already stored are kept; [`LapKind::Unknown`] is resolved
+/// from position in the stint and the speed trace. Complete laps with a
+/// pit-length stop become [`LapKind::Pit`] even when stored as flying, since
+/// a stop is a fact of the trace, not a labelling choice.
+pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut [LapMetadata]) {
+    laps.sort_by_key(|lap| (lap.start_ns, lap.end_ns));
+    let speed = speed_channel(source);
+    let stops: Vec<u64> = laps
+        .iter()
+        .map(|lap| {
+            speed.map_or(0, |speed| {
+                longest_stop_ns(source, speed, lap.start_ns, lap.end_ns)
+            })
+        })
+        .collect();
+    let pit_stop = |index: usize| stops[index] >= PIT_STOP_NS;
+
+    if laps.iter().any(|lap| lap.stint == 0) {
+        let mut stint = 1u32;
+        for index in 0..laps.len() {
+            if index > 0 {
+                let previous = &laps[index - 1];
+                let current = &laps[index];
+                let gap = current.start_ns.saturating_sub(previous.end_ns) > STINT_GAP_NS;
+                let in_then_out = !previous.complete && !current.complete;
+                let after_pit_lap = previous.complete && pit_stop(index - 1);
+                if gap || in_then_out || after_pit_lap {
+                    stint += 1;
+                }
+            }
+            laps[index].stint = stint;
+        }
+    }
+
+    let mut index = 0;
+    while index < laps.len() {
+        let stint = laps[index].stint;
+        let end = laps[index..]
+            .iter()
+            .position(|lap| lap.stint != stint)
+            .map_or(laps.len(), |offset| index + offset);
+        let count = end - index;
+        for (offset, lap) in laps[index..end].iter_mut().enumerate() {
+            let first = offset == 0;
+            let last = offset + 1 == count;
+            let stopped = pit_stop(index + offset);
+            lap.kind = match lap.kind {
+                LapKind::Unknown if lap.complete => {
+                    if stopped {
+                        LapKind::Pit
+                    } else {
+                        LapKind::Flying
+                    }
+                }
+                LapKind::Unknown if first && last => LapKind::OutIn,
+                LapKind::Unknown if first => LapKind::Out,
+                LapKind::Unknown if last => LapKind::In,
+                LapKind::Unknown => LapKind::Out,
+                LapKind::Flying if stopped => LapKind::Pit,
+                kept => kept,
+            };
+        }
+        index = end;
+    }
+
+    // A pit lap closes its stint whichever way the stints were assigned: a
+    // counter that kept counting through the stop put the next lap in the
+    // same stint, and that is the one place the counter is wrong about it.
+    let mut bump = 0u32;
+    for index in 0..laps.len() {
+        if index > 0 && laps[index - 1].kind == LapKind::Pit {
+            bump += 1;
+        }
+        laps[index].stint += bump;
+    }
+
+    for (position, lap) in laps.iter_mut().enumerate() {
+        lap.number = position as i64 + 1;
+    }
+}
+
+/// Derives the fastest flying lap from the classified laps.
 ///
 /// Prefers an authoritative fastest lap. Otherwise the shortest plausible
-/// complete lap *of the list itself*: a `Ref Lap Time` channel only bounds
+/// flying lap *of the list itself* (an in-lap cut short by a pit-box counter
+/// reset once read as a 1:13 at a 1:16 circuit; a lap with a stop in it is
+/// never a candidate): a `Ref Lap Time` channel only bounds
 /// what is plausible (half to one-and-a-half times the reference). It never
 /// manufactures an interval from a `Previous Lap Time` report — that produced
 /// a fastest lap that was in no lap list, so a recording and its own
@@ -511,9 +736,21 @@ pub(crate) fn fastest_lap(
     };
     authoritative
         .and_then(|source| source.fastest_lap.clone())
+        .map(|reported| {
+            // The source's pick, but as the classified lap (stint, kind,
+            // virtual number) so it is the same value a consumer finds in
+            // `laps`. A reported fastest lap that is not in the list is
+            // returned as-is.
+            laps.iter()
+                .find(|lap| lap.start_ns == reported.start_ns && lap.end_ns == reported.end_ns)
+                .cloned()
+                .unwrap_or(reported)
+        })
         .or_else(|| {
             laps.iter()
-                .filter(|lap| lap.complete && plausible_lap(lap.duration_ns))
+                .filter(|lap| {
+                    lap.complete && lap.kind.is_flying() && plausible_lap(lap.duration_ns)
+                })
                 .min_by_key(|lap| lap.duration_ns)
                 .cloned()
         })
@@ -524,16 +761,12 @@ mod tests {
     use super::*;
 
     fn lap(number: i64, start_s: f64, end_s: f64, complete: bool) -> LapMetadata {
-        let start_ns = (start_s * 1e9) as u64;
-        let end_ns = (end_s * 1e9) as u64;
-        LapMetadata {
+        LapMetadata::interval(
             number,
-            start_ns,
-            end_ns,
-            duration_ns: end_ns - start_ns,
+            (start_s * 1e9) as u64,
+            (end_s * 1e9) as u64,
             complete,
-            first_video_frame: None,
-        }
+        )
     }
 
     #[test]

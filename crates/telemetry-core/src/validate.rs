@@ -26,8 +26,8 @@
 //! flag data a working sensor could legitimately produce.
 
 use crate::diag::{Diagnostic, Diagnostics, Severity};
-use crate::units::{convert, lookup, Dimension};
-use crate::{names, TelemetrySource};
+use crate::units::{lookup, Dimension};
+use crate::TelemetrySource;
 
 /// Inclusive range a working sensor could plausibly report, in the dimension's
 /// SI base unit.
@@ -161,20 +161,6 @@ pub fn validate_source_with(source: &dyn TelemetrySource, options: ValidateOptio
     diagnostics
 }
 
-/// Speed channels the lap check may use, by [`names::eq`] spelling, in
-/// priority order. Only a channel with a unit convertible to m/s qualifies.
-const LAP_CHECK_SPEED_NAMES: &[&str] = &[
-    "groundspeed",
-    "speedref",
-    "corrspeed",
-    "vehiclespeed",
-    "vehrefspeed",
-    "speedwspdapp",
-    "speed",
-    "gpsspeed",
-    "velocitykmh",
-];
-
 /// A file with this much running and no laps merits a missing-lap warning.
 const MOVING_WITHOUT_LAPS_NS: u64 = 300_000_000_000;
 /// Review threshold, not a universal maximum: slow laps, long circuits and
@@ -195,13 +181,7 @@ const LONG_LAP_MOVING_FRACTION: f64 = 0.6;
 /// the car was lapping the whole time.
 fn check_laps(source: &dyn TelemetrySource, diagnostics: &mut Diagnostics) {
     let channels = source.channels();
-    let Some(speed) = LAP_CHECK_SPEED_NAMES.iter().find_map(|wanted| {
-        channels.iter().position(|channel| {
-            channel.sample_count > 0
-                && names::eq(&channel.name, wanted)
-                && convert(1.0, &channel.unit, "m/s").is_ok()
-        })
-    }) else {
+    let Some(speed) = crate::laps::speed_channel(source) else {
         return;
     };
     let duration_ns = channels

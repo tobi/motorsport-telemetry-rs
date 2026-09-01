@@ -3,8 +3,8 @@ use super::write::{write_jsonl_document, write_number};
 use super::*;
 use crate::NativeRecording;
 use motorsport_telemetry_core::{
-    Channel, ChannelPlot, Chunk, LapMetadata, SampleType, SourceIdentity, SourceLapMetadata, Span,
-    SpanMetaValue, SpanPrimary, TelemetrySource, UnitSource, VideoFileRef,
+    Channel, ChannelPlot, Chunk, LapKind, LapMetadata, SampleType, SourceIdentity,
+    SourceLapMetadata, Span, SpanMetaValue, SpanPrimary, TelemetrySource, UnitSource, VideoFileRef,
 };
 
 struct TinySource {
@@ -136,6 +136,9 @@ fn tiny() -> TinySource {
             duration_ns: 40_000_000,
             complete: false,
             first_video_frame: None,
+            stint: 0,
+            stint_lap: 1,
+            kind: LapKind::Unknown,
         }],
     }
 }
@@ -214,7 +217,7 @@ fn writes_header_laps_then_compact_channels() {
         "header has insignificant whitespace: {}",
         lines[0]
     );
-    assert_eq!(lines[1], "[[1,0,40000000,0]]");
+    assert_eq!(lines[1], "[[1,0,40000000,0,null,1,1,\"out-in\"]]");
     assert_eq!(
         lines[2],
         "{\"n\":\"Speed\",\"hz\":100,\"u\":\"km/h\",\"v\":[10,11,12.5,13]}"
@@ -282,7 +285,10 @@ fn video_linkage_round_trips() {
         "hash must stay the last header key"
     );
     // The lap line picks up the first video frame (5th element).
-    assert_eq!(text.lines().nth(1).unwrap(), "[[1,0,40000000,0,0]]");
+    assert_eq!(
+        text.lines().nth(1).unwrap(),
+        "[[1,0,40000000,0,0,1,1,\"out-in\"]]"
+    );
 
     let opened = JsonlRecording::from_bytes("tiny.mtj", &bytes).unwrap();
     assert_eq!(opened.video_files(), source.videos.as_slice());
@@ -1140,6 +1146,9 @@ fn alignment_snap_laps_and_spans_to_lattice() {
                 duration_ns: end_ns - start_ns,
                 complete: true,
                 first_video_frame: None,
+                stint: 0,
+                stint_lap: 1,
+                kind: LapKind::Unknown,
             }],
             quantum_ns,
         )
@@ -1170,6 +1179,9 @@ fn alignment_snap_laps_and_spans_to_lattice() {
             duration_ns: 36_000_000,
             complete: false,
             first_video_frame: None,
+            stint: 0,
+            stint_lap: 1,
+            kind: LapKind::Unknown,
         },
         LapMetadata {
             number: 2,
@@ -1178,6 +1190,9 @@ fn alignment_snap_laps_and_spans_to_lattice() {
             duration_ns: 1_000_000,
             complete: true,
             first_video_frame: None,
+            stint: 0,
+            stint_lap: 2,
+            kind: LapKind::Unknown,
         },
     ];
     source.spans = vec![
@@ -1200,7 +1215,9 @@ fn alignment_snap_laps_and_spans_to_lattice() {
     assert_eq!(opened.spans()[1].start_ns, 10_000_000);
     assert_eq!(opened.spans()[1].end_ns, 20_000_000);
     let text = String::from_utf8(bytes).unwrap();
-    assert!(text.contains("[[1,0,40000000,0],[2,10000000,20000000,1]]"));
+    assert!(text.contains(
+        "[[1,0,40000000,0,null,1,1,\"out\"],[2,10000000,20000000,1,null,1,2,\"flying\"]]"
+    ));
     assert!(text.contains("\"s\":0,\"e\":20000000"));
     assert!(text.contains("\"s\":10000000,\"e\":20000000"));
 }

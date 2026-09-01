@@ -441,8 +441,19 @@ fn write_laps(writer: &mut impl Write, laps: &[LapMetadata]) -> Result<(), Telem
             lap.end_ns,
             u8::from(lap.complete)
         )?;
-        if let Some(frame) = lap.first_video_frame {
-            write!(writer, ",{frame}")?;
+        match lap.first_video_frame {
+            Some(frame) => write!(writer, ",{frame}")?,
+            None if lap.stint > 0 => writer.write_all(b",null")?,
+            None => {}
+        }
+        if lap.stint > 0 {
+            write!(
+                writer,
+                ",{},{},\"{}\"",
+                lap.stint,
+                lap.stint_lap,
+                lap.kind.as_str()
+            )?;
         }
         writer.write_all(b"]")?;
     }

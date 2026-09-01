@@ -791,13 +791,13 @@ fn gate_laps(
         .windows(2)
         .enumerate()
         .filter(|(_, pair)| pair[1] > pair[0])
-        .map(|(index, pair)| LapMetadata {
-            number: index as i64 + 1,
-            start_ns: pair[0],
-            end_ns: pair[1],
-            duration_ns: pair[1] - pair[0],
-            complete: index > 0 && index + 1 < count,
-            first_video_frame: None,
+        .map(|(index, pair)| {
+            LapMetadata::interval(
+                index as i64 + 1,
+                pair[0],
+                pair[1],
+                index > 0 && index + 1 < count,
+            )
         })
         .collect::<Vec<_>>();
     diagnostics.push(Diagnostic::info(

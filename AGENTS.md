@@ -61,6 +61,23 @@ from the original vendor recording. Likewise the v8 -> v9 migration leaves
 `passes` empty and `source_path` as found: provenance that predates v9 is
 unknowable, not defaultable.
 
+## Laps are stints
+
+`FileMetadata::laps` is the normalised lap model (`telemetry-core/src/laps.rs`,
+`classify_laps`): `number` is the virtual session lap (1-based, monotonic across
+the recording), `stint` / `stint_lap` carry the stint index and the dash's own
+counter value, `kind` is `LapKind` (`Flying`, `Out`, `In`, `OutIn`, `Pit`),
+`label()` renders `S2 L3` / `S1 in`. Vendor counters are *stint* counters: a
+drop that does not recover within `RESET_CONFIRM_NS` is a stint boundary; the
+AiM pit sequence (+1 to close the lap, → 0 parked, 0 → 1 armed) is folded into
+the in-lap / out-lap; a complete lap with ≥ `PIT_STOP_NS` standing still is a
+`Pit` lap and closes its stint. `valid_laps` and `fastest_lap` consider flying
+laps only. Never select a fastest lap by duration alone, never treat a counter
+reset as a glitch to skip, and never emit an unclassified lap from
+`read_source_metadata`. MTJ stores stint/stint_lap/kind at tuple positions 5–7;
+the legacy zip stores intervals and is classified on open (header-only
+`read_laps` is not).
+
 ## Processing passes
 
 `crates/telemetry-passes` holds the named, versioned, lossless pass registry

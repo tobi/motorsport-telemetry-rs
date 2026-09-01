@@ -129,7 +129,9 @@ incompatible inputs stay `None`.
 | Steering | `steering_deg` | deg | `Steering Angle`, `SW Angle` |
 | Gear | `gear` | count | `Gear`, `Gear Pos` |
 | RPM | `rpm` | rpm | `RPM`, `Engine RPM` |
-| Lap number | `lap_number` | count | `Lap Number`, `Current Lap` |
+| Lap number | `lap_number` | count | virtual session lap from the classified laps (see below); falls back to the counter |
+| Stint lap | `stint_lap_number` | count | `Lap Number`, `Current Lap` — the dash's own counter, which restarts per stint |
+| Stint / kind / label | `stint`, `lap_kind`, `lap_label` | — | from the containing classified lap: `S2 L3`, `S1 in`, `S1 pit L5` |
 | Lap progress | `lap_progress` | 0–1 | see below |
 | Current lap time | `lap_time_s` | s | `Lap Time`, `Current Lap Time` |
 | Latitude | `latitude_deg` | deg | `GPS Latitude` |
@@ -152,7 +154,8 @@ heuristics in `read_source_metadata`:
    GPS-gate inference when usable; see below).
 2. An incrementing counter. `Lap Number` is preferred when it actually counts
    (high-water ≥ 2). A 0/1 flag loses to `beaconEventCount` / `lap_beacon`
-   counts. Shutdown resets are ignored.
+   counts. A drop that does not recover within 5 s is a **stint boundary**
+   (see "Stints and lap kinds"); a drop that recovers is a transient.
 3. A running timer or progress channel that resets (`Current Lap Time`,
    `Lap Progression`). When a counter *and* a lap timer both exist, the
    counter supplies the lap numbers and the timer supplies the boundaries:
@@ -177,8 +180,31 @@ Validation also flags missing laps during sustained motion and unusually
 long moving laps. These are review hints, not proof of a decoder defect or
 permission to fabricate missing boundaries.
 
-The fastest lap is always one of those laps (the shortest plausible complete
-one). It is never an interval rebuilt from a `Previous Lap Time` report, so a
+### Stints and lap kinds
+
+A vendor lap counter is a *stint* lap counter. An AiM dash resets
+`Lap_Number` to 0 when the car stops in the box (after bumping it once to
+close the running lap) and arms it 0 → 1 while still parked; a Cosworth
+logger keeps counting straight through a pit stop; a power-cycled logger
+starts again at 1. Read naively, the Indianapolis CT3 Run2 recording had one
+364 s "complete" lap swallowing four flying laps and a 1:13 "fastest lap"
+that was the in-lap cut short by the pit-box reset.
+
+`FileMetadata::laps` is therefore normalised (`classify_laps`):
+
+| Field | Meaning |
+|---|---|
+| `number` | **Virtual session lap**: 1-based, monotonic across the whole recording and every stint. Two consumers of the same file mean the same interval by "lap 7". |
+| `stint` | 1-based stint index. A new stint starts at a counter reset, at more than 10 s of unrecorded time between laps, after an in-lap followed by an out-lap, and after a pit lap. |
+| `stint_lap` | The counter as the dash showed it (0 for an AiM out-lap), or the position in the stint when no counter exists. |
+| `kind` | `flying` (beacon to beacon, moving), `out` (stint start → first beacon), `in` (last beacon → stint end), `out-in` (a stint with no beacon), `pit` (beacon to beacon but standing still ≥ 15 s inside — an in+out the counter never separated). |
+| `label()` | `S1 out`, `S1 L2`, `S1 in`, `S2 out`, `S2 L1`, …, `S1 pit L5` |
+
+`valid_laps` counts flying laps. The fastest lap is always the shortest
+plausible **flying** lap of the list; an in-lap fragment or a pit lap is
+never a candidate, however short a broken beacon made it. `.telemetry`
+(MTJ) stores `stint`, `stint_lap` and `kind` on each lap tuple; the legacy
+zip stores intervals only and is classified on open. It is never an interval rebuilt from a `Previous Lap Time` report, so a
 source recording and its `.telemetry` conversion can never disagree about
 which lap was fastest.
 

@@ -715,6 +715,7 @@ fn unpack_laps(bytes: &[u8], format_version: u16) -> Result<Vec<LapMetadata>, Zi
             duration_ns,
             complete,
             first_video_frame,
+            ..LapMetadata::interval(number, start_ns, end_ns, complete)
         });
     }
     Ok(laps)
@@ -1380,6 +1381,9 @@ mod tests {
             duration_ns: 40_000_000,
             complete: true,
             first_video_frame: Some(3),
+            stint: 0,
+            stint_lap: 1,
+            kind: motorsport_telemetry_core::LapKind::Unknown,
         }];
         let packed = pack_laps(&laps, FORMAT_VERSION).unwrap();
         let back = unpack_laps(&packed, FORMAT_VERSION).unwrap();

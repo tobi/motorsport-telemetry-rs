@@ -154,6 +154,20 @@ Examples:
 
 const SUSPICIOUS_CLOCK_AGE_DAYS: i64 = 365 * 2;
 
+/// One classified lap for the `inspect` lap table.
+#[derive(Debug, Clone)]
+struct LapRow {
+    number: i64,
+    stint: u32,
+    stint_lap: i64,
+    kind: &'static str,
+    label: String,
+    start_ns: u64,
+    end_ns: u64,
+    duration_ns: u64,
+    complete: bool,
+}
+
 #[derive(Debug)]
 struct Inspection {
     file: String,
@@ -166,8 +180,12 @@ struct Inspection {
     driver_ids: Vec<i64>,
     laps: usize,
     complete_laps: usize,
+    flying_laps: usize,
+    stints: u32,
+    lap_table: Vec<LapRow>,
     fastest_lap_ns: Option<u64>,
     fastest_lap_number: Option<i64>,
+    fastest_lap_label: Option<String>,
     video_included: bool,
     video_filenames: Vec<String>,
     video_file_indices: Vec<u32>,
@@ -951,8 +969,30 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
         driver_ids: metadata.driver_ids.clone(),
         laps: metadata.laps.len(),
         complete_laps: metadata.laps.iter().filter(|lap| lap.complete).count(),
+        flying_laps: metadata
+            .laps
+            .iter()
+            .filter(|lap| lap.kind.is_flying())
+            .count(),
+        stints: metadata.laps.iter().map(|lap| lap.stint).max().unwrap_or(0),
+        lap_table: metadata
+            .laps
+            .iter()
+            .map(|lap| LapRow {
+                number: lap.number,
+                stint: lap.stint,
+                stint_lap: lap.stint_lap,
+                kind: lap.kind.as_str(),
+                label: lap.label(),
+                start_ns: lap.start_ns,
+                end_ns: lap.end_ns,
+                duration_ns: lap.duration_ns,
+                complete: lap.complete,
+            })
+            .collect(),
         fastest_lap_ns: metadata.fastest_lap.as_ref().map(|lap| lap.duration_ns),
         fastest_lap_number: metadata.fastest_lap.as_ref().map(|lap| lap.number),
+        fastest_lap_label: metadata.fastest_lap.as_ref().map(|lap| lap.label()),
         video_included,
         video_filenames,
         video_file_indices,
@@ -1294,6 +1334,8 @@ fn print_human(inspection: &Inspection) {
     println!("driver_id: {}", display_ids(&inspection.driver_ids));
     println!("laps: {}", inspection.laps);
     println!("complete_laps: {}", inspection.complete_laps);
+    println!("flying_laps: {}", inspection.flying_laps);
+    println!("stints: {}", inspection.stints);
     println!(
         "fastest_lap: {}",
         inspection
@@ -1305,6 +1347,28 @@ fn print_human(inspection: &Inspection) {
         "fastest_lap_number: {}",
         display(inspection.fastest_lap_number)
     );
+    println!(
+        "fastest_lap_label: {}",
+        inspection.fastest_lap_label.as_deref().unwrap_or("unknown")
+    );
+    if !inspection.lap_table.is_empty() {
+        println!("lap_table:");
+        println!("  #    stint  count  kind     label         start        end     duration");
+        for row in &inspection.lap_table {
+            println!(
+                "  {:<4} {:<6} {:<6} {:<8} {:<12} {:>9.3} {:>9.3}  {}{}",
+                row.number,
+                row.stint,
+                row.stint_lap,
+                row.kind,
+                row.label,
+                row.start_ns as f64 / 1e9,
+                row.end_ns as f64 / 1e9,
+                format_duration(row.duration_ns),
+                if row.complete { "" } else { "  (partial)" }
+            );
+        }
+    }
     println!("video_included: {}", inspection.video_included);
     println!(
         "video_filenames: {}",
@@ -1404,9 +1468,30 @@ fn inspection_json(inspection: &Inspection) -> serde_json::Value {
         "driver_ids": inspection.driver_ids,
         "laps": inspection.laps,
         "complete_laps": inspection.complete_laps,
+        "flying_laps": inspection.flying_laps,
+        "stints": inspection.stints,
+        "lap_table": inspection
+            .lap_table
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "number": row.number,
+                    "stint": row.stint,
+                    "stint_lap": row.stint_lap,
+                    "kind": row.kind,
+                    "label": row.label,
+                    "start_ns": row.start_ns,
+                    "end_ns": row.end_ns,
+                    "duration_ns": row.duration_ns,
+                    "duration": format_duration(row.duration_ns),
+                    "complete": row.complete,
+                })
+            })
+            .collect::<Vec<_>>(),
         "fastest_lap_ns": inspection.fastest_lap_ns,
         "fastest_lap": inspection.fastest_lap_ns.map(format_duration),
         "fastest_lap_number": inspection.fastest_lap_number,
+        "fastest_lap_label": inspection.fastest_lap_label,
         "video_included": inspection.video_included,
         "video_filenames": video_filenames,
         "video_file_indices": inspection.video_file_indices,

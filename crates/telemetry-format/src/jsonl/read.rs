@@ -12,8 +12,8 @@ use super::{
 use crate::write::TelemetryFormatError;
 use motorsport_telemetry_core::{
     parse_timespan_ms, timespan_ms_in_range, AbsoluteTimeRange, AppliedPass, Channel,
-    ChannelDisplay, ChannelLabel, ChannelPlot, Chunk, LapMetadata, SampleType, SourceIdentity,
-    Span, SpanMetaValue, SpanPrimary, UnitSource, VideoFileRef, TIMESPAN_MS,
+    ChannelDisplay, ChannelLabel, ChannelPlot, Chunk, LapKind, LapMetadata, SampleType,
+    SourceIdentity, Span, SpanMetaValue, SpanPrimary, UnitSource, VideoFileRef, TIMESPAN_MS,
 };
 use serde_json::{Map, Number, Value};
 use std::io::BufRead;
@@ -498,6 +498,18 @@ fn parse_laps(value: &Value, quantum_ns: u64) -> Result<Vec<LapMetadata>, Teleme
             return Err(invalid("laps must be in non-decreasing start order"));
         }
         previous_start = Some(start_ns);
+        // Positions 5-7 (stint, stint lap, kind) are written since the
+        // stint model; older documents stop at 4 and are classified on read.
+        let stint = fields
+            .get(5)
+            .and_then(json_i64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0);
+        let stint_lap = fields.get(6).and_then(json_i64).unwrap_or(number);
+        let kind = fields
+            .get(7)
+            .and_then(Value::as_str)
+            .map_or(LapKind::Unknown, LapKind::parse);
         laps.push(LapMetadata {
             number,
             start_ns,
@@ -505,6 +517,9 @@ fn parse_laps(value: &Value, quantum_ns: u64) -> Result<Vec<LapMetadata>, Teleme
             duration_ns: end_ns - start_ns,
             complete: json_complete(&fields[3])?,
             first_video_frame: fields.get(4).map(json_u64).transpose()?.flatten(),
+            stint,
+            stint_lap,
+            kind,
         });
     }
     Ok(laps)

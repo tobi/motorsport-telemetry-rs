@@ -60,14 +60,12 @@ impl LdxMetadata {
                 break;
             };
             if end_ns > start_ns {
-                laps.push(LapMetadata {
-                    number: number as i64,
+                laps.push(LapMetadata::interval(
+                    number as i64,
                     start_ns,
                     end_ns,
-                    duration_ns: end_ns - start_ns,
                     complete,
-                    first_video_frame: None,
-                });
+                ));
             }
         }
 
@@ -78,14 +76,7 @@ impl LdxMetadata {
                     let marker_index = usize::try_from(number.checked_sub(1)?).ok()?;
                     let end_ns = *markers.get(marker_index)?;
                     let start_ns = end_ns.checked_sub(duration_ns)?;
-                    Some(LapMetadata {
-                        number,
-                        start_ns,
-                        end_ns,
-                        duration_ns,
-                        complete: true,
-                        first_video_frame: None,
-                    })
+                    Some(LapMetadata::interval(number, start_ns, end_ns, true))
                 });
         if let Some(fastest) = &fastest_lap {
             if let Some(lap) = laps.iter_mut().find(|lap| lap.number == fastest.number) {

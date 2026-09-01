@@ -40,7 +40,7 @@ compact JSON (no space after `:` or `,`). A zstd frame (`28 B5 2F FD`)
 MAY wrap the UTF-8 document. This crate writes zstd level 11 by default.
 
 ```sh
-cargo run -p motorsport-telemetry -- convert run.pds
+cargo run -p motorsport-telemetry -- convert run.pds                       # run.pds.telemetry (zstd MTJ)
 cargo run -p motorsport-telemetry -- convert run.pds run.telemetry.jsonl
 cargo run -p motorsport-telemetry -- verify run.telemetry run.telemetry.jsonl
 python3 crates/telemetry-format/scripts/validate-mtx.py stints.telemetry.ext.jsonl

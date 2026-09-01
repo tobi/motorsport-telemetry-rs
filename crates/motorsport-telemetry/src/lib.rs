@@ -7,7 +7,7 @@ use motec_telemetry::MotecFile;
 use motorsport_telemetry_core::names;
 use motorsport_telemetry_core::{
     group_sessions, implies_decode_fault, validate_source_with, Channel, Diagnostics, FileMetadata,
-    SessionMetadata, TelemetrySource, ValidateOptions, VideoReference,
+    LapKind, SessionMetadata, TelemetrySource, ValidateOptions, VideoReference,
 };
 use motorsport_track_atlas::{match_track, TrackMatch};
 use racelogic_telemetry::RacelogicFile;
@@ -550,8 +550,20 @@ pub struct NormalizedSample {
     pub gear: Option<i64>,
     /// Engine speed in revolutions per minute.
     pub rpm: Option<f64>,
-    /// Source lap number rounded to an integer.
+    /// Virtual session lap number: 1-based, monotonic across stints, from
+    /// the recording's classified laps (`FileMetadata::laps[].number`). When
+    /// the recording has no laps this falls back to the source counter.
     pub lap_number: Option<i64>,
+    /// The vendor counter as logged (`Lap_Number`, `Lap Count`, …), rounded.
+    /// This is a *stint* lap counter on most dashes: it restarts after a pit
+    /// stop or logger reset. Use `lap_number` to identify a lap.
+    pub stint_lap_number: Option<i64>,
+    /// 1-based stint index of the lap containing this sample.
+    pub stint: Option<u32>,
+    /// Normalised role of the containing lap (flying, out, in, out-in, pit).
+    pub lap_kind: Option<LapKind>,
+    /// Human label of the containing lap: `S1 out`, `S2 L3`, `S1 pit L5`.
+    pub lap_label: Option<String>,
     /// Progress through the current lap in the range `0.0..=1.0`.
     pub lap_progress: Option<f64>,
     /// Current lap time in seconds.
@@ -622,7 +634,7 @@ impl<'a> TelemetryNormalizer<'a> {
                 let laps = self
                     .laps
                     .get_or_init(|| self.source.metadata().laps.clone());
-                lap_progress_from_metadata(laps, time_ns)
+                lap_at(laps, time_ns)
             },
             self.clock.get_or_init(|| file_clock(self.source)).as_ref(),
         )
@@ -642,7 +654,7 @@ fn normalize_sample(
     time_ns: u64,
     roles: &SignalRoles,
     track: Option<&TrackContext>,
-    lap_fallback: impl FnOnce() -> Option<f64>,
+    lap_lookup: impl FnOnce() -> Option<motorsport_telemetry_core::LapMetadata>,
     clock: Option<&(i128, String)>,
 ) -> NormalizedSample {
     let value = |index: Option<usize>, linear| {
@@ -676,7 +688,14 @@ fn normalize_sample(
     let longitude_deg = roles.longitude.and_then(|index| {
         normalize_longitude(value(Some(index), true)?, &source.channels()[index].unit)
     });
-    let lap_number = value(roles.lap_number, false).map(|value| value.round() as i64);
+    let stint_lap_number = value(roles.lap_number, false).map(|value| value.round() as i64);
+    let lap = lap_lookup();
+    let lap_number = lap.as_ref().map(|lap| lap.number).or(stint_lap_number);
+    let stint = lap.as_ref().map(|lap| lap.stint);
+    let lap_kind = lap.as_ref().map(|lap| lap.kind);
+    let lap_label = lap
+        .as_ref()
+        .map(motorsport_telemetry_core::LapMetadata::label);
     let lap_time_s = roles.lap_time.and_then(|index| {
         normalize_duration_s(value(Some(index), true)?, &source.channels()[index].unit)
     });
@@ -691,7 +710,11 @@ fn normalize_sample(
                 .zip(longitude_deg)
                 .and_then(|(lat, lon)| track.and_then(|track| track.progress(lat, lon)))
         })
-        .or_else(lap_fallback);
+        .or_else(|| {
+            lap.as_ref()
+                .filter(|lap| lap.duration_ns > 0)
+                .map(|lap| time_ns.saturating_sub(lap.start_ns) as f64 / lap.duration_ns as f64)
+        });
     let (absolute_time_ns, time_of_day_ns) = match clock {
         Some((offset, name)) => {
             let absolute = u64::try_from(i128::from(time_ns) + *offset).ok();
@@ -713,6 +736,10 @@ fn normalize_sample(
         gear,
         rpm,
         lap_number,
+        stint_lap_number,
+        stint,
+        lap_kind,
+        lap_label,
         lap_progress,
         lap_time_s,
         latitude_deg,
@@ -722,14 +749,14 @@ fn normalize_sample(
     }
 }
 
-fn lap_progress_from_metadata(
+/// The classified lap containing `time_ns`, if any.
+fn lap_at(
     laps: &[motorsport_telemetry_core::LapMetadata],
     time_ns: u64,
-) -> Option<f64> {
+) -> Option<motorsport_telemetry_core::LapMetadata> {
     laps.iter()
         .find(|lap| time_ns >= lap.start_ns && time_ns < lap.end_ns)
-        .filter(|lap| lap.duration_ns > 0)
-        .map(|lap| time_ns.saturating_sub(lap.start_ns) as f64 / lap.duration_ns as f64)
+        .cloned()
 }
 
 /// A matched track plus precomputed centerline distances for GPS projection.

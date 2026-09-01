@@ -27,10 +27,79 @@ use crate::laps;
 const GPS_WEEK_MS: u64 = 604_800_000;
 const GPS_UNIX_EPOCH_MS: u64 = 315_964_800_000;
 
+/// What a lap interval is, once stints are known.
+///
+/// A vendor lap counter is really a *stint* lap counter: an AiM dash resets
+/// `Lap_Number` to 0 when the car stops in the pits, a Cosworth logger keeps
+/// counting across a stop, a power-cycled logger starts again at 1. The
+/// intervals between crossings are therefore not all laps of the same kind,
+/// and a session commonly holds several in/out pairs. [`LapKind`] is the
+/// normalised answer, so consumers can filter flying laps without knowing
+/// which logger wrote the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LapKind {
+    /// Not yet classified. Readers that store laps without a kind leave
+    /// this; [`read_source_metadata`] resolves it.
+    #[default]
+    Unknown,
+    /// Beacon to beacon with the car moving throughout.
+    Flying,
+    /// Starts at a stint start (pit exit, logger start) and ends at the
+    /// first beacon. No start beacon.
+    Out,
+    /// Starts at a beacon and ends where the stint ends (pit box, counter
+    /// reset, logger stop). No end beacon.
+    In,
+    /// A stint with no beacon at all: one fragment from start to stop.
+    OutIn,
+    /// Beacon to beacon, but the car stood still for a pit-stop's worth of
+    /// time inside it: an in-lap and out-lap the counter did not separate.
+    Pit,
+}
+
+impl LapKind {
+    /// Stable lowercase token used in labels and on disk.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LapKind::Unknown => "unknown",
+            LapKind::Flying => "flying",
+            LapKind::Out => "out",
+            LapKind::In => "in",
+            LapKind::OutIn => "out-in",
+            LapKind::Pit => "pit",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; anything else is [`LapKind::Unknown`].
+    pub fn parse(token: &str) -> LapKind {
+        match token {
+            "flying" => LapKind::Flying,
+            "out" => LapKind::Out,
+            "in" => LapKind::In,
+            "out-in" => LapKind::OutIn,
+            "pit" => LapKind::Pit,
+            _ => LapKind::Unknown,
+        }
+    }
+
+    /// True for a complete beacon-to-beacon lap without a stop.
+    pub fn is_flying(self) -> bool {
+        self == LapKind::Flying
+    }
+}
+
 /// One lap boundary derived from source channels or reported lap timing.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `number` is the **virtual session lap number**: 1-based and strictly
+/// increasing across the whole recording, through every stint, so two
+/// consumers of the same file always mean the same interval by "lap 7".
+/// The vendor counter's value lives in `stint_lap`; the stint index in
+/// `stint`; the normalised role in `kind`; and [`Self::label`] renders the
+/// three as one human string (`S2 L3`, `S1 in`).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LapMetadata {
-    /// Source lap number, or a conservative inferred number.
+    /// Virtual session lap number (1-based, monotonic across stints). Zero
+    /// only on a lap that has not been through [`read_source_metadata`].
     pub number: i64,
     /// File- or session-relative lap start in nanoseconds.
     pub start_ns: u64,
@@ -42,6 +111,48 @@ pub struct LapMetadata {
     pub complete: bool,
     /// Presentation-order video frame at [`Self::start_ns`], when known.
     pub first_video_frame: Option<u64>,
+    /// 1-based stint index within the recording. Zero when unassigned.
+    pub stint: u32,
+    /// Lap number as the source counted it within the stint (the raw
+    /// `Lap_Number` value), or the 1-based position in the stint when no
+    /// counter exists.
+    pub stint_lap: i64,
+    /// Normalised role of this interval.
+    pub kind: LapKind,
+}
+
+impl LapMetadata {
+    /// A lap with only its interval known; stint, kind and virtual number
+    /// are filled in by [`read_source_metadata`].
+    pub fn interval(number: i64, start_ns: u64, end_ns: u64, complete: bool) -> Self {
+        LapMetadata {
+            number,
+            start_ns,
+            end_ns,
+            duration_ns: end_ns.saturating_sub(start_ns),
+            complete,
+            first_video_frame: None,
+            stint: 0,
+            stint_lap: number,
+            kind: LapKind::Unknown,
+        }
+    }
+
+    /// Human label normalised across loggers: `S1 out`, `S1 L2`, `S1 L3`,
+    /// `S1 in`, `S2 out`, …; a stint without a beacon is `S3 out-in`; a
+    /// beacon-to-beacon lap containing a stop is `S1 pit L5`. `L{n}` uses
+    /// the stint-local lap number so it matches the dash display.
+    pub fn label(&self) -> String {
+        let stint = self.stint.max(1);
+        match self.kind {
+            LapKind::Flying => format!("S{stint} L{}", self.stint_lap),
+            LapKind::Out => format!("S{stint} out"),
+            LapKind::In => format!("S{stint} in"),
+            LapKind::OutIn => format!("S{stint} out-in"),
+            LapKind::Pit => format!("S{stint} pit L{}", self.stint_lap),
+            LapKind::Unknown => format!("S{stint} L{}", self.stint_lap),
+        }
+    }
 }
 
 /// Authoritative lap information supplied directly by a source format.
@@ -510,6 +621,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         timer_laps,
         snap_window_ns,
     );
+    laps::classify_laps(source, &mut laps);
     let mut fastest_lap = laps::fastest_lap(source, &laps, authoritative.as_ref());
 
     stamp_lap_video_frames(source, &mut laps);
@@ -558,7 +670,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         identity: source.identity(),
         driver_ids,
         driver_stints,
-        valid_laps: laps.iter().filter(|lap| lap.complete).count() as u32,
+        valid_laps: laps.iter().filter(|lap| lap.kind.is_flying()).count() as u32,
         laps,
         fastest_lap,
         video_frame_count,
@@ -677,6 +789,9 @@ pub fn group_sessions(files: &[FileMetadata], max_gap_ns: u64) -> Vec<SessionMet
                             duration_ns: to.saturating_sub(from),
                             complete: false,
                             first_video_frame: lap.first_video_frame,
+                            stint: lap.stint,
+                            stint_lap: lap.stint_lap,
+                            kind: lap.kind,
                         });
                     }
                 }
@@ -1030,7 +1145,7 @@ mod tests {
             metadata
                 .laps
                 .iter()
-                .map(|lap| (lap.number, lap.complete))
+                .map(|lap| (lap.stint_lap, lap.complete))
                 .collect::<Vec<_>>(),
             [(23, false), (24, false)]
         );
@@ -1051,7 +1166,7 @@ mod tests {
             metadata
                 .laps
                 .iter()
-                .map(|lap| (lap.number, lap.complete))
+                .map(|lap| (lap.stint_lap, lap.complete))
                 .collect::<Vec<_>>(),
             [(1, false), (2, true), (3, true), (4, false)]
         );
@@ -1063,7 +1178,7 @@ mod tests {
             metadata
                 .laps
                 .iter()
-                .map(|lap| lap.number)
+                .map(|lap| lap.stint_lap)
                 .collect::<Vec<_>>(),
             [1, 4, 5]
         );
@@ -1101,19 +1216,248 @@ mod tests {
     }
 
     #[test]
-    fn upward_lap_counter_is_preferred_and_shutdown_reset_is_ignored() {
+    fn upward_lap_counter_is_preferred_and_a_reset_starts_a_new_stint() {
+        // 10 s samples: the drop to 0 at 60 s is not recovered within
+        // RESET_CONFIRM_NS, so it is a stint boundary, not a glitch. Lap 3
+        // becomes stint 1's in-lap; the 0 -> 1 climb is stint 2's out-lap
+        // and its tail fragment. Virtual numbers run straight through.
         let source = counter_source("Lap Number", vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 0.0, 1.0]);
         let metadata = read_source_metadata(&source);
         assert_eq!(
             metadata
                 .laps
                 .iter()
-                .map(|lap| (lap.number, lap.start_ns, lap.end_ns, lap.complete))
+                .map(|lap| (
+                    lap.number,
+                    lap.stint,
+                    lap.stint_lap,
+                    lap.start_ns,
+                    lap.end_ns,
+                    lap.kind
+                ))
                 .collect::<Vec<_>>(),
             [
-                (1, 0, 20_000_000_000, false),
-                (2, 20_000_000_000, 40_000_000_000, true),
-                (3, 40_000_000_000, 80_000_000_000, false),
+                (1, 1, 1, 0, 20_000_000_000, LapKind::Out),
+                (2, 1, 2, 20_000_000_000, 40_000_000_000, LapKind::Flying),
+                (3, 1, 3, 40_000_000_000, 60_000_000_000, LapKind::In),
+                (4, 2, 0, 60_000_000_000, 70_000_000_000, LapKind::Out),
+                (5, 2, 1, 70_000_000_000, 80_000_000_000, LapKind::In),
+            ]
+        );
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(LapMetadata::label)
+                .collect::<Vec<_>>(),
+            ["S1 out", "S1 L2", "S1 in", "S2 out", "S2 in"]
+        );
+        assert_eq!(metadata.valid_laps, 1);
+    }
+
+    /// Builds a multi-channel synthetic source; every channel shares one
+    /// sample period.
+    fn channels_source(period_ns: u64, channels: Vec<(&str, &str, Vec<f64>)>) -> MetadataSource {
+        let built = channels
+            .iter()
+            .enumerate()
+            .map(|(index, (name, unit, values))| {
+                let count = values.len() as u64;
+                Channel {
+                    id: index as u32,
+                    name: (*name).into(),
+                    unit: (*unit).into(),
+                    unit_source: if unit.is_empty() {
+                        UnitSource::Unknown
+                    } else {
+                        UnitSource::Declared
+                    },
+                    sample_type: SampleType::F64,
+                    chunks: vec![Chunk {
+                        sample_period_ns: period_ns,
+                        sample_count: count,
+                        data_ptr: 0,
+                        sample_base: 0,
+                        time_base_ns: 0,
+                    }],
+                    sample_count: count,
+                    duration_ns: count * period_ns,
+                }
+            })
+            .collect();
+        MetadataSource {
+            path: "stints".into(),
+            channels: built,
+            values: channels.into_iter().map(|(_, _, values)| values).collect(),
+            absolute_start_ns: 1_000_000_000_000,
+        }
+    }
+
+    /// Indianapolis 2026 test, CT3 Run2 (AiM SmartyCam `.MP4.telemetry`):
+    /// `Lap_Number` ran 1,2,3,4 then dropped to 0 when the car stopped in
+    /// the pit box (t = 264 s), climbed 1..5 in the second stint and dropped
+    /// to 0 again at the end; `Current_Lap_Time` reset at every beacon *and*
+    /// at both pit resets. The old counter walk ignored the drop as a
+    /// "shutdown reset", so 262 -> 626 s (four flying laps) became one
+    /// 364 s "complete" lap and the 73 s in-lap fragment 189 -> 262 s, cut
+    /// short by the pit-box reset with the car standing still inside it,
+    /// was reported as the fastest lap at a 1:16 circuit. Modelled here at
+    /// 1/5 scale (one channel sample per second, laps of 16-20 s so they
+    /// clear the 10 s plausibility floor).
+    #[test]
+    fn aim_pit_box_counter_reset_splits_stints_and_never_wins_fastest_lap() {
+        // seconds: 0..20 lap 1 | 20..36 lap 2 | 36..43 in-lap | 43 the dash
+        // closes the lap as the car stops in the box (counter -> 4, timer
+        // reset) | 44 counter reset to 0 | 46 dash arms 0 -> 1, still parked
+        // | 60 pit exit | 70 beacon -> 2 | 86 -> 3 | 102 -> 4, tail. Exactly
+        // the CT3 Run2 sequence (262.4 s +1, 264.0 s -> 0, 303.4 s -> 1).
+        let mut lap_number = Vec::new();
+        let mut lap_time = Vec::new();
+        let mut speed = Vec::new();
+        for t in 0..108u32 {
+            let (lap, since) = match t {
+                0..=19 => (1.0, t),
+                20..=35 => (2.0, t - 20),
+                36..=42 => (3.0, t - 36),
+                43 => (4.0, 0),
+                44..=45 => (0.0, t - 43),
+                46..=69 => (1.0, t - 43),
+                70..=85 => (2.0, t - 70),
+                86..=101 => (3.0, t - 86),
+                _ => (4.0, t - 102),
+            };
+            lap_number.push(lap);
+            lap_time.push(f64::from(since) * 1000.0 + 50.0); // ms, first sample 50 ms after the reset
+            speed.push(if (42..=59).contains(&t) || t >= 104 {
+                0.0
+            } else {
+                40.0
+            });
+        }
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                ("Lap_Number", "", lap_number),
+                ("Current_Lap_Time", "", lap_time),
+                ("Speed_Wspd_App", "km/h", speed),
+            ],
+        );
+        let metadata = read_source_metadata(&source);
+        let shape: Vec<(i64, u32, i64, LapKind, bool)> = metadata
+            .laps
+            .iter()
+            .map(|lap| (lap.number, lap.stint, lap.stint_lap, lap.kind, lap.complete))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (1, 1, 1, LapKind::Out, false),
+                (2, 1, 2, LapKind::Flying, true),
+                (3, 1, 3, LapKind::In, false),
+                (4, 2, 1, LapKind::Out, false),
+                (5, 2, 2, LapKind::Flying, true),
+                (6, 2, 3, LapKind::Flying, true),
+                (7, 2, 4, LapKind::In, false),
+            ]
+        );
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(LapMetadata::label)
+                .collect::<Vec<_>>(),
+            ["S1 out", "S1 L2", "S1 in", "S2 out", "S2 L2", "S2 L3", "S2 in"]
+        );
+        // No 1 s fragment between the dash's pit-event increment (43 s) and
+        // the counter reset (44 s): the in-lap absorbs it. Its end sits on
+        // the pit-event timer reset (first post-reset sample 50 ms -> 42.95
+        // s), which the counter drop a second later snaps onto.
+        assert_eq!(metadata.laps[2].end_ns, 42_950_000_000);
+        assert_eq!(metadata.laps[3].start_ns, metadata.laps[2].end_ns);
+        assert_eq!(metadata.valid_laps, 3);
+        // The 8 s in-lap fragment (36 -> 44 s) is shorter than every flying
+        // lap and must not be the fastest lap.
+        let fastest = metadata.fastest_lap.as_ref().unwrap();
+        assert!(fastest.kind.is_flying(), "{fastest:?}");
+        assert_eq!(fastest.stint_lap, 2);
+        assert_eq!(fastest.stint, 1);
+        // Timer resets place the beacons: the first post-reset timer sample
+        // reads 50 ms, so the crossings are recovered 50 ms before the 1 s
+        // sample that carried them. Lap 2 of stint 1 is 19.95 -> 35.95 s.
+        assert_eq!(
+            (fastest.start_ns, fastest.end_ns),
+            (19_950_000_000, 35_950_000_000)
+        );
+    }
+
+    /// A Cosworth-style logger keeps counting across a pit stop: the
+    /// beacon-to-beacon interval that contains the stop is one long
+    /// "complete" lap. It is a pit lap, closes its stint, and is never the
+    /// fastest lap even when a broken beacon made it short.
+    #[test]
+    fn a_complete_lap_with_a_pit_length_stop_is_a_pit_lap_and_closes_the_stint() {
+        let mut lap_number = Vec::new();
+        let mut speed = Vec::new();
+        for t in 0..60u32 {
+            lap_number.push(match t {
+                0..=9 => 1.0,
+                10..=19 => 2.0,
+                20..=39 => 3.0, // the stop 24..=41 puts 16 s of standing still inside it
+                40..=49 => 4.0,
+                _ => 5.0,
+            });
+            speed.push(if (24..=41).contains(&t) { 0.0 } else { 45.0 });
+        }
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                ("Lap Number", "", lap_number),
+                ("Ground Speed", "m/s", speed),
+            ],
+        );
+        let metadata = read_source_metadata(&source);
+        let shape: Vec<(u32, i64, LapKind, &str)> = metadata
+            .laps
+            .iter()
+            .map(|lap| (lap.stint, lap.stint_lap, lap.kind, lap.kind.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (1, 1, LapKind::Out, "out"),
+                (1, 2, LapKind::Flying, "flying"),
+                (1, 3, LapKind::Pit, "pit"),
+                (2, 4, LapKind::Flying, "flying"),
+                (2, 5, LapKind::In, "in"),
+            ]
+        );
+        assert_eq!(metadata.laps[2].label(), "S1 pit L3");
+        assert_eq!(metadata.valid_laps, 2);
+        assert_ne!(metadata.fastest_lap.as_ref().unwrap().kind, LapKind::Pit);
+    }
+
+    #[test]
+    fn a_counter_drop_that_recovers_within_seconds_is_a_glitch_not_a_stint() {
+        // A stale dash frame re-sends lap 2 for one 10 s sample inside lap 3.
+        // RESET_CONFIRM_NS is 5 s, so make the sample period short enough for
+        // the recovery to land inside the window.
+        let mut source = counter_source("Lap Number", vec![1.0, 2.0, 3.0, 3.0, 2.0, 3.0, 3.0, 4.0]);
+        for chunk in &mut source.channels[0].chunks {
+            chunk.sample_period_ns = 1_000_000_000;
+        }
+        source.channels[0].duration_ns = 8_000_000_000;
+        let metadata = read_source_metadata(&source);
+        assert_eq!(
+            metadata
+                .laps
+                .iter()
+                .map(|lap| (lap.stint, lap.stint_lap, lap.kind))
+                .collect::<Vec<_>>(),
+            [
+                (1, 1, LapKind::Out),
+                (1, 2, LapKind::Flying),
+                (1, 3, LapKind::Flying),
+                (1, 4, LapKind::In),
             ]
         );
     }

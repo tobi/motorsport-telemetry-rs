@@ -31,10 +31,11 @@ pub mod view;
 
 pub use diag::{Diagnostic, Diagnostics, Severity};
 pub use display::{ChannelDisplay, ChannelPlot};
+pub use laps::classify_laps;
 pub use metadata::{
     driver_histogram, group_sessions, read_source_metadata, schema_hash, AbsoluteTimeRange,
-    DriverStint, FileMetadata, LapMetadata, SessionMetadata, SourceIdentity, SourceLapMetadata,
-    VideoFileRef, VideoReference,
+    DriverStint, FileMetadata, LapKind, LapMetadata, SessionMetadata, SourceIdentity,
+    SourceLapMetadata, VideoFileRef, VideoReference,
 };
 pub use pass::{AppliedPass, SourceOrigin};
 pub use placement::{

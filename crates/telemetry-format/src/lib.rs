@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn catalog_round_trips_chunks_and_valid_laps() {
         use crate::catalog::{decode, encode, Catalog, CatalogChannel};
-        use motorsport_telemetry_core::{Channel, Chunk, SampleType, UnitSource};
+        use motorsport_telemetry_core::{Channel, Chunk, LapKind, SampleType, UnitSource};
         let catalog = Catalog {
             format_version: FORMAT_VERSION,
             identity: Default::default(),
@@ -129,6 +129,9 @@ mod tests {
                 duration_ns: 1,
                 complete: true,
                 first_video_frame: Some(4),
+                stint: 0,
+                stint_lap: 2,
+                kind: LapKind::Unknown,
             }],
             valid_laps: 1,
             channels: vec![CatalogChannel {

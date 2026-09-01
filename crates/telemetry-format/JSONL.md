@@ -263,15 +263,23 @@ Line 2 is a JSON array. Each element is a lap tuple:
 ```
 [number, start_ns, end_ns, complete]
 [number, start_ns, end_ns, complete, first_video_frame]
+[number, start_ns, end_ns, complete, first_video_frame_or_null, stint, stint_lap, kind]
 ```
 
 | Position | Type | Meaning |
 |---|---|---|
-| 0 | integer | Lap number as reported or derived. |
+| 0 | integer | Virtual session lap number: 1-based, monotonic across stints. |
 | 1 | integer ≥ 0 | Inclusive start, file-relative nanoseconds. |
 | 2 | integer ≥ 0 | Exclusive end, file-relative nanoseconds. |
 | 3 | `0` or `1` | `1` when both boundaries fall inside the recording. |
-| 4 | integer ≥ 0 | Optional presentation-order video frame at `start_ns`. |
+| 4 | integer ≥ 0 or `null` | Optional presentation-order video frame at `start_ns`. `null` when absent but later positions are present. |
+| 5 | integer ≥ 1 | Stint index. |
+| 6 | integer | The vendor counter's value for this lap (stint-local; may be 0). |
+| 7 | string | Lap kind: `"flying"`, `"out"`, `"in"`, `"out-in"`, `"pit"`. |
+
+Writers emit positions 5–7 for every classified lap. Readers that find a
+4-tuple treat the lap as unclassified and MAY classify it from the
+intervals and a speed channel. Readers MUST ignore positions beyond 7.
 
 `end_ns` MUST be greater than `start_ns`. Both MUST be lattice points.
 `duration_ns` is `end_ns - start_ns` and MUST NOT be stored separately.

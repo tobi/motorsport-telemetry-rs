@@ -173,7 +173,31 @@ impl NativeRecording {
 
     /// Format-neutral metadata copied out of the catalog.
     pub fn metadata(&self) -> FileMetadata {
-        self.catalog.to_file_metadata(&self.path)
+        self.classified_metadata()
+    }
+
+    /// Catalog metadata with the stint model resolved. The legacy catalog
+    /// stores lap intervals only, so stint, kind and the virtual lap number
+    /// are derived here from the intervals and the speed trace, exactly as
+    /// for a vendor file. Header-only reads (`read_laps`) do not classify.
+    fn classified_metadata(&self) -> FileMetadata {
+        let mut metadata = self.catalog.to_file_metadata(&self.path);
+        motorsport_telemetry_core::classify_laps(self, &mut metadata.laps);
+        metadata.valid_laps = metadata
+            .laps
+            .iter()
+            .filter(|lap| lap.kind.is_flying())
+            .count() as u32;
+        if let Some(fastest) = &mut metadata.fastest_lap {
+            if let Some(lap) = metadata
+                .laps
+                .iter()
+                .find(|lap| lap.start_ns == fastest.start_ns && lap.end_ns == fastest.end_ns)
+            {
+                *fastest = lap.clone();
+            }
+        }
+        metadata
     }
 
     /// Processing passes recorded as applied to this recording, in order.
@@ -622,7 +646,7 @@ impl TelemetrySource for NativeRecording {
     }
 
     fn metadata(&self) -> FileMetadata {
-        self.catalog.to_file_metadata(&self.path)
+        self.classified_metadata()
     }
 }
 

@@ -175,12 +175,10 @@ pub(super) fn snap_laps(
                 .checked_sub(start_ns)
                 .ok_or_else(|| invalid("snapped lap duration underflows u64"))?;
             Ok(LapMetadata {
-                number: lap.number,
                 start_ns,
                 end_ns,
                 duration_ns,
-                complete: lap.complete,
-                first_video_frame: lap.first_video_frame,
+                ..lap.clone()
             })
         })
         .collect()

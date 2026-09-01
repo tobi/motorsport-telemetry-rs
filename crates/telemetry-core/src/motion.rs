@@ -80,6 +80,68 @@ pub fn summarize_motion(
     result
 }
 
+/// Speed below which the car counts as standing still, in m/s (1.8 km/h):
+/// wheel-speed and GPS noise on a parked car stays under it, a pit-lane
+/// crawl does not.
+pub const STATIONARY_MPS: f64 = 0.5;
+
+/// Longest contiguous stretch of `[start_ns, end_ns)` with the car standing
+/// still, in nanoseconds, from a speed channel.
+///
+/// Bins are at most one second and at most [`MAX_PROBES`] per interval, so
+/// the estimate resolves a stop to within a second on a normal lap and stays
+/// bounded on a corrupt duration. A bin with no plausible speed sample
+/// (grid gap, stale explicit sample, non-finite value) breaks a run rather
+/// than extending it: missing data is not evidence of standing still.
+pub fn longest_stop_ns(
+    source: &dyn TelemetrySource,
+    speed: usize,
+    start_ns: u64,
+    end_ns: u64,
+) -> u64 {
+    let Some(channel) = source.channels().get(speed) else {
+        return 0;
+    };
+    if convert(1.0, &channel.unit, "m/s").is_err() {
+        return 0;
+    }
+    let end_ns = end_ns.min(channel.duration_ns);
+    let Some(duration) = end_ns.checked_sub(start_ns).filter(|&d| d > 0) else {
+        return 0;
+    };
+    let step = duration.div_ceil(MAX_PROBES).max(SECOND_NS);
+    let max_age = channel.chunks.first().map_or(2 * SECOND_NS, |c| {
+        c.sample_period_ns.saturating_mul(2).max(2 * SECOND_NS)
+    });
+    let mut longest = 0u64;
+    let mut run = 0u64;
+    for bin in 0..duration.div_ceil(step) {
+        let start = (u128::from(start_ns) + u128::from(bin) * u128::from(step)) as u64;
+        let width = step.min(end_ns - start);
+        let at = start + width / 2;
+        let stale = match source.sample_times(speed) {
+            SampleTimes::Explicit(times) => times
+                .partition_point(|&t| t <= at)
+                .checked_sub(1)
+                .is_none_or(|previous| at.saturating_sub(times[previous]) > max_age),
+            SampleTimes::Grid => false,
+        };
+        let stationary = !stale
+            && source
+                .sample_at(speed, at, false)
+                .filter(|v| v.is_finite())
+                .and_then(|raw| convert(raw, &channel.unit, "m/s").ok())
+                .is_some_and(|mps| mps.is_finite() && (0.0..STATIONARY_MPS).contains(&mps));
+        if stationary {
+            run += width;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
