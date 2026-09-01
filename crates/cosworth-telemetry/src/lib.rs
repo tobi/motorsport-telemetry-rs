@@ -210,10 +210,10 @@ fn u64le(data: &[u8], offset: usize) -> Option<u64> {
 /// A channel definition is only believed when its name looks like one.
 ///
 /// Definition records are UTF-16 in the file, so any byte pattern decodes to
-/// *some* string: a definition region that was never written (zero fill, or a
-/// repeated filler word such as `0x2710`) decodes to runs of a single exotic
-/// code point, or to a soup of halfwidth/fullwidth forms when sample bytes
-/// are read as text. Every one of the 1,020 distinct names in the audited
+/// *some* string: a definition region that was never written (zero fill, or
+/// int16 sample data left where the index should be) decodes to runs of a
+/// single exotic code point (`10 27` → U+2710) or a soup of halfwidth /
+/// fullwidth forms. Every one of the 1,020 distinct names in the audited
 /// archive is printable ASCII; Latin-1 symbols (`°`, `µ`, `²`) are allowed
 /// for unseen firmware. Requiring that, plus one ASCII alphanumeric, rejects
 /// the filler without touching any real name, and lets the caller report a
@@ -1571,9 +1571,12 @@ mod tests {
     /// Indianapolis 2025 test, CT3 Run007B (`250907110047_…_ST_MQ12Di_LMP2
     /// #443.pds`, 21.3 MB): the directory at 0x80 is intact and names 1,021
     /// definitions and 2,315 chunks, the sample area holds 20 MB of data, but
-    /// the 310 KB definition region is 53 % zero bytes and the rest is the
-    /// filler word `0x2710` plus stray sample bytes — the logger stopped before
-    /// writing its index. Read as UTF-16 that region decodes to runs of
+    /// the 310 KB definition region is 53 % zero bytes and the rest is int16
+    /// sample data (`10 27` = 10000, `33 33` ≈ 13107 runs) while the chunk
+    /// table is all zeros — the directory was written but the index blocks
+    /// it points at never were. The sibling Run007A from the same logger 20
+    /// minutes earlier has `72 7c` marker-framed UTF-16 records there, so the
+    /// encoding is not in doubt. Read as UTF-16, B's region decodes to runs of
     /// U+2710 and a soup of halfwidth/fullwidth forms, with two records that
     /// happen to spell `"d"` and `"TTTT"`. The markerless fallback used to
     /// accept 568 of those as channels (duplicate ids, nonsense names) and the
