@@ -982,6 +982,9 @@ struct IngestStats {
     value_unterminated: u32,
     /// GPS records skipped for wrong size or truncation.
     gps_skipped: u32,
+    /// Packets whose own length word or `amv0` signature did not match the
+    /// MP4 sample table; skipped whole. `(count, first offset, first size)`.
+    malformed_packets: (u32, u64, u32),
 }
 
 struct IngestContext<'a> {
@@ -1007,14 +1010,22 @@ fn ingest_packet(
     } = context;
     let (offset, size) = sample;
     let packet = &data[offset as usize..offset as usize + size as usize];
-    if be16(packet, 0).map(usize::from) != Some(packet.len().saturating_sub(2)) {
-        return Err(invalid(
-            display,
-            "aimd packet length does not match MP4 sample size",
-        ));
-    }
-    if packet.get(6..10) != Some(b"amv0") {
-        return Err(invalid(display, "aimd packet has no amv0 signature"));
+    // A packet whose own length word disagrees with the MP4 sample table, or
+    // that lacks the `amv0` signature, is damaged (Indianapolis 2026 CT1
+    // Run2: one such packet in 10,906 at 18 minutes of otherwise clean
+    // recording). It is skipped and counted; the first packet was already
+    // validated by the caller, so this cannot mistake a non-aimd track for a
+    // damaged one, and a recording where every packet is bad still fails
+    // through the "no supported scalar records" check.
+    if be16(packet, 0).map(usize::from) != Some(packet.len().saturating_sub(2))
+        || packet.get(6..10) != Some(b"amv0")
+    {
+        let _ = display;
+        if stats.malformed_packets.0 == 0 {
+            stats.malformed_packets = (0, offset, size);
+        }
+        stats.malformed_packets.0 += 1;
+        return Ok(());
     }
     let mut at = 10usize;
     while let Some(start) = scalar_record_start(packet, at) {
@@ -1268,6 +1279,17 @@ impl AimFile {
                     "{} scalar record value(s) were not terminated with ')' as \
                      expected and were skipped",
                     stats.value_unterminated
+                ),
+            ));
+        }
+        if stats.malformed_packets.0 > 0 {
+            let (count, offset, size) = stats.malformed_packets;
+            diagnostics.push(Diagnostic::warning(
+                "aim.packet_malformed",
+                format!(
+                    "{count} aimd packet(s) whose length word or amv0 signature did not \
+                     match the MP4 sample table were skipped (first at byte offset \
+                     {offset}, {size} bytes); samples inside them are lost"
                 ),
             ));
         }
@@ -2217,6 +2239,40 @@ mod tests {
             .diagnostics()
             .iter()
             .any(|d| d.code == "aim.unknown_record_id"));
+    }
+
+    /// Indianapolis 2026 CT1 Run2 (AiM SmartyCam, 10,906 aimd packets over
+    /// 18 minutes): one packet's length word disagreed with the MP4 sample
+    /// table and the whole file was rejected, losing ten flying laps. A
+    /// damaged packet is skipped and counted; the rest of the recording
+    /// stays readable.
+    #[test]
+    fn a_malformed_packet_is_skipped_not_fatal() {
+        let mut bytes = multilap_fixture_mp4(INDEX_PACKET_SAMPLES + 40);
+        let track = aimd_track(&bytes, "fixture.mp4").unwrap();
+        let clean = AimFile::from_bytes("fixture.mp4", bytes.clone()).unwrap();
+        let clean_samples: u64 = clean.channels().iter().map(|c| c.sample_count).sum();
+        // Corrupt the length word of a data packet in the middle (the first
+        // packet is the caller's format check and must stay valid).
+        let vp = track.samples[track.samples.len() / 2];
+        let bogus = (vp.1 as u16).wrapping_add(7).to_be_bytes(); // length word no longer matches stsz
+        bytes[vp.0 as usize..vp.0 as usize + 2].copy_from_slice(&bogus);
+        let file = AimFile::from_bytes("fixture.mp4", bytes).unwrap();
+        let diagnostic = file
+            .diagnostics()
+            .iter()
+            .find(|d| d.code == "aim.packet_malformed")
+            .expect("malformed packet is reported");
+        assert!(
+            diagnostic.message.starts_with("1 aimd packet(s)"),
+            "{diagnostic:?}"
+        );
+        let samples: u64 = file.channels().iter().map(|c| c.sample_count).sum();
+        assert!(
+            samples < clean_samples,
+            "the damaged packet's samples are gone"
+        );
+        assert!(samples > 0, "everything else is kept");
     }
 
     #[test]
