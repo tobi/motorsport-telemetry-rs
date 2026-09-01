@@ -16,6 +16,17 @@ counter reset. The rates and channel roles were informed by aggregate local
 recording structure; all durations, samples, identities, and timing values are
 invented. No proprietary data is embedded in the fixtures.
 
+`synthetic_cosworth.legacy.telemetry` and `synthetic_cosworth.telemetry` are
+the two `.telemetry` containers of `synthetic_cosworth.pds`: the legacy
+aligned STORE zip (FlatBuffers catalog v10, first bytes `PK\x03\x04`) and the
+current zstd-compressed MTJ document (first bytes `28 B5 2F FD`). They pin
+that both containers keep opening side by side. Regenerate with the CLI:
+
+```sh
+motorsport-telemetry convert --no-passes --native-zip tests/fixtures/synthetic_cosworth.pds tests/fixtures/synthetic_cosworth.legacy.telemetry
+motorsport-telemetry convert --no-passes tests/fixtures/synthetic_cosworth.pds tests/fixtures/synthetic_cosworth.telemetry
+```
+
 Regenerate all synthetic fixtures with:
 
 ```sh

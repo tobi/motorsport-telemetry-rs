@@ -345,3 +345,114 @@ fn jsonl_and_zstd_match_on_real_motec_when_present() {
         "expected JSONL not to be a bit-copy of the Motec source"
     );
 }
+
+/// Both `.telemetry` containers, side by side in one process: the committed
+/// legacy zip fixture (`PK\x03\x04`, FlatBuffers catalog, written by
+/// `convert --native-zip`) and the committed zstd-MTJ fixture
+/// (`28 B5 2F FD`) of the same synthetic Cosworth recording. Same name
+/// extension, different first bytes, identical content once opened.
+#[test]
+fn legacy_zip_and_zstd_mtj_telemetry_files_open_side_by_side() {
+    use telemetry_format::{sniff_container, Container, TelemetryRecording};
+
+    let legacy_path = fixture("synthetic_cosworth.legacy.telemetry");
+    let modern_path = fixture("synthetic_cosworth.telemetry");
+    assert_eq!(&std::fs::read(&legacy_path).unwrap()[..4], b"PK\x03\x04");
+    assert_eq!(
+        &std::fs::read(&modern_path).unwrap()[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD]
+    );
+    assert_eq!(sniff_container(&legacy_path).unwrap(), Container::NativeZip);
+    assert_eq!(sniff_container(&modern_path).unwrap(), Container::JsonlZstd);
+
+    // Same generic entry point for both; the container is decided by content.
+    let legacy = open(&legacy_path).unwrap();
+    let modern = open(&modern_path).unwrap();
+    let vendor = open(fixture("synthetic_cosworth.pds")).unwrap();
+    for (name, file) in [("legacy", &legacy), ("modern", &modern)] {
+        assert_eq!(file.format(), "pds", "{name} keeps the vendor format");
+        assert_eq!(
+            file.channels().len(),
+            vendor.channels().len(),
+            "{name} channel count"
+        );
+    }
+
+    // Identical laps, including the stint model, for both and the source.
+    let strip = |laps: Vec<motorsport_telemetry::motorsport_telemetry_core::LapMetadata>| {
+        laps.into_iter()
+            .map(|lap| {
+                (
+                    lap.number,
+                    lap.stint,
+                    lap.stint_lap,
+                    lap.kind,
+                    lap.label(),
+                    lap.complete,
+                    lap.start_ns / 1_000_000,
+                    lap.end_ns / 1_000_000,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let legacy_laps = strip(read_lap_metadata(&legacy_path).unwrap());
+    let modern_laps = strip(read_lap_metadata(&modern_path).unwrap());
+    let vendor_laps = strip(vendor.metadata().laps);
+    assert_eq!(legacy_laps, vendor_laps);
+    assert_eq!(modern_laps, vendor_laps);
+    assert_eq!(legacy_laps.len(), 5);
+    assert_eq!(
+        legacy_laps
+            .iter()
+            .map(|lap| lap.4.as_str())
+            .collect::<Vec<_>>(),
+        ["S1 out", "S1 L2", "S1 L3", "S1 L4", "S1 in"]
+    );
+
+    // Identical normalized samples at the same instants.
+    let legacy_n = legacy.normalizer();
+    let modern_n = modern.normalizer();
+    let vendor_n = vendor.normalizer();
+    for time_ns in [5_000_000_000u64, 60_000_000_000, 200_000_000_000] {
+        let (l, m, v) = (
+            legacy_n.sample(time_ns),
+            modern_n.sample(time_ns),
+            vendor_n.sample(time_ns),
+        );
+        assert_eq!(l.speed_mps, v.speed_mps, "legacy speed at {time_ns}");
+        assert!(
+            (m.speed_mps.unwrap() - v.speed_mps.unwrap()).abs() < 1e-9,
+            "modern speed at {time_ns}"
+        );
+        assert_eq!(l.lap_number, v.lap_number);
+        assert_eq!(m.lap_number, v.lap_number);
+        assert_eq!(l.lap_label, m.lap_label);
+    }
+
+    // The typed entry point reports which container it found, and header-only
+    // helpers work for both.
+    assert!(matches!(
+        TelemetryRecording::open_unchanged(&legacy_path).unwrap(),
+        TelemetryRecording::Native(_)
+    ));
+    assert!(matches!(
+        TelemetryRecording::open_unchanged(&modern_path).unwrap(),
+        TelemetryRecording::Jsonl(_)
+    ));
+    assert_eq!(
+        motorsport_telemetry::read_valid_laps(&legacy_path).unwrap(),
+        motorsport_telemetry::read_valid_laps(&modern_path).unwrap()
+    );
+    assert!(!motorsport_telemetry::telemetry_needs_update(&legacy_path).unwrap());
+    assert!(!motorsport_telemetry::telemetry_needs_update(&modern_path).unwrap());
+    assert!(motorsport_telemetry::read_format_version(&legacy_path).is_ok());
+    assert!(motorsport_telemetry::read_format_version(&modern_path).is_err());
+
+    // verify() accepts both and names the container it saw.
+    let legacy_report = motorsport_telemetry::verify(&legacy_path).unwrap();
+    let modern_report = motorsport_telemetry::verify(&modern_path).unwrap();
+    assert_eq!(legacy_report.kind, motorsport_telemetry::VerifyKind::Native);
+    assert_eq!(modern_report.kind, motorsport_telemetry::VerifyKind::Mtj);
+    assert!(modern_report.compressed);
+    assert_eq!(legacy_report.laps, modern_report.laps);
+}
