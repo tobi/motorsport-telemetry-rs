@@ -680,7 +680,10 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut [LapMetadata]) {
     // same stint, and that is the one place the counter is wrong about it.
     let mut bump = 0u32;
     for index in 0..laps.len() {
-        if index > 0 && laps[index - 1].kind == LapKind::Pit {
+        if index > 0
+            && laps[index - 1].kind == LapKind::Pit
+            && laps[index].stint == laps[index - 1].stint - bump
+        {
             bump += 1;
         }
         laps[index].stint += bump;
@@ -736,15 +739,21 @@ pub(crate) fn fastest_lap(
     };
     authoritative
         .and_then(|source| source.fastest_lap.clone())
-        .map(|reported| {
+        .and_then(|reported| {
             // The source's pick, but as the classified lap (stint, kind,
             // virtual number) so it is the same value a consumer finds in
             // `laps`. A reported fastest lap that is not in the list is
-            // returned as-is.
-            laps.iter()
+            // returned as-is; one that classifies as anything but flying (a
+            // VBO gate crossing inside a pit stop, an in-lap fragment) is
+            // rejected and the flying selection below applies.
+            match laps
+                .iter()
                 .find(|lap| lap.start_ns == reported.start_ns && lap.end_ns == reported.end_ns)
-                .cloned()
-                .unwrap_or(reported)
+            {
+                Some(lap) if lap.kind.is_flying() => Some(lap.clone()),
+                Some(_) => None,
+                None => Some(reported),
+            }
         })
         .or_else(|| {
             laps.iter()

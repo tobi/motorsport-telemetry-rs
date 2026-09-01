@@ -1436,6 +1436,78 @@ mod tests {
         assert_ne!(metadata.fastest_lap.as_ref().unwrap().kind, LapKind::Pit);
     }
 
+    /// When the counter itself restarted right after the pit lap, the stint
+    /// split is already there; the pit rule must not add a second one.
+    #[test]
+    fn a_pit_lap_followed_by_a_counter_reset_starts_one_stint_not_two() {
+        let mut lap_number = Vec::new();
+        let mut speed = Vec::new();
+        for t in 0..60u32 {
+            lap_number.push(match t {
+                0..=9 => 1.0,
+                10..=19 => 2.0,
+                20..=39 => 3.0,
+                40..=49 => 0.0, // dash reset after the stop
+                _ => 1.0,
+            });
+            speed.push(if (24..=41).contains(&t) { 0.0 } else { 45.0 });
+        }
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                ("Lap Number", "", lap_number),
+                ("Ground Speed", "m/s", speed),
+            ],
+        );
+        let metadata = read_source_metadata(&source);
+        let stints: Vec<u32> = metadata.laps.iter().map(|lap| lap.stint).collect();
+        assert_eq!(stints, [1, 1, 1, 2, 2], "{:?}", metadata.laps);
+    }
+
+    /// A source-reported fastest lap (VBO gate, LDX details) that classifies
+    /// as a pit lap is not the fastest lap.
+    #[test]
+    fn authoritative_fastest_lap_that_is_a_pit_lap_is_rejected() {
+        struct WithFastest(MetadataSource);
+        impl TelemetrySource for WithFastest {
+            fn path(&self) -> &str {
+                self.0.path()
+            }
+            fn format(&self) -> &'static str {
+                "synthetic"
+            }
+            fn channels(&self) -> &[Channel] {
+                self.0.channels()
+            }
+            fn decode(&self, c: usize, k: usize, i: u64) -> f64 {
+                self.0.decode(c, k, i)
+            }
+            fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
+                let laps = vec![
+                    LapMetadata::interval(1, 0, 20_000_000_000, true),
+                    LapMetadata::interval(2, 20_000_000_000, 36_000_000_000, true), // 16 s, stop inside
+                    LapMetadata::interval(3, 36_000_000_000, 56_000_000_000, true),
+                ];
+                Some(SourceLapMetadata {
+                    fastest_lap: Some(laps[1].clone()),
+                    laps,
+                })
+            }
+        }
+        let speed: Vec<f64> = (0..60u32)
+            .map(|t| if (21..=35).contains(&t) { 0.0 } else { 45.0 })
+            .collect();
+        let source = WithFastest(channels_source(
+            1_000_000_000,
+            vec![("Ground Speed", "m/s", speed)],
+        ));
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.laps[1].kind, LapKind::Pit);
+        let fastest = metadata.fastest_lap.as_ref().unwrap();
+        assert!(fastest.kind.is_flying(), "{fastest:?}");
+        assert_eq!(fastest.stint_lap, 1);
+    }
+
     #[test]
     fn a_counter_drop_that_recovers_within_seconds_is_a_glitch_not_a_stint() {
         // A stale dash frame re-sends lap 2 for one 10 s sample inside lap 3.
