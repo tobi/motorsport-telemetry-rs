@@ -208,8 +208,13 @@ zip stores intervals only and is classified on open. It is never an interval reb
 source recording and its `.telemetry` conversion can never disagree about
 which lap was fastest.
 
-`.telemetry` stores the result in the header (`laps` plus the `valid_laps`
-scalar) so later `read_laps` / `read_valid_laps` do not scan samples.
+`.telemetry` stores the result in the header (the laps line, with stints and
+kinds) so `read_metadata` / `read_laps` / `read_valid_laps` / `read_channels`
+are O(header): a zstd-MTJ document is streamed only through its first two
+lines — 0.3 ms on a 9 MB, 700-channel recording versus 400 ms for a full
+open — and a legacy zip maps its catalog. The header carries channel and
+sample counts, the driver ids, the fastest lap and a channel directory
+(`ch`) for exactly this purpose.
 
 VBOX recordings that roll to a second video (`avifileindex` 1 then 2, files
 `stem_0001.mp4` / `stem_0002.mp4`) keep both files in the catalog. Mapping at a

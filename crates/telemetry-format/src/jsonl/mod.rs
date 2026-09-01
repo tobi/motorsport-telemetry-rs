@@ -6,10 +6,10 @@
 use crate::write::TelemetryFormatError;
 use motorsport_telemetry_core::{
     read_source_metadata, AbsoluteTimeRange, AppliedPass, Channel, ChannelDisplay, ChannelLabel,
-    FileMetadata, LapMetadata, SourceIdentity, VideoFileRef,
+    FileMetadata, LapKind, LapMetadata, SourceIdentity, VideoFileRef,
 };
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 mod align;
@@ -88,6 +88,155 @@ impl JsonlRecording {
         } else {
             Self::from_reader(display, BufReader::new(file))
         }
+    }
+
+    /// Reads a recording's [`FileMetadata`] from the first two lines only.
+    ///
+    /// This is the O(header) path: the zstd frame is decoded as a stream and
+    /// abandoned after the laps line, so cost depends on header size (identity,
+    /// laps, video frame table), never on the channel data. Everything in
+    /// [`FileMetadata`] comes straight from the header since 1.3.2 (`nc`,
+    /// `nsc`, `ns`, `dids`, `fl`); a document written before those keys existed
+    /// returns `None` and the caller falls back to [`Self::open`].
+    pub fn read_header_metadata(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<FileMetadata>, TelemetryFormatError> {
+        let path = path.as_ref();
+        let display = path.to_string_lossy().into_owned();
+        let mut file = File::open(path)?;
+        if starts_with_zstd(&mut file)? {
+            let decoder = zstd::Decoder::new(file).map_err(zstd_err)?;
+            Self::header_metadata_from_reader(display, BufReader::new(decoder))
+        } else {
+            Self::header_metadata_from_reader(display, BufReader::new(file))
+        }
+    }
+
+    /// The channel directory of a recording from its header line only:
+    /// name, unit, rate, start and sample count per channel, no values. Same
+    /// cost model and fallback rule as [`Self::read_header_metadata`].
+    pub fn read_header_channels(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<Vec<Channel>>, TelemetryFormatError> {
+        let path = path.as_ref();
+        let mut file = File::open(path)?;
+        let header_line = if starts_with_zstd(&mut file)? {
+            let decoder = zstd::Decoder::new(file).map_err(zstd_err)?;
+            json::next_record(&mut BufReader::new(decoder).lines(), "header")?
+        } else {
+            json::next_record(&mut BufReader::new(file).lines(), "header")?
+        };
+        Ok(read::parse_header_line(&header_line)?.directory)
+    }
+
+    /// [`Self::read_header_metadata`] over an in-memory document.
+    pub fn header_metadata_from_bytes(
+        path: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<Option<FileMetadata>, TelemetryFormatError> {
+        if bytes.starts_with(&ZSTD_MAGIC) {
+            let decoder = zstd::Decoder::new(bytes).map_err(zstd_err)?;
+            Self::header_metadata_from_reader(path.into(), BufReader::new(decoder))
+        } else {
+            Self::header_metadata_from_reader(path.into(), BufReader::new(bytes))
+        }
+    }
+
+    fn header_metadata_from_reader(
+        path: String,
+        reader: impl std::io::BufRead,
+    ) -> Result<Option<FileMetadata>, TelemetryFormatError> {
+        let mut lines = reader.lines();
+        let header_line = json::next_record(&mut lines, "header")?;
+        let header = read::parse_header_line(&header_line)?;
+        if header.extension {
+            // A sidecar's metadata is its groups; leave that to the full parser.
+            return Ok(None);
+        }
+        let Some((channel_count, sampled_channel_count, sample_count)) = header.counts else {
+            return Ok(None);
+        };
+        let laps_line = json::next_record(&mut lines, "laps")?;
+        let laps = read::parse_laps_line(&laps_line, header.quantum_ns)?;
+        // The stint model is stored per lap; a pre-1.3.0 document without it
+        // needs the speed trace to classify, i.e. a full open.
+        if laps
+            .iter()
+            .any(|lap| lap.kind == LapKind::Unknown || lap.stint == 0)
+        {
+            return Ok(None);
+        }
+        let fastest_lap = header
+            .fastest_lap_number
+            .and_then(|number| laps.iter().find(|lap| lap.number == number).cloned());
+        let valid_laps = laps.iter().filter(|lap| lap.kind.is_flying()).count() as u32;
+        let schema_hash = header.schema_hash.unwrap_or(0);
+        let session_key = header.clock.as_ref().and_then(|clock| {
+            (!clock.session_hint.is_empty())
+                .then(|| format!("{}:{schema_hash:016x}", clock.session_hint))
+        });
+        let format = match header.source_format.as_str() {
+            "aimd" | "pds" | "motec" | "vbo" | "telemetry" => header.source_format.clone(),
+            _ => "jsonl".to_owned(),
+        };
+        let video_frame_count =
+            (!header.video_times.is_empty()).then_some(header.video_times.len() as u64);
+        let videos = header
+            .videos
+            .iter()
+            .cloned()
+            .map(|mut video| {
+                if video.presentation_offset_ns.is_none() {
+                    video.presentation_offset_ns = header.video_offset_ns;
+                }
+                if video.frame_count == 0 {
+                    if let Some(count) = video_frame_count {
+                        video.frame_count = count;
+                    }
+                }
+                video
+            })
+            .collect();
+        Ok(Some(FileMetadata {
+            format,
+            source_format: if header.source_format.is_empty() {
+                "jsonl".to_owned()
+            } else {
+                header.source_format.clone()
+            },
+            source_path: if header.source_path.is_empty() {
+                path.clone()
+            } else {
+                header.source_path.clone()
+            },
+            path,
+            passes: header.passes,
+            channel_count: channel_count as usize,
+            sampled_channel_count: sampled_channel_count as usize,
+            sample_count,
+            duration_ns: header.duration_ns,
+            schema_hash,
+            format_version: None,
+            session_key,
+            absolute_clock: header.clock.as_ref().map(|clock| clock.clock.clone()),
+            absolute_start_ns: header.clock.as_ref().map(|clock| clock.start_ns),
+            absolute_end_ns: header.clock.as_ref().map(|clock| clock.end_ns),
+            clock_offset_ns: header
+                .clock
+                .as_ref()
+                .map(|clock| i128::from(clock.start_ns)),
+            utc_start_ns: header.utc_start_ns,
+            timezone: header.timezone,
+            identity: header.identity,
+            driver_ids: header.driver_ids.unwrap_or_default(),
+            driver_stints: Vec::new(),
+            valid_laps,
+            laps,
+            fastest_lap,
+            video_frame_count,
+            video_presentation_offset_ns: header.video_offset_ns,
+            videos,
+        }))
     }
 
     /// Parses an owned MTJ buffer, decompressing a zstd frame when present.

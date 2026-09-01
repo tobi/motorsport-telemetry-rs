@@ -114,47 +114,42 @@ pub fn read_lap_metadata(
     path: impl AsRef<Path>,
 ) -> Result<Vec<motorsport_telemetry_core::LapMetadata>, TelemetryError> {
     if is_telemetry(path.as_ref()) {
-        // Not the header-only `telemetry_format::read_laps`: a legacy zip
-        // stores intervals without the stint model, and classifying needs
-        // the speed trace. Opening maps the file; only speed is decoded.
-        return Ok(telemetry_format::TelemetryRecording::open_unchanged(path)?
-            .metadata()
-            .laps);
+        // O(header): MTJ reads its first two lines; a legacy zip maps the
+        // catalog and probes speed for classification.
+        return Ok(telemetry_format::read_laps(path)?);
     }
     if is_jsonl_path(path.as_ref()) {
-        return Ok(JsonlRecording::open(path)?.metadata().laps);
+        return Ok(telemetry_format::read_laps(path)?);
     }
     Ok(open_metadata(path)?.metadata().laps)
 }
 
 /// Returns the number of flying laps.
 ///
-/// For a `.telemetry` the recording is opened without rewriting and its laps
-/// classified (a legacy zip's header scalar predates the stint model).
+/// For a `.telemetry` this is an O(header) read (see [`read_metadata`]).
 pub fn read_valid_laps(path: impl AsRef<Path>) -> Result<u32, TelemetryError> {
     if is_telemetry(path.as_ref()) {
-        return Ok(telemetry_format::TelemetryRecording::open_unchanged(path)?
-            .metadata()
-            .valid_laps);
+        return Ok(telemetry_format::read_valid_laps(path)?);
     }
     if is_jsonl_path(path.as_ref()) {
-        return Ok(JsonlRecording::open(path)?.metadata().valid_laps);
+        return Ok(telemetry_format::read_valid_laps(path)?);
     }
     Ok(open_metadata(path)?.metadata().valid_laps)
 }
 
 /// Format-neutral file summary with the stint model resolved.
 ///
-/// For a `.telemetry` the recording is opened without rewriting (memory-map;
-/// channel payloads beyond speed are not decoded).
+/// For a `.telemetry` this is O(header): a zstd-MTJ document is decoded only
+/// through its header and laps lines; a legacy zip maps the catalog and probes
+/// the speed channel for classification. Vendor files are opened.
 pub fn read_metadata(
     path: impl AsRef<Path>,
 ) -> Result<motorsport_telemetry_core::FileMetadata, TelemetryError> {
     if is_telemetry(path.as_ref()) {
-        return Ok(telemetry_format::TelemetryRecording::open_unchanged(path)?.metadata());
+        return Ok(telemetry_format::read_metadata(path)?);
     }
     if is_jsonl_path(path.as_ref()) {
-        return Ok(JsonlRecording::open(path)?.metadata());
+        return Ok(telemetry_format::read_metadata(path)?);
     }
     Ok(open_metadata(path)?.metadata())
 }

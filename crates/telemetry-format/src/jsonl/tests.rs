@@ -1249,3 +1249,104 @@ fn alignment_snap_up_duration_to_lattice() {
     let text = String::from_utf8(bytes).unwrap();
     assert!(text.contains("\"dur\":50000000"));
 }
+
+/// The header line alone answers `FileMetadata` and the channel directory.
+/// Proven by cutting the document off right after the laps line: the
+/// header-only readers still succeed on the truncated (and re-compressed)
+/// bytes while the full parser cannot, so nothing past line 2 was needed.
+#[test]
+fn header_only_metadata_and_channels_need_only_the_first_two_lines() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/synthetic_cosworth.pds");
+    let source = cosworth_telemetry::CosworthFile::open(&fixture).unwrap();
+    let mut bytes = Vec::new();
+    write_jsonl_to(&source, &mut bytes).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    let header = text.lines().next().unwrap();
+    for key in [
+        "\"nc\":",
+        "\"nsc\":",
+        "\"ns\":",
+        "\"dids\":[",
+        "\"fl\":",
+        "\"ch\":[[",
+    ] {
+        assert!(header.contains(key), "{key} missing from {header}");
+    }
+
+    let full = JsonlRecording::from_bytes("full.telemetry", &bytes).unwrap();
+    let expected = full.metadata();
+    let quick = JsonlRecording::header_metadata_from_bytes("full.telemetry", &bytes)
+        .unwrap()
+        .expect("header carries everything");
+    assert_eq!(quick.channel_count, expected.channel_count);
+    assert_eq!(quick.sampled_channel_count, expected.sampled_channel_count);
+    assert_eq!(quick.sample_count, expected.sample_count);
+    assert_eq!(quick.duration_ns, expected.duration_ns);
+    assert_eq!(quick.schema_hash, expected.schema_hash);
+    assert_eq!(quick.session_key, expected.session_key);
+    assert_eq!(quick.absolute_clock, expected.absolute_clock);
+    assert_eq!(quick.absolute_start_ns, expected.absolute_start_ns);
+    assert_eq!(quick.absolute_end_ns, expected.absolute_end_ns);
+    assert_eq!(quick.clock_offset_ns, expected.clock_offset_ns);
+    assert_eq!(quick.identity, expected.identity);
+    assert_eq!(quick.driver_ids, expected.driver_ids);
+    assert_eq!(quick.laps, expected.laps);
+    assert_eq!(quick.valid_laps, expected.valid_laps);
+    assert_eq!(quick.fastest_lap, expected.fastest_lap);
+    assert_eq!(quick.format, expected.format);
+    assert_eq!(quick.source_format, expected.source_format);
+    assert_eq!(quick.passes, expected.passes);
+
+    // Truncate after line 2 and compress: header readers work, full parse fails.
+    let cut = text.splitn(3, '\n').take(2).collect::<Vec<_>>().join("\n") + "\n";
+    let compressed = zstd::encode_all(cut.as_bytes(), 3).unwrap();
+    assert!(compressed.starts_with(&ZSTD_MAGIC));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cut.telemetry");
+    std::fs::write(&path, &compressed).unwrap();
+    let from_cut = JsonlRecording::read_header_metadata(&path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(from_cut.laps, expected.laps);
+    assert_eq!(from_cut.channel_count, expected.channel_count);
+    let channels = JsonlRecording::read_header_channels(&path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(channels.len(), full.channels().len());
+    for (quick, full) in channels.iter().zip(full.channels()) {
+        assert_eq!(quick.name, full.name);
+        assert_eq!(quick.unit, full.unit);
+        assert_eq!(quick.sample_count, full.sample_count);
+        assert_eq!(
+            quick.chunks[0].sample_period_ns,
+            full.chunks[0].sample_period_ns
+        );
+        assert_eq!(quick.chunks[0].time_base_ns, full.chunks[0].time_base_ns);
+    }
+    assert!(
+        JsonlRecording::open(&path).is_err()
+            || JsonlRecording::open(&path).unwrap().channels().is_empty(),
+        "the cut document must not parse as a complete recording with channels"
+    );
+
+    // A document from before the directory keys existed falls back (None).
+    let old_header = header
+        .replace(&format!(",\"nc\":{}", expected.channel_count), "")
+        .replace(&format!(",\"nsc\":{}", expected.sampled_channel_count), "")
+        .replace(&format!(",\"ns\":{}", expected.sample_count), "");
+    assert!(!old_header.contains("\"nc\":"));
+    let old = old_header + &text[header.len()..];
+    assert!(
+        JsonlRecording::header_metadata_from_bytes("old.telemetry", old.as_bytes())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        JsonlRecording::from_bytes("old.telemetry", old.as_bytes())
+            .unwrap()
+            .metadata()
+            .laps,
+        expected.laps
+    );
+}

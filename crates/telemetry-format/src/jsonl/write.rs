@@ -236,6 +236,35 @@ pub(super) fn write_jsonl_document(
         )?;
         writer.write_all(b"\n")?;
     } else {
+        let counts = HeaderCounts {
+            channel_count: aligned.len() as u64,
+            sampled_channel_count: aligned
+                .iter()
+                .filter(|series| series.values.iter().any(Option::is_some))
+                .count() as u64,
+            sample_count: aligned
+                .iter()
+                .map(|series| series.values.len() as u64)
+                .sum(),
+            fastest_lap_number: metadata.fastest_lap.as_ref().and_then(|fastest| {
+                laps.iter()
+                    .find(|lap| {
+                        lap.number == fastest.number
+                            || (lap.stint == fastest.stint && lap.stint_lap == fastest.stint_lap)
+                    })
+                    .map(|lap| lap.number)
+            }),
+            directory: aligned
+                .iter()
+                .map(|series| DirectoryEntry {
+                    name: series.name.clone(),
+                    unit: series.unit.clone(),
+                    period_ns: series.period_ns,
+                    t0_ns: series.t0_ns,
+                    count: series.values.len() as u64,
+                })
+                .collect(),
+        };
         write_header(
             &mut writer,
             &metadata,
@@ -243,6 +272,7 @@ pub(super) fn write_jsonl_document(
             quantum_ns,
             origin_ns,
             duration_ns,
+            &counts,
         )?;
         writer.write_all(b"\n")?;
         write_laps(&mut writer, &laps)?;
@@ -266,6 +296,27 @@ pub(super) fn write_jsonl_document(
     writer.flush()?;
     Ok(())
 }
+/// Header keys that let a metadata read stop after the header line: how many
+/// channel lines follow (`nc`), how many carry a sample (`nsc`), the total
+/// sample count (`ns`), the drivers seen (`dids`), and which lap is fastest
+/// (`fl`, the virtual lap number in the laps line).
+struct HeaderCounts {
+    channel_count: u64,
+    sampled_channel_count: u64,
+    sample_count: u64,
+    fastest_lap_number: Option<i64>,
+    directory: Vec<DirectoryEntry>,
+}
+
+/// One `ch` tuple: the channel line's identity without its values.
+struct DirectoryEntry {
+    name: String,
+    unit: String,
+    period_ns: u64,
+    t0_ns: u64,
+    count: u64,
+}
+
 fn write_header(
     writer: &mut impl Write,
     metadata: &FileMetadata,
@@ -273,11 +324,46 @@ fn write_header(
     quantum_ns: u64,
     origin_ns: u64,
     duration_ns: u64,
+    counts: &HeaderCounts,
 ) -> Result<(), TelemetryFormatError> {
     write!(
         writer,
         "{{\"mtj\":{JSONL_VERSION},\"q\":{quantum_ns},\"dur\":{duration_ns}"
     )?;
+    write!(
+        writer,
+        ",\"nc\":{},\"nsc\":{},\"ns\":{}",
+        counts.channel_count, counts.sampled_channel_count, counts.sample_count
+    )?;
+    if !metadata.driver_ids.is_empty() {
+        writer.write_all(b",\"dids\":[")?;
+        for (position, id) in metadata.driver_ids.iter().enumerate() {
+            if position > 0 {
+                writer.write_all(b",")?;
+            }
+            write!(writer, "{id}")?;
+        }
+        writer.write_all(b"]")?;
+    }
+    if let Some(number) = counts.fastest_lap_number {
+        write!(writer, ",\"fl\":{number}")?;
+    }
+    // Channel directory: one compact tuple per channel line that follows,
+    // `[name, unit, hz, t0, count]`, so channel metadata is a header read.
+    writer.write_all(b",\"ch\":[")?;
+    for (position, entry) in counts.directory.iter().enumerate() {
+        if position > 0 {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(b"[")?;
+        write_json_string(writer, &entry.name)?;
+        writer.write_all(b",")?;
+        write_json_string(writer, &entry.unit)?;
+        writer.write_all(b",")?;
+        write_hz(writer, entry.period_ns)?;
+        write!(writer, ",{},{}]", entry.t0_ns, entry.count)?;
+    }
+    writer.write_all(b"]")?;
     if origin_ns != 0 {
         write!(writer, ",\"o\":{origin_ns}")?;
     }

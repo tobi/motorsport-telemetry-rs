@@ -161,6 +161,12 @@ Line 1 is a JSON object. Writers SHOULD emit keys in the order listed.
 | `q` | integer ≥ 1 | yes | Lattice quantum, nanoseconds. |
 | `dur` | integer ≥ 0 | yes | Exclusive file-relative duration, nanoseconds. |
 | `o` | integer ≥ 0 | no | Lattice origin, nanoseconds. Default `0`. |
+| `nc` | integer ≥ 0 | yes on write | Number of channel lines that follow. |
+| `nsc` | integer ≥ 0 | yes on write | Number of those channels with at least one non-null sample. |
+| `ns` | integer ≥ 0 | yes on write | Total sample slots over all channel lines. |
+| `dids` | array of integers | no | Internal driver identifiers seen in the recording, ascending. |
+| `fl` | integer | no | Virtual lap number (laps line, position 0) of the fastest flying lap. |
+| `ch` | array | yes on write | Channel directory: one `[name, unit, hz, t0, count]` tuple per channel line, in line order. `unit` is `""` when none; `t0` is the absolute lattice start (not origin-relative); `count` equals the length of that channel's `v`. |
 | `src` | string | no | Format of the original recording: `aimd`, `pds`, `motec`, `vbo`, or `telemetry`. Carried through rewrites: a `.telemetry` -> MTJ hop keeps the vendor id. |
 | `srcp` | string | no | Path of the original recording as seen at first conversion. Carried through rewrites like `src`. |
 | `drv` | string | no | Driver name. 1–80. |
@@ -192,6 +198,15 @@ not the join key. `utc` is the primary key.
 
 `mtj`, `q`, `dur`, `o`, `utc`, `abs`, `abe`, `vo`, and every `vpts` entry
 MUST be JSON integers, not quoted strings and not non-integral numbers.
+
+**Header-only reads.** `nc`/`nsc`/`ns`/`dids`/`fl`/`ch` plus the laps line
+(§5, with stint fields) make every recording-level fact available without
+reading a channel line. A reader that stops after line 2 has the file's
+identity, clocks, duration, counts, video table, laps with stints and kinds,
+fastest lap, and the channel directory. A document without these keys (written
+before they existed) is complete but must be parsed in full to know them.
+Values in `ch` MUST agree with the channel lines; a reader MAY trust `ch`
+without verifying.
 
 ### 4.1 Pass provenance (`passes`)
 

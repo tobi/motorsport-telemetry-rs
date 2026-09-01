@@ -18,6 +18,231 @@ use motorsport_telemetry_core::{
 use serde_json::{Map, Number, Value};
 use std::io::BufRead;
 
+/// Everything the first line of an MTJ/MTX document says, before any channel
+/// is read. Shared by the full parser and the header-only metadata reader.
+pub(super) struct ParsedHeader {
+    pub(super) extension: bool,
+    pub(super) quantum_ns: u64,
+    pub(super) duration_ns: u64,
+    pub(super) origin_ns: u64,
+    pub(super) identity: SourceIdentity,
+    pub(super) clock: Option<AbsoluteTimeRange>,
+    pub(super) timezone: String,
+    pub(super) utc_start_ns: Option<u64>,
+    pub(super) sidecar_header: Option<SidecarHeader>,
+    pub(super) source_format: String,
+    pub(super) source_path: String,
+    pub(super) passes: Vec<AppliedPass>,
+    pub(super) videos: Vec<VideoFileRef>,
+    pub(super) video_times: Vec<u64>,
+    pub(super) video_offset_ns: Option<i128>,
+    pub(super) schema_hash: Option<u64>,
+    /// `nc` / `nsc` / `ns`: channel count, sampled channel count, total
+    /// samples. Written since 1.3.2 so a metadata read need not touch the
+    /// channel lines. `None` on older documents.
+    pub(super) counts: Option<(u64, u64, u64)>,
+    /// `dids`: internal driver identifiers seen in the recording.
+    pub(super) driver_ids: Option<Vec<i64>>,
+    /// `fl`: virtual lap number of the fastest flying lap.
+    pub(super) fastest_lap_number: Option<i64>,
+    /// `ch`: the channel directory, one [`Channel`] per channel line that
+    /// follows (name, unit, rate, start, count; no values). `None` on
+    /// documents written before 1.3.2.
+    pub(super) directory: Option<Vec<Channel>>,
+}
+
+pub(super) fn parse_header_line(header_line: &str) -> Result<ParsedHeader, TelemetryFormatError> {
+    let header = parse_json(header_line)?;
+    let header = header
+        .as_object()
+        .ok_or_else(|| invalid("header must be a JSON object"))?;
+    let has_mtj = header.contains_key("mtj");
+    let has_mtx = header.contains_key("mtx");
+    if has_mtj && has_mtx {
+        return Err(invalid("header cannot contain both mtj and mtx"));
+    }
+    let extension = has_mtx;
+    let version_key = if extension { "mtx" } else { "mtj" };
+    let version = int_field(header, version_key)?
+        .ok_or_else(|| invalid(format!("header is missing {version_key}")))?;
+    let expected = if extension {
+        u64::from(JSONL_EXT_VERSION)
+    } else {
+        u64::from(JSONL_VERSION)
+    };
+    if version != expected {
+        return Err(invalid(format!(
+            "unsupported {version_key} version {version}"
+        )));
+    }
+    let (quantum_ns, duration_ns, origin_ns) = parse_group_header(header, "header")?;
+
+    let identity = SourceIdentity {
+        driver: string_field(header, "drv"),
+        vehicle: string_field(header, "veh"),
+        venue: string_field(header, "ven"),
+        event: string_field(header, "evt"),
+        session: string_field(header, "ses"),
+        date: string_field(header, "date"),
+        time: string_field(header, "time"),
+    };
+    let session_hint = string_field(header, "hint");
+    let clock = match (
+        string_field(header, "clk"),
+        int_field(header, "abs")?,
+        int_field(header, "abe")?,
+    ) {
+        (name, Some(start_ns), end_ns) if !name.is_empty() => Some(AbsoluteTimeRange {
+            clock: name,
+            start_ns,
+            end_ns: end_ns.unwrap_or(start_ns.saturating_add(duration_ns)),
+            session_hint,
+        }),
+        _ => None,
+    };
+    let timezone = string_field(header, "tz");
+    let utc_start_ns = int_field(header, "utc")?;
+    let sidecar_header = if extension {
+        let name = header
+            .get("n")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("mtx header is missing n"))?;
+        if name.is_empty() {
+            return Err(invalid("mtx header n must be non-empty"));
+        }
+        let utc = utc_start_ns.ok_or_else(|| invalid("mtx header is missing utc"))?;
+        if utc == 0 {
+            return Err(invalid(
+                "mtx header utc must be Unix-epoch nanoseconds at t=0",
+            ));
+        }
+        if timezone.is_empty() {
+            return Err(invalid("mtx header is missing tz"));
+        }
+        if !valid_iana_timezone(&timezone) {
+            return Err(invalid(format!(
+                "mtx header tz is not an IANA timezone: {timezone}"
+            )));
+        }
+        Some(SidecarHeader {
+            name: name.to_owned(),
+            visible: parse_vis(header, true, "mtx header")?,
+            right: parse_right(header.get("r"))?,
+            utc_start_ns: utc,
+            timezone: timezone.clone(),
+        })
+    } else {
+        if !timezone.is_empty() && !valid_iana_timezone(&timezone) {
+            return Err(invalid(format!(
+                "header tz is not an IANA timezone: {timezone}"
+            )));
+        }
+        None
+    };
+    let source_format = string_field(header, "src");
+    let source_path = string_field(header, "srcp");
+    let passes = parse_passes(header)?;
+    let (videos, video_times, video_offset_ns) = parse_videos(header, extension)?;
+    let schema_hash = parse_schema_hash(header)?;
+    let counts = match (
+        int_field(header, "nc")?,
+        int_field(header, "nsc")?,
+        int_field(header, "ns")?,
+    ) {
+        (Some(nc), Some(nsc), Some(ns)) => Some((nc, nsc, ns)),
+        _ => None,
+    };
+    let driver_ids = match header.get("dids") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_array()
+                .ok_or_else(|| invalid("dids must be an array"))?
+                .iter()
+                .map(|id| json_i64(id).ok_or_else(|| invalid("dids entries must be integers")))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    let fastest_lap_number = header.get("fl").and_then(json_i64);
+    let directory = match header.get("ch") {
+        None => None,
+        Some(value) => {
+            let entries = value
+                .as_array()
+                .ok_or_else(|| invalid("ch must be an array"))?;
+            let mut channels = Vec::with_capacity(entries.len());
+            for (index, entry) in entries.iter().enumerate() {
+                let fields = entry
+                    .as_array()
+                    .filter(|fields| fields.len() >= 5)
+                    .ok_or_else(|| invalid("ch entries must be [name, unit, hz, t0, count]"))?;
+                let name = fields[0]
+                    .as_str()
+                    .ok_or_else(|| invalid("ch name must be a string"))?;
+                let unit = fields[1]
+                    .as_str()
+                    .ok_or_else(|| invalid("ch unit must be a string"))?;
+                let hz = json_finite(&fields[2], name, "ch hz")?;
+                let period_ns = period_ns_from_hz(hz)
+                    .ok_or_else(|| invalid(format!("ch {name} has a non-positive hz")))?;
+                let t0_ns = json_u64(&fields[3])?.ok_or_else(|| invalid("ch t0"))?;
+                let count = json_u64(&fields[4])?.ok_or_else(|| invalid("ch count"))?;
+                channels.push(Channel {
+                    id: index as u32,
+                    name: name.to_owned(),
+                    unit: unit.to_owned(),
+                    unit_source: if unit.is_empty() {
+                        UnitSource::Unknown
+                    } else {
+                        UnitSource::Declared
+                    },
+                    sample_type: SampleType::F64,
+                    chunks: vec![Chunk {
+                        sample_period_ns: period_ns,
+                        sample_count: count,
+                        data_ptr: 0,
+                        sample_base: 0,
+                        time_base_ns: t0_ns,
+                    }],
+                    sample_count: count,
+                    duration_ns: t0_ns.saturating_add(count.saturating_mul(period_ns)),
+                });
+            }
+            Some(channels)
+        }
+    };
+    Ok(ParsedHeader {
+        extension,
+        quantum_ns,
+        duration_ns,
+        origin_ns,
+        identity,
+        clock,
+        timezone,
+        utc_start_ns,
+        sidecar_header,
+        source_format,
+        source_path,
+        passes,
+        videos,
+        video_times,
+        video_offset_ns,
+        schema_hash,
+        counts,
+        driver_ids,
+        fastest_lap_number,
+        directory,
+    })
+}
+
+/// Parses the laps line (line 2 of an MTJ recording).
+pub(super) fn parse_laps_line(
+    laps_line: &str,
+    quantum_ns: u64,
+) -> Result<Vec<LapMetadata>, TelemetryFormatError> {
+    parse_laps(&parse_json(laps_line)?, quantum_ns)
+}
+
 impl JsonlRecording {
     pub(super) fn from_reader(
         path: String,
@@ -25,104 +250,31 @@ impl JsonlRecording {
     ) -> Result<Self, TelemetryFormatError> {
         let mut lines = reader.lines();
         let header_line = next_record(&mut lines, "header")?;
-        let header = parse_json(&header_line)?;
-        let header = header
-            .as_object()
-            .ok_or_else(|| invalid("header must be a JSON object"))?;
-        let has_mtj = header.contains_key("mtj");
-        let has_mtx = header.contains_key("mtx");
-        if has_mtj && has_mtx {
-            return Err(invalid("header cannot contain both mtj and mtx"));
-        }
-        let extension = has_mtx;
-        let version_key = if extension { "mtx" } else { "mtj" };
-        let version = int_field(header, version_key)?
-            .ok_or_else(|| invalid(format!("header is missing {version_key}")))?;
-        let expected = if extension {
-            u64::from(JSONL_EXT_VERSION)
-        } else {
-            u64::from(JSONL_VERSION)
-        };
-        if version != expected {
-            return Err(invalid(format!(
-                "unsupported {version_key} version {version}"
-            )));
-        }
-        let (quantum_ns, duration_ns, origin_ns) = parse_group_header(header, "header")?;
-
-        let identity = SourceIdentity {
-            driver: string_field(header, "drv"),
-            vehicle: string_field(header, "veh"),
-            venue: string_field(header, "ven"),
-            event: string_field(header, "evt"),
-            session: string_field(header, "ses"),
-            date: string_field(header, "date"),
-            time: string_field(header, "time"),
-        };
-        let session_hint = string_field(header, "hint");
-        let clock = match (
-            string_field(header, "clk"),
-            int_field(header, "abs")?,
-            int_field(header, "abe")?,
-        ) {
-            (name, Some(start_ns), end_ns) if !name.is_empty() => Some(AbsoluteTimeRange {
-                clock: name,
-                start_ns,
-                end_ns: end_ns.unwrap_or(start_ns.saturating_add(duration_ns)),
-                session_hint,
-            }),
-            _ => None,
-        };
-        let timezone = string_field(header, "tz");
-        let utc_start_ns = int_field(header, "utc")?;
-        let sidecar_header = if extension {
-            let name = header
-                .get("n")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("mtx header is missing n"))?;
-            if name.is_empty() {
-                return Err(invalid("mtx header n must be non-empty"));
-            }
-            let utc = utc_start_ns.ok_or_else(|| invalid("mtx header is missing utc"))?;
-            if utc == 0 {
-                return Err(invalid(
-                    "mtx header utc must be Unix-epoch nanoseconds at t=0",
-                ));
-            }
-            if timezone.is_empty() {
-                return Err(invalid("mtx header is missing tz"));
-            }
-            if !valid_iana_timezone(&timezone) {
-                return Err(invalid(format!(
-                    "mtx header tz is not an IANA timezone: {timezone}"
-                )));
-            }
-            Some(SidecarHeader {
-                name: name.to_owned(),
-                visible: parse_vis(header, true, "mtx header")?,
-                right: parse_right(header.get("r"))?,
-                utc_start_ns: utc,
-                timezone: timezone.clone(),
-            })
-        } else {
-            if !timezone.is_empty() && !valid_iana_timezone(&timezone) {
-                return Err(invalid(format!(
-                    "header tz is not an IANA timezone: {timezone}"
-                )));
-            }
-            None
-        };
-        let source_format = string_field(header, "src");
-        let source_path = string_field(header, "srcp");
-        let passes = parse_passes(header)?;
-        let (videos, video_times, video_offset_ns) = parse_videos(header, extension)?;
-        let schema_hash = parse_schema_hash(header)?;
+        let ParsedHeader {
+            extension,
+            quantum_ns,
+            duration_ns,
+            origin_ns,
+            identity,
+            clock,
+            timezone,
+            utc_start_ns,
+            sidecar_header,
+            source_format,
+            source_path,
+            passes,
+            videos,
+            video_times,
+            video_offset_ns,
+            schema_hash,
+            ..
+        } = parse_header_line(&header_line)?;
 
         let laps = if extension {
             Vec::new()
         } else {
             let laps_line = next_record(&mut lines, "laps")?;
-            parse_laps(&parse_json(&laps_line)?, quantum_ns)?
+            parse_laps_line(&laps_line, quantum_ns)?
         };
 
         let mut channels = Vec::new();

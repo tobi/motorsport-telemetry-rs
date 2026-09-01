@@ -58,6 +58,10 @@ pub fn read_format_version(path: impl AsRef<std::path::Path>) -> Result<u16, Tel
 
 /// Header-only check: a legacy zip older than [`FORMAT_VERSION`]. MTJ
 /// containers never need a catalog migration and report `false`.
+///
+/// Raw header-only readers of the legacy zip remain available as
+/// [`NativeRecording::read_laps`] / [`NativeRecording::read_metadata`]; they
+/// return laps without the stint model.
 pub fn file_needs_update(path: impl AsRef<std::path::Path>) -> Result<bool, TelemetryFormatError> {
     let path = path.as_ref();
     match sniff_container(path)? {
@@ -70,37 +74,65 @@ pub fn file_needs_update(path: impl AsRef<std::path::Path>) -> Result<bool, Tele
     }
 }
 
-/// Reads file metadata. Header-only for a legacy zip (`metadata.fb`); an MTJ
-/// document is parsed (its header line carries laps and identity).
+/// Reads file metadata with the stint model resolved, in O(header).
+///
+/// * zstd / plain MTJ: the first two lines only ([`JsonlRecording::read_header_metadata`]);
+///   a document written before the header carried `nc`/`nsc`/`ns`/`ch` and
+///   per-lap stints falls back to a full open.
+/// * legacy zip: memory-map, catalog, and the speed probes classification
+///   needs — no channel payload is decoded.
 pub fn read_metadata(
     path: impl AsRef<std::path::Path>,
 ) -> Result<motorsport_telemetry_core::FileMetadata, TelemetryFormatError> {
     let path = path.as_ref();
     match sniff_container(path)? {
-        Container::NativeZip => NativeRecording::read_metadata(path),
-        _ => Ok(TelemetryRecording::open_unchanged(path)?.metadata()),
+        Container::NativeZip => Ok(NativeRecording::open_unchanged(path)?.metadata()),
+        Container::JsonlZstd | Container::Jsonl => {
+            match JsonlRecording::read_header_metadata(path)? {
+                Some(metadata) => Ok(metadata),
+                None => Ok(JsonlRecording::open(path)?.metadata()),
+            }
+        }
+        Container::Unknown => Err(TelemetryFormatError::Invalid(format!(
+            "{}: not a .telemetry file",
+            path.display()
+        ))),
     }
 }
 
-/// Reads stored laps without mapping channel payloads of a legacy zip.
+/// Reads the classified laps. Same cost model as [`read_metadata`].
 pub fn read_laps(
     path: impl AsRef<std::path::Path>,
 ) -> Result<Vec<motorsport_telemetry_core::LapMetadata>, TelemetryFormatError> {
-    let path = path.as_ref();
-    match sniff_container(path)? {
-        Container::NativeZip => NativeRecording::read_laps(path),
-        _ => Ok(TelemetryRecording::open_unchanged(path)?.metadata().laps),
-    }
+    Ok(read_metadata(path)?.laps)
 }
 
-/// Reads the stored complete-lap count.
+/// Reads the flying-lap count. Same cost model as [`read_metadata`].
 pub fn read_valid_laps(path: impl AsRef<std::path::Path>) -> Result<u32, TelemetryFormatError> {
+    Ok(read_metadata(path)?.valid_laps)
+}
+
+/// Reads the channel directory (name, unit, rate, start, count per channel;
+/// no values) in O(header) where the container allows it: the MTJ `ch` key,
+/// or the legacy zip catalog. Falls back to a full MTJ parse for documents
+/// written before `ch` existed.
+pub fn read_channels(
+    path: impl AsRef<std::path::Path>,
+) -> Result<Vec<motorsport_telemetry_core::Channel>, TelemetryFormatError> {
+    use motorsport_telemetry_core::TelemetrySource;
     let path = path.as_ref();
     match sniff_container(path)? {
-        Container::NativeZip => NativeRecording::read_valid_laps(path),
-        _ => Ok(TelemetryRecording::open_unchanged(path)?
-            .metadata()
-            .valid_laps),
+        Container::NativeZip => Ok(NativeRecording::open_unchanged(path)?.channels().to_vec()),
+        Container::JsonlZstd | Container::Jsonl => {
+            match JsonlRecording::read_header_channels(path)? {
+                Some(channels) => Ok(channels),
+                None => Ok(JsonlRecording::open(path)?.channels().to_vec()),
+            }
+        }
+        Container::Unknown => Err(TelemetryFormatError::Invalid(format!(
+            "{}: not a .telemetry file",
+            path.display()
+        ))),
     }
 }
 #[cfg(test)]

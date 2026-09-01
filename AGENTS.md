@@ -61,6 +61,17 @@ from the original vendor recording. Likewise the v8 -> v9 migration leaves
 `passes` empty and `source_path` as found: provenance that predates v9 is
 unknowable, not defaultable.
 
+## Metadata is O(header)
+
+`telemetry_format::read_metadata` / `read_laps` / `read_valid_laps` /
+`read_channels` and the facade `read_*` must never parse channel data. For MTJ
+that means `JsonlRecording::read_header_metadata` / `read_header_channels`:
+stream the zstd frame, stop after the laps line, answer from the header keys
+`nc`/`nsc`/`ns`/`dids`/`fl`/`ch` (fall back to a full open only for documents
+that predate them). Anything added to `FileMetadata` or needed by a metadata
+table function must be written into the header too, or it silently turns the
+catalog scan back into a full decode.
+
 ## Laps are stints
 
 `FileMetadata::laps` is the normalised lap model (`telemetry-core/src/laps.rs`,
