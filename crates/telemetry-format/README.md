@@ -1,8 +1,11 @@
 # telemetry-format
 
-Native `.telemetry` recordings: an aligned STORE zip whose first member is a
-FlatBuffers catalog (`metadata.fb`) and whose remaining members are lossless
-native channel columns.
+The `.telemetry` file format. A `.telemetry` is a **zstd-compressed MTJ JSONL
+document** (`write_telemetry`); the earlier aligned STORE zip with a
+FlatBuffers catalog (`metadata.fb`) is the *legacy native* container, still
+opened and migrated by `NativeRecording`, written only by `write_from_source`
+/ `convert --native-zip`. `TelemetryRecording::open` / `open_telemetry` sniff
+the first bytes (`sniff_container`) and dispatch; nothing is decided by name.
 
 The workspace guide (layout + examples) is [TELEMETRY.md](../../TELEMETRY.md).
 The writer-strict schema is [telemetry.schema.json](../../telemetry.schema.json).
@@ -16,7 +19,8 @@ An MTX reader also accepts another complete header later in the file to start
 another folder. Sidecar groups join on integer nanoseconds; every header
 requires `utc`.
 
-`FORMAT_VERSION` is stored in the catalog (`schema_version`). Current version is
+`FORMAT_VERSION` is the **legacy zip** catalog version (`schema_version`); the
+MTJ container is versioned by `JSONL_VERSION`. Current catalog version is
 `10` (signed `int8` sample encoding, code 0; v9 pass provenance; v8 typed span
 meta `timespan_ms` as u32le; v7 plot class / scale / rounding).
 `NativeRecording::open` rewrites a writable older file in place. Header-only

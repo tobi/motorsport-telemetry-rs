@@ -9,18 +9,28 @@ There are two encodings of the **same** recording model:
 
 | Encoding | Name | Role |
 |---|---|---|
-| JSONL | MTJ / MTX | Inspectable interchange. Sidecars exist only here. |
-| STORE zip + FlatBuffers | `.telemetry` | Lossless archive of one recording. No sidecar member. |
+| JSONL | MTJ / MTX | The recording format. A `.telemetry` file **is** an MTJ document in one zstd frame. Sidecars exist only here. |
+| STORE zip + FlatBuffers | legacy `.telemetry` | Earlier native archive. Still read and migrated; written only on request (`convert --native-zip`). |
 
-JSONL is the working interchange. `.telemetry` exists to keep native
-integer columns, scale/bias, and video frame tables. An MTX sidecar is
-never a zip member; join it onto an MTJ host with `JsonlRecording::attach`.
+`.telemetry` and `.telemetry.jsonl.zstd` are the same bytes; the short name
+is the default destination. Readers tell the two `.telemetry` containers
+apart by content: `28 B5 2F FD` (zstd) or `{` is MTJ, `PK 03 04` is the
+legacy zip. Nothing is decided from the file name. An MTX sidecar is never
+a zip member; join it onto an MTJ host with `JsonlRecording::attach`.
+
+Trade-off accepted with the switch: MTJ lays every channel on a single
+`hz`/`t0` lattice (a sample moves at most half a period) and drops
+irregular event streams; the legacy zip kept native integer columns and
+per-sample stamps. Header-only reads of a legacy zip (`metadata.fb`) stay
+O(1); the MTJ header is the first line but the file must be decompressed
+to reach it.
 
 ## Files
 
 | Kind | Preferred name | First line |
 |---|---|---|
-| Native archive | `Name.telemetry` | zip local header, first member `metadata.fb` |
+| Recording (default) | `Name.telemetry` | zstd frame `28 B5 2F FD` wrapping `{"mtj":1,...}` |
+| Legacy native archive | `Name.telemetry` | zip local header `PK 03 04`, first member `metadata.fb` |
 | Recording | `Name.telemetry.jsonl` or `.zstd` | `{"mtj":1,...}` |
 | Sidecar | `Name.telemetry.ext.jsonl` or `.zstd` | `{"mtx":1,...}` |
 
@@ -195,8 +205,9 @@ Validate:
 python3 crates/telemetry-format/scripts/validate-mtx.py PATH.telemetry.ext.jsonl
 ```
 
-## Native `.telemetry` memory layout
+## Legacy native `.telemetry` memory layout
 
+Still readable; no longer written by default (`convert --native-zip`).
 A **STORE** zip (compression method 0). CRC-32 of each member. Each
 payload starts on a **64-byte** boundary (padding lives in the extra
 field of the local header). First member **must** be `metadata.fb`.

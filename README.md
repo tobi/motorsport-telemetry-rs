@@ -13,9 +13,9 @@ The writer-strict schema is [telemetry.schema.json](telemetry.schema.json).
 | Pi/Cosworth PDS | `.pds` | [`cosworth-telemetry`](crates/cosworth-telemetry) | Read |
 | MoTeC LD/LDX | `.ld` | [`motec-telemetry`](crates/motec-telemetry) | Read and write |
 | Racelogic VBOX | `.vbo` | [`racelogic-telemetry`](crates/racelogic-telemetry) | Read |
-| Native `.telemetry` | `.telemetry` | [`telemetry-format`](crates/telemetry-format) | Read and write; aligned STORE zip, FlatBuffers catalog first |
+| `.telemetry` | `.telemetry` | [`telemetry-format`](crates/telemetry-format) | Read and write. **Written as a zstd-compressed MTJ JSONL document.** The legacy aligned STORE zip + FlatBuffers container is still read (and migrated) — readers sniff the first bytes, never the name — and can be written with `convert --native-zip` |
 | MTJ JSONL | `.telemetry.jsonl` | [`telemetry-format`](crates/telemetry-format/JSONL.md) | Read and write; time-aligned header / laps / channels; video linkage in the header |
-| MTJ JSONL + zstd | `.telemetry.jsonl.zstd` | same | Same document, one zstd frame |
+| MTJ JSONL + zstd | `.telemetry.jsonl.zstd` | same | Same document, one zstd frame (byte-identical to a `.telemetry`) |
 
 [`motorsport-telemetry`](crates/motorsport-telemetry) is the unified facade.
 [`motorsport-telemetry-core`](crates/telemetry-core) defines the shared source,
@@ -37,7 +37,7 @@ different installation root, for example
 `make install PREFIX=/usr/local` (normally with `sudo`) or use `DESTDIR` when
 staging a package.
 
-The facade crate includes a CLI. It memory-maps native recordings and
+The facade crate includes a CLI. It memory-maps vendor recordings and
 does not decode video payloads:
 
 ```sh
@@ -49,6 +49,7 @@ cargo run -p motorsport-telemetry -- convert recording.pds
 cargo run -p motorsport-telemetry -- convert recording.pds recording.telemetry.jsonl
 cargo run -p motorsport-telemetry -- convert recording.pds recording.telemetry.jsonl.zstd
 cargo run -p motorsport-telemetry -- convert --no-passes recording.pds
+cargo run -p motorsport-telemetry -- convert --native-zip recording.pds legacy.telemetry
 cargo run -p motorsport-telemetry -- convert --strip-passes recording.pds.telemetry
 cargo run -p motorsport-telemetry -- verify recording.telemetry recording.telemetry.jsonl recording.telemetry.jsonl.zstd
 ```

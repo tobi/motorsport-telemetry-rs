@@ -15,7 +15,9 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use telemetry_format::{is_jsonl_path, is_jsonl_zstd_path, JsonlRecording, NativeRecording};
+use telemetry_format::{
+    is_jsonl_path, is_jsonl_zstd_path, sniff_container, Container, JsonlRecording, NativeRecording,
+};
 use thiserror::Error;
 
 pub use motorsport_telemetry_core;
@@ -57,14 +59,15 @@ pub enum TelemetryError {
     Telemetry(#[from] telemetry_format::TelemetryFormatError),
 }
 
-/// Opens a native telemetry file using its case-insensitive extension.
+/// Opens a telemetry file using its case-insensitive extension.
 ///
 /// Supported extensions are `.mp4`, `.pds`, `.ld`, `.vbo`, `.telemetry`,
 /// `.telemetry.jsonl`, `.jsonl`, `.mtj`, `.telemetry.ext.jsonl`, and those
 /// names with a `.zstd` or `.zst` suffix.
 /// This function selects a parser by extension; the selected parser still
-/// validates the file contents. Opening a writable `.telemetry` file older
-/// than [`FORMAT_VERSION`] rewrites it in place.
+/// validates the file contents. A `.telemetry` file is dispatched by its
+/// container (zstd MTJ, or the legacy native zip); a writable legacy zip
+/// older than [`FORMAT_VERSION`] is rewritten in place.
 pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
     let path = path.as_ref();
     if is_jsonl_path(path) {
@@ -75,7 +78,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
         "pds" => Ok(Box::new(CosworthFile::open(path)?)),
         "ld" => Ok(Box::new(MotecFile::open(path)?)),
         "vbo" => Ok(Box::new(RacelogicFile::open(path)?)),
-        "telemetry" => Ok(Box::new(NativeRecording::open(path)?)),
+        "telemetry" => Ok(telemetry_format::open_telemetry(path)?),
         _ => Err(TelemetryError::Unsupported(path.display().to_string())),
     }
 }
@@ -96,7 +99,7 @@ pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryE
         "pds" => Ok(Box::new(CosworthFile::open(path)?)),
         "ld" => Ok(Box::new(MotecFile::open(path)?)),
         "vbo" => Ok(Box::new(RacelogicFile::open_metadata(path)?)),
-        "telemetry" => Ok(Box::new(NativeRecording::open(path)?)),
+        "telemetry" => Ok(telemetry_format::open_telemetry(path)?),
         _ => Err(TelemetryError::Unsupported(path.display().to_string())),
     }
 }
@@ -147,7 +150,8 @@ pub fn read_metadata(
     Ok(open_metadata(path)?.metadata())
 }
 
-/// Catalog format version from `metadata.fb`. Header-only for `.telemetry`.
+/// Catalog format version from `metadata.fb` of a **legacy zip** `.telemetry`.
+/// Header-only. A zstd-MTJ `.telemetry` has no catalog version and errors.
 pub fn read_format_version(path: impl AsRef<Path>) -> Result<u16, TelemetryError> {
     if !is_telemetry(path.as_ref()) {
         return Err(TelemetryError::Unsupported(
@@ -157,7 +161,8 @@ pub fn read_format_version(path: impl AsRef<Path>) -> Result<u16, TelemetryError
     Ok(telemetry_format::read_format_version(path)?)
 }
 
-/// True when a `.telemetry` file is older than [`FORMAT_VERSION`] and should be rewritten.
+/// True when a legacy-zip `.telemetry` is older than [`FORMAT_VERSION`] and
+/// should be rewritten. Always `false` for the zstd-MTJ container.
 pub fn telemetry_needs_update(path: impl AsRef<Path>) -> Result<bool, TelemetryError> {
     if !is_telemetry(path.as_ref()) {
         return Err(TelemetryError::Unsupported(
@@ -183,7 +188,7 @@ fn is_telemetry(path: &Path) -> bool {
 /// Kind of file verified by [`verify`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyKind {
-    /// Native `.telemetry` STORE zip.
+    /// Legacy native `.telemetry` STORE zip.
     Native,
     /// MTJ JSONL recording.
     Mtj,
@@ -236,8 +241,10 @@ pub enum VerifyError {
     DecodeFault(Diagnostics),
 }
 
-/// Verifies a native `.telemetry` or MTJ/MTX JSONL document.
+/// Verifies a `.telemetry` (either container) or MTJ/MTX JSONL document.
 ///
+/// A `.telemetry` path is dispatched by content: a zstd frame or `{` is an
+/// MTJ document, `PK` is the legacy native zip.
 /// Opens the file without rewriting an older catalog, decodes one sample from
 /// every channel, and runs the reader diagnostics plus the format-neutral
 /// plausibility validator. A proven decode-layout fault returns
@@ -249,7 +256,16 @@ pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport, VerifyError> {
     if is_jsonl_path(path) {
         verify_jsonl(path)
     } else if is_telemetry(path) {
-        verify_native(path)
+        match sniff_container(path)? {
+            Container::NativeZip => verify_native(path),
+            Container::JsonlZstd | Container::Jsonl => verify_jsonl(path),
+            Container::Unknown => Err(VerifyError::Format(
+                telemetry_format::TelemetryFormatError::Invalid(format!(
+                    "{}: not a .telemetry file (neither a zstd MTJ frame nor a native zip)",
+                    path.display()
+                )),
+            )),
+        }
     } else {
         Err(VerifyError::Unsupported)
     }

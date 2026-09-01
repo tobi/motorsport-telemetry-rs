@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use telemetry_format::{
     is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, needs_update, write_from_source,
     write_from_source_stripped, write_jsonl_extension_from_source_with,
-    write_jsonl_from_source_with, FORMAT_VERSION,
+    write_jsonl_from_source_with, write_telemetry, write_telemetry_stripped, FORMAT_VERSION,
 };
 use telemetry_passes::{apply_registry, PassOutcome};
 
@@ -27,9 +27,9 @@ the on-disk formats this crate writes.
 Commands:
   inspect    Print laps, track, video, identity, and diagnostics
              for a file or every matching recording under a folder
-  convert    Write native .telemetry (default) or JSONL by suffix
-  verify     Check .telemetry / .telemetry.jsonl / .zstd and flag
-             decode faults
+  convert    Write .telemetry (zstd MTJ, default) or JSONL by suffix
+  verify     Check .telemetry (either container) / .telemetry.jsonl /
+             .zstd and flag decode faults
 
 Run motorsport-telemetry <command> --help for that command.
 Run motorsport-telemetry help <command> for the same text.
@@ -87,10 +87,11 @@ Examples:
 const CONVERT_HELP: &str = "\
 Usage: motorsport-telemetry convert [options] <input> [output]
 
-Convert a recording to native .telemetry, or to JSONL when the output
-name says so. By default the standard processing-pass registry runs and
-appends its derived channels; every pass is lossless, and --strip-passes
-recovers a byte-identical raw conversion.
+Convert a recording to .telemetry (a zstd-compressed MTJ JSONL document),
+or to plain JSONL / an MTX sidecar when the output name says so. By default
+the standard processing-pass registry runs and appends its derived
+channels; every pass is lossless, and --strip-passes recovers the raw
+conversion.
 
 Arguments:
   <input>              Any supported source: .mp4 .pds .ld .vbo
@@ -100,11 +101,13 @@ Arguments:
 
 Options:
   --no-passes          Convert the source as-is; run no passes
-  --strip-passes       Drop previously applied pass outputs (native
-                       .telemetry output only)
+  --strip-passes       Drop previously applied pass outputs
+                       (.telemetry output only)
+  --native-zip         Write the legacy native STORE zip container
+                       instead of zstd MTJ (.telemetry output only)
 
 Output suffix:
-  .telemetry                    Native STORE zip (the default)
+  .telemetry                    MTJ, one zstd frame (the default)
   .telemetry.jsonl              MTJ, uncompressed UTF-8
   .telemetry.jsonl.zstd         MTJ, one zstd frame (level 11)
   .telemetry.ext.jsonl[.zstd]   MTX sidecar
@@ -122,9 +125,10 @@ Examples:
 const VERIFY_HELP: &str = "\
 Usage: motorsport-telemetry verify <file>...
 
-Check that each file is a valid native .telemetry archive or an MTJ/MTX
-JSONL document (plain or zstd). Opens a native file without rewriting an
-older catalog. Decodes one sample from every channel.
+Check that each file is a valid .telemetry (zstd MTJ, or the legacy
+native zip, told apart by content) or an MTJ/MTX JSONL document (plain
+or zstd). Opens a legacy zip without rewriting an older catalog. Decodes
+one sample from every channel.
 
 After the format check, reader diagnostics and plausibility findings are
 printed for every file. A file whose channels claim more sample bytes than
@@ -196,7 +200,8 @@ fn main() {
             input,
             output,
             passes,
-        }) => match convert(&input, output.as_deref(), passes) {
+            container,
+        }) => match convert(&input, output.as_deref(), passes, container) {
             Ok(dest) => println!("{}", dest.display()),
             Err(error) => {
                 eprintln!("motorsport-telemetry: {error}");
@@ -267,10 +272,21 @@ enum Command {
         input: PathBuf,
         output: Option<PathBuf>,
         passes: PassMode,
+        container: OutputContainer,
     },
     Verify {
         paths: Vec<PathBuf>,
     },
+}
+
+/// Which container a `.telemetry` destination is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OutputContainer {
+    /// zstd-compressed MTJ JSONL (the default).
+    #[default]
+    JsonlZstd,
+    /// Legacy aligned STORE zip with a FlatBuffers catalog (`--native-zip`).
+    NativeZip,
 }
 
 /// What `convert` does with the processing-pass registry.
@@ -372,6 +388,7 @@ fn parse_inspect(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
 fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut positional = Vec::new();
     let mut passes = PassMode::Apply;
+    let mut container = OutputContainer::default();
     for argument in args {
         if argument == "-h" || argument == "--help" {
             return Ok(Command::Help {
@@ -386,6 +403,10 @@ fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
             passes = PassMode::Strip;
             continue;
         }
+        if argument == "--native-zip" {
+            container = OutputContainer::NativeZip;
+            continue;
+        }
         if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option {}", argument.to_string_lossy()));
         }
@@ -396,11 +417,13 @@ fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
             input: input.clone(),
             output: None,
             passes,
+            container,
         }),
         [input, output] => Ok(Command::Convert {
             input: input.clone(),
             output: Some(output.clone()),
             passes,
+            container,
         }),
         [] => Err("convert is missing an input file".into()),
         _ => Err("convert expects <input> [output]".into()),
@@ -571,7 +594,7 @@ fn walk_inspect(
 }
 
 fn is_known_telemetry_path(path: &Path) -> bool {
-    if is_jsonl_path(path) || is_native_telemetry(path) {
+    if is_jsonl_path(path) || is_telemetry_ext(path) {
         return true;
     }
     matches!(
@@ -665,10 +688,16 @@ fn convert(
     input: &Path,
     output: Option<&Path>,
     passes: PassMode,
+    container: OutputContainer,
 ) -> Result<PathBuf, TelemetryError> {
     let dest = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_telemetry_dest(input));
+    if container == OutputContainer::NativeZip && !is_telemetry_ext(&dest) {
+        return Err(TelemetryError::Unsupported(
+            "--native-zip applies to .telemetry output only".into(),
+        ));
+    }
     let file = open(input)?;
     match passes {
         PassMode::Apply => {
@@ -684,15 +713,19 @@ fn convert(
                     }
                 }
             }
-            write_converted(&passed, &dest)?;
+            write_converted(&passed, &dest, container)?;
         }
-        PassMode::Skip => write_converted(&file, &dest)?,
+        PassMode::Skip => write_converted(&file, &dest, container)?,
         PassMode::Strip => {
             if is_jsonl_path(&dest) {
                 return Err(TelemetryError::Unsupported(
                     "--strip-passes writes .telemetry output only".into(),
                 ));
             }
+            let write_stripped = |dest: &Path| match container {
+                OutputContainer::JsonlZstd => write_telemetry_stripped(&file, dest),
+                OutputContainer::NativeZip => write_from_source_stripped(&file, dest),
+            };
             if dest == input {
                 // In-place strip: write next to the destination, then swap.
                 let dir = dest.parent().unwrap_or_else(|| Path::new("."));
@@ -701,20 +734,24 @@ fn convert(
                     .and_then(|name| name.to_str())
                     .unwrap_or("recording");
                 let temp = dir.join(format!(".{name}.strip-tmp"));
-                write_from_source_stripped(&file, &temp)?;
+                write_stripped(&temp)?;
                 drop(file);
                 fs::rename(&temp, &dest)
                     .map_err(telemetry_format::TelemetryFormatError::Io)
                     .map_err(TelemetryError::Telemetry)?;
             } else {
-                write_from_source_stripped(&file, &dest)?;
+                write_stripped(&dest)?;
             }
         }
     }
     Ok(dest)
 }
 
-fn write_converted(source: &dyn TelemetrySource, dest: &Path) -> Result<(), TelemetryError> {
+fn write_converted(
+    source: &dyn TelemetrySource,
+    dest: &Path,
+    container: OutputContainer,
+) -> Result<(), TelemetryError> {
     if is_jsonl_path(dest) {
         let compress = is_jsonl_zstd_path(dest);
         if is_jsonl_ext_path(dest) {
@@ -723,7 +760,10 @@ fn write_converted(source: &dyn TelemetrySource, dest: &Path) -> Result<(), Tele
             write_jsonl_from_source_with(source, dest, compress)?;
         }
     } else {
-        write_from_source(source, dest)?;
+        match container {
+            OutputContainer::JsonlZstd => write_telemetry(source, dest)?,
+            OutputContainer::NativeZip => write_from_source(source, dest)?,
+        }
     }
     Ok(())
 }
@@ -738,7 +778,7 @@ fn default_telemetry_dest(src: &Path) -> PathBuf {
     dest
 }
 
-fn is_native_telemetry(path: &Path) -> bool {
+fn is_telemetry_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("telemetry"))
@@ -1477,6 +1517,7 @@ mod tests {
                 input: PathBuf::from("run.pds"),
                 output: None,
                 passes: PassMode::Apply,
+                container: OutputContainer::JsonlZstd,
             })
         );
         assert_eq!(
@@ -1485,6 +1526,7 @@ mod tests {
                 input: PathBuf::from("run.pds"),
                 output: None,
                 passes: PassMode::Skip,
+                container: OutputContainer::JsonlZstd,
             })
         );
         assert_eq!(
@@ -1497,6 +1539,21 @@ mod tests {
                 input: PathBuf::from("run.telemetry"),
                 output: None,
                 passes: PassMode::Strip,
+                container: OutputContainer::JsonlZstd,
+            })
+        );
+        assert_eq!(
+            arguments([
+                "convert".into(),
+                "--native-zip".into(),
+                "run.pds".into(),
+                "run.telemetry".into()
+            ]),
+            Ok(Command::Convert {
+                input: PathBuf::from("run.pds"),
+                output: Some(PathBuf::from("run.telemetry")),
+                passes: PassMode::Apply,
+                container: OutputContainer::NativeZip,
             })
         );
         assert_eq!(
@@ -1546,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn default_convert_target_is_native_telemetry() {
+    fn default_convert_target_is_dot_telemetry() {
         let dest = default_telemetry_dest(Path::new("run.pds"));
         assert_eq!(dest, PathBuf::from("run.pds.telemetry"));
     }

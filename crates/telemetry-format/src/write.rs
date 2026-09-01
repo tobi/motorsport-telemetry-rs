@@ -46,7 +46,11 @@ impl std::fmt::Display for TelemetryFormatError {
 
 impl std::error::Error for TelemetryFormatError {}
 
-/// Writes a `.telemetry` zip next to or at `dest`.
+/// Writes the **legacy native zip** container to `dest`.
+///
+/// The default `.telemetry` container is zstd MTJ — see
+/// [`crate::write_telemetry`]. Reach for this only when a consumer needs the
+/// FlatBuffers catalog / mmap layout.
 pub fn write_from_source(
     source: &dyn TelemetrySource,
     dest: impl AsRef<Path>,
@@ -66,6 +70,16 @@ pub fn write_from_source_stripped(
     source: &dyn TelemetrySource,
     dest: impl AsRef<Path>,
 ) -> Result<(), TelemetryFormatError> {
+    let view = stripped_view(source);
+    let dest = dest.as_ref();
+    let file = File::create(dest).map_err(io_err)?;
+    write_to(&view, crate::FORMAT_VERSION, BufWriter::new(file))
+}
+
+/// A view of `source` with every applied-pass output channel removed and the
+/// pass list cleared — the raw conversion, whichever container it is then
+/// written to.
+pub fn stripped_view(source: &dyn TelemetrySource) -> motorsport_telemetry_core::ViewSource<'_> {
     let outputs: HashSet<&str> = source
         .applied_passes()
         .iter()
@@ -74,9 +88,7 @@ pub fn write_from_source_stripped(
     let mut view = motorsport_telemetry_core::ViewSource::new(source);
     view.retain(|_, channel| !outputs.contains(channel.name.as_str()));
     view.passes_mut().clear();
-    let dest = dest.as_ref();
-    let file = File::create(dest).map_err(io_err)?;
-    write_to(&view, crate::FORMAT_VERSION, BufWriter::new(file))
+    view
 }
 
 /// Writes a `.telemetry` zip stamped with an explicit catalog version.

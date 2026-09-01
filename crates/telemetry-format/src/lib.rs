@@ -1,7 +1,13 @@
-//! Native `.telemetry` format: aligned STORE zip + FlatBuffers catalog.
-//! Time-aligned JSONL interchange is documented in `JSONL.md`.
+//! The `.telemetry` file format.
+//!
+//! Since the container switch, a `.telemetry` file is a **zstd-compressed MTJ
+//! JSONL document** (`JSONL.md`). The earlier aligned STORE zip + FlatBuffers
+//! catalog is the *legacy native* container: still opened, migrated, and
+//! writable on request (`write_from_source`), never produced by default.
+//! Readers decide by content ([`sniff_container`]), not by file name.
 
 mod catalog;
+mod container;
 mod file;
 mod jsonl;
 mod migrate;
@@ -9,6 +15,10 @@ mod write;
 mod zip;
 
 pub use catalog::{needs_update, Catalog, FORMAT_VERSION};
+pub use container::{
+    sniff_container, sniff_container_bytes, write_telemetry, write_telemetry_stripped, Container,
+    TelemetryRecording,
+};
 pub use file::NativeRecording;
 pub use jsonl::{
     is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, period_ns_from_hz,
@@ -19,38 +29,80 @@ pub use jsonl::{
 };
 pub use migrate::{apply as apply_migrations, MigrateError};
 pub use write::{
-    write_from_source, write_from_source_stripped, write_from_source_version, TelemetryFormatError,
+    stripped_view, write_from_source, write_from_source_stripped, write_from_source_version,
+    TelemetryFormatError,
 };
 
-/// Reads the catalog format version from `metadata.fb` only.
+/// Opens any `.telemetry` file (zstd MTJ or legacy zip) as a source.
+pub fn open_telemetry(
+    path: impl AsRef<std::path::Path>,
+) -> Result<Box<dyn motorsport_telemetry_core::TelemetrySource>, TelemetryFormatError> {
+    Ok(TelemetryRecording::open(path)?.into_source())
+}
+
+/// Reads the catalog format version of a **legacy zip** from `metadata.fb` only.
+///
+/// MTJ containers have no catalog version; they return
+/// [`TelemetryFormatError::Invalid`]. Use [`sniff_container`] first when the
+/// container is not known.
 pub fn read_format_version(path: impl AsRef<std::path::Path>) -> Result<u16, TelemetryFormatError> {
-    NativeRecording::read_format_version(path)
+    let path = path.as_ref();
+    match sniff_container(path)? {
+        Container::NativeZip => NativeRecording::read_format_version(path),
+        other => Err(TelemetryFormatError::Invalid(format!(
+            "{}: {other:?} container has no native catalog version",
+            path.display()
+        ))),
+    }
 }
 
-/// Header-only check: the file is older than [`FORMAT_VERSION`].
+/// Header-only check: a legacy zip older than [`FORMAT_VERSION`]. MTJ
+/// containers never need a catalog migration and report `false`.
 pub fn file_needs_update(path: impl AsRef<std::path::Path>) -> Result<bool, TelemetryFormatError> {
-    Ok(needs_update(read_format_version(path)?))
+    let path = path.as_ref();
+    match sniff_container(path)? {
+        Container::NativeZip => Ok(needs_update(NativeRecording::read_format_version(path)?)),
+        Container::JsonlZstd | Container::Jsonl => Ok(false),
+        Container::Unknown => Err(TelemetryFormatError::Invalid(format!(
+            "{}: not a .telemetry file",
+            path.display()
+        ))),
+    }
 }
 
-/// Reads catalog metadata without mapping channel payloads.
+/// Reads file metadata. Header-only for a legacy zip (`metadata.fb`); an MTJ
+/// document is parsed (its header line carries laps and identity).
 pub fn read_metadata(
     path: impl AsRef<std::path::Path>,
 ) -> Result<motorsport_telemetry_core::FileMetadata, TelemetryFormatError> {
-    NativeRecording::read_metadata(path)
+    let path = path.as_ref();
+    match sniff_container(path)? {
+        Container::NativeZip => NativeRecording::read_metadata(path),
+        _ => Ok(TelemetryRecording::open_unchanged(path)?.metadata()),
+    }
 }
 
-/// Reads stored laps from `metadata.fb` only.
+/// Reads stored laps without mapping channel payloads of a legacy zip.
 pub fn read_laps(
     path: impl AsRef<std::path::Path>,
 ) -> Result<Vec<motorsport_telemetry_core::LapMetadata>, TelemetryFormatError> {
-    NativeRecording::read_laps(path)
+    let path = path.as_ref();
+    match sniff_container(path)? {
+        Container::NativeZip => NativeRecording::read_laps(path),
+        _ => Ok(TelemetryRecording::open_unchanged(path)?.metadata().laps),
+    }
 }
 
-/// Reads the stored complete-lap count. A header scalar; no lap vector walk.
+/// Reads the stored complete-lap count.
 pub fn read_valid_laps(path: impl AsRef<std::path::Path>) -> Result<u32, TelemetryFormatError> {
-    NativeRecording::read_valid_laps(path)
+    let path = path.as_ref();
+    match sniff_container(path)? {
+        Container::NativeZip => NativeRecording::read_valid_laps(path),
+        _ => Ok(TelemetryRecording::open_unchanged(path)?
+            .metadata()
+            .valid_laps),
+    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,10 +20,24 @@ source; passes and `write_from_source_stripped` are built on it),
 `SourceExt` trait in `motorsport-telemetry`). Adding a trait method means
 adding it to the blanket macro and `ViewSource` once.
 
-## `.telemetry` format version
+## `.telemetry` containers
+
+A `.telemetry` file is a zstd-compressed MTJ JSONL document. Every writer
+(`telemetry_format::write_telemetry`, CLI `convert` default) produces that.
+The aligned STORE zip + FlatBuffers catalog is the *legacy native*
+container: `NativeRecording` still opens and migrates it, `write_from_source`
+/ `convert --native-zip` still produce it on request. Readers decide by
+content (`sniff_container`: zstd magic / `{` → MTJ, `PK` → zip), never by
+name, so `TelemetryRecording::open` and the facade's `open("x.telemetry")`
+accept both. Header-only helpers (`read_laps`, `read_metadata`,
+`read_valid_laps`) stay O(1) for a zip and parse the document for MTJ;
+`read_format_version` is zip-only and errors on MTJ; `file_needs_update`
+is `false` for MTJ. Do not add name-based `.telemetry` dispatch anywhere.
+
+## Legacy `.telemetry` zip format version
 
 `FORMAT_VERSION` in `crates/telemetry-format/src/catalog.rs` is the on-disk
-catalog version (`10`: signed `int8` sample encoding, code 0; v9 pass
+catalog version of the legacy zip (`10`: signed `int8` sample encoding, code 0; v9 pass
 provenance + preserved `source_format`/`source_path` across rewrites; v8
 typed span meta `timespan_ms` as u32le; v7 plot class / display scale /
 rounding; v6 comment labels; v5 spans + visibility; v4 `utc_start_ns` +

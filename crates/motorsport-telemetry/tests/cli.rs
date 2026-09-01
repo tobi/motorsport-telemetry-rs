@@ -74,7 +74,7 @@ fn recognizes_decimal_degree_vbox_exports() {
 }
 
 #[test]
-fn convert_defaults_to_native_and_verify_accepts_all_encodings() {
+fn convert_defaults_to_zstd_mtj_and_verify_accepts_all_encodings() {
     let dir = tempfile::tempdir().unwrap();
     let input = fixture("synthetic_cosworth.pds");
     let native = dir.path().join("run.telemetry");
@@ -100,10 +100,13 @@ fn convert_defaults_to_native_and_verify_accepts_all_encodings() {
         .unwrap();
     assert!(verified.status.success(), "{:?}", verified);
     let stdout = String::from_utf8(verified.stdout).unwrap();
-    assert!(stdout.contains("native v"), "{stdout}");
-    assert!(stdout.contains("mtj:1"), "{stdout}");
-    assert!(stdout.contains("zstd"), "{stdout}");
+    // `.telemetry` is a zstd MTJ frame now; verify tells that from content.
+    assert!(!stdout.contains("native v"), "{stdout}");
+    assert_eq!(stdout.matches("mtj:1").count(), 3, "{stdout}");
+    assert_eq!(stdout.matches("mtj:1  zstd").count(), 2, "{stdout}");
     assert!(!stdout.contains("FAIL"), "{stdout}");
+    let head = std::fs::read(&native).unwrap();
+    assert_eq!(&head[..4], &[0x28, 0xB5, 0x2F, 0xFD], "zstd magic");
 
     let rejected = cli()
         .args(["verify", input.to_str().unwrap()])
@@ -178,8 +181,111 @@ fn convert_without_output_writes_next_to_the_input() {
     let verified = cli().args(["verify", dest]).output().unwrap();
     assert!(verified.status.success(), "{:?}", verified);
     let report = String::from_utf8(verified.stdout).unwrap();
-    assert!(report.contains("native v"), "{report}");
+    assert!(report.contains("mtj:1  zstd"), "{report}");
     assert!(report.contains("ok"), "{report}");
+}
+
+#[test]
+fn native_zip_flag_writes_legacy_container_and_both_open_by_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture("synthetic_cosworth.pds");
+    let legacy = dir.path().join("legacy.telemetry");
+    let modern = dir.path().join("modern.telemetry");
+    let out = cli()
+        .args([
+            "convert",
+            "--native-zip",
+            input.to_str().unwrap(),
+            legacy.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let out = cli()
+        .args(["convert", input.to_str().unwrap(), modern.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    assert_eq!(&std::fs::read(&legacy).unwrap()[..2], b"PK");
+    assert_eq!(
+        &std::fs::read(&modern).unwrap()[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD]
+    );
+
+    let verified = cli()
+        .args(["verify", legacy.to_str().unwrap(), modern.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(verified.status.success(), "{verified:?}");
+    let stdout = String::from_utf8(verified.stdout).unwrap();
+    assert!(
+        stdout.contains("legacy.telemetry: ok  native v"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("modern.telemetry: ok  mtj:1  zstd"),
+        "{stdout}"
+    );
+
+    // Both containers expose the same laps through the facade.
+    let legacy_laps = motorsport_telemetry::read_lap_metadata(&legacy).unwrap();
+    let modern_laps = motorsport_telemetry::read_lap_metadata(&modern).unwrap();
+    assert_eq!(legacy_laps.len(), modern_laps.len());
+    assert_eq!(legacy_laps.len(), 5);
+    assert!(!motorsport_telemetry::telemetry_needs_update(&modern).unwrap());
+    assert!(motorsport_telemetry::read_format_version(&modern).is_err());
+
+    // --native-zip is a .telemetry-only switch.
+    let rejected = cli()
+        .args([
+            "convert",
+            "--native-zip",
+            input.to_str().unwrap(),
+            dir.path().join("x.telemetry.jsonl").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+}
+
+#[test]
+fn strip_passes_works_on_the_zstd_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture("synthetic_cosworth.pds");
+    let passed = dir.path().join("passed.telemetry");
+    let raw = dir.path().join("raw.telemetry");
+    let stripped = dir.path().join("stripped.telemetry");
+    for (args, dest) in [
+        (vec!["convert"], &passed),
+        (vec!["convert", "--no-passes"], &raw),
+    ] {
+        let mut full: Vec<&str> = args;
+        full.push(input.to_str().unwrap());
+        full.push(dest.to_str().unwrap());
+        let out = cli().args(&full).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    let out = cli()
+        .args([
+            "convert",
+            "--strip-passes",
+            passed.to_str().unwrap(),
+            stripped.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let raw_file = motorsport_telemetry::open(&raw).unwrap();
+    let stripped_file = motorsport_telemetry::open(&stripped).unwrap();
+    let passed_file = motorsport_telemetry::open(&passed).unwrap();
+    assert!(passed_file.channels().len() >= raw_file.channels().len());
+    assert_eq!(stripped_file.channels().len(), raw_file.channels().len());
+    assert!(stripped_file.applied_passes().is_empty());
+    assert_eq!(
+        &std::fs::read(&stripped).unwrap()[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD]
+    );
 }
 
 #[test]

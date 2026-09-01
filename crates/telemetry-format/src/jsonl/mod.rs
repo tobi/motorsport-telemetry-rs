@@ -35,7 +35,7 @@ pub use write::{
 };
 
 /// zstd frame magic (`0x28B52FFD`).
-pub(super) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Default zstd level for compressed MTJ documents. This one goes to 11.
 pub const JSONL_ZSTD_LEVEL: i32 = 11;
 /// Document version written and accepted by this module.
