@@ -99,22 +99,30 @@ pub fn longest_stop_ns(
     start_ns: u64,
     end_ns: u64,
 ) -> u64 {
-    let Some(channel) = source.channels().get(speed) else {
-        return 0;
-    };
+    longest_stop_interval(source, speed, start_ns, end_ns).map_or(0, |(start, end)| end - start)
+}
+
+/// Longest contiguous standstill interval as `(start_ns, end_ns)`, so the
+/// stop can be carved out of its lap instead of only measured. `None` means
+/// the interval never stood still for a full sampled bin.
+pub fn longest_stop_interval(
+    source: &dyn TelemetrySource,
+    speed: usize,
+    start_ns: u64,
+    end_ns: u64,
+) -> Option<(u64, u64)> {
+    let channel = source.channels().get(speed)?;
     if convert(1.0, &channel.unit, "m/s").is_err() {
-        return 0;
+        return None;
     }
     let end_ns = end_ns.min(channel.duration_ns);
-    let Some(duration) = end_ns.checked_sub(start_ns).filter(|&d| d > 0) else {
-        return 0;
-    };
+    let duration = end_ns.checked_sub(start_ns).filter(|&d| d > 0)?;
     let step = duration.div_ceil(MAX_PROBES).max(SECOND_NS);
     let max_age = channel.chunks.first().map_or(2 * SECOND_NS, |c| {
         c.sample_period_ns.saturating_mul(2).max(2 * SECOND_NS)
     });
-    let mut longest = 0u64;
-    let mut run = 0u64;
+    let mut best: Option<(u64, u64)> = None;
+    let mut run_start: Option<u64> = None;
     for bin in 0..duration.div_ceil(step) {
         let start = (u128::from(start_ns) + u128::from(bin) * u128::from(step)) as u64;
         let width = step.min(end_ns - start);
@@ -133,13 +141,17 @@ pub fn longest_stop_ns(
                 .and_then(|raw| convert(raw, &channel.unit, "m/s").ok())
                 .is_some_and(|mps| mps.is_finite() && (0.0..STATIONARY_MPS).contains(&mps));
         if stationary {
-            run += width;
-            longest = longest.max(run);
+            let run_start = *run_start.get_or_insert(start);
+            let run_end = start + width;
+            if best.is_none_or(|(best_start, best_end)| run_end - run_start > best_end - best_start)
+            {
+                best = Some((run_start, run_end));
+            }
         } else {
-            run = 0;
+            run_start = None;
         }
     }
-    longest
+    best
 }
 
 #[cfg(test)]

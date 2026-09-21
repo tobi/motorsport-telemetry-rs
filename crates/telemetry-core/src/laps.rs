@@ -22,7 +22,7 @@
 //! from the classified laps and any reported previous-lap channel.
 
 use crate::metadata::{finite_i64, finite_u64, samples, LapKind, LapMetadata, SourceLapMetadata};
-use crate::motion::longest_stop_ns;
+use crate::motion::{longest_stop_interval, longest_stop_ns};
 use crate::{convert, names, TelemetrySource};
 
 /// A counter drop that has not recovered this long after it happened is a
@@ -614,7 +614,14 @@ fn refine_with_timer(
 /// from position in the stint and the speed trace. Complete laps with a
 /// pit-length stop become [`LapKind::Pit`] even when stored as flying, since
 /// a stop is a fact of the trace, not a labelling choice.
-pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut [LapMetadata]) {
+///
+/// A [`LapKind::Pit`] lap is then *carved*: the standing time is split out as
+/// its own [`LapKind::Pit`] interval, bounded by an [`LapKind::In`] and an
+/// [`LapKind::Out`] fragment. The stop is not a lap, so lap-time work must not
+/// count it; keeping it as a separate interval means a consumer can include or
+/// exclude it explicitly instead of subtracting an opaque standstill from a
+/// lap. The in-lap keeps the closing stint, the out-lap opens the next.
+pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) {
     laps.sort_by_key(|lap| (lap.start_ns, lap.end_ns));
     let speed = speed_channel(source);
     let stops: Vec<u64> = laps
@@ -687,6 +694,51 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut [LapMetadata]) {
             bump += 1;
         }
         laps[index].stint += bump;
+    }
+
+    // Carve the pit stop out of the lap that holds it. A logger that keeps
+    // counting through the pits produces one beacon-to-beacon interval with
+    // the in-lap, the standing time and the out-lap glued together; the stop
+    // is not part of any lap, so give it its own interval. The in-lap keeps
+    // the closing stint, the stop is neutral, and the out-lap opens the next
+    // (matching the bump above, which already moved the following laps).
+    if let Some(speed) = speed {
+        let mut carved = Vec::with_capacity(laps.len());
+        for lap in laps.drain(..) {
+            let stop = (lap.kind == LapKind::Pit)
+                .then(|| longest_stop_interval(source, speed, lap.start_ns, lap.end_ns))
+                .flatten();
+            if let Some((stop_start, stop_end)) = stop {
+                if stop_end - stop_start >= PIT_STOP_NS
+                    && stop_start > lap.start_ns
+                    && stop_end < lap.end_ns
+                {
+                    let mut in_lap = lap.clone();
+                    in_lap.end_ns = stop_start;
+                    in_lap.duration_ns = stop_start - lap.start_ns;
+                    in_lap.kind = LapKind::In;
+                    in_lap.complete = false;
+                    let mut pit = lap.clone();
+                    pit.start_ns = stop_start;
+                    pit.end_ns = stop_end;
+                    pit.duration_ns = stop_end - stop_start;
+                    pit.complete = false;
+                    let mut out_lap = lap.clone();
+                    out_lap.start_ns = stop_end;
+                    out_lap.duration_ns = lap.end_ns - stop_end;
+                    out_lap.kind = LapKind::Out;
+                    out_lap.complete = false;
+                    out_lap.stint = lap.stint + 1;
+                    out_lap.stint_lap = 0;
+                    carved.push(in_lap);
+                    carved.push(pit);
+                    carved.push(out_lap);
+                    continue;
+                }
+            }
+            carved.push(lap);
+        }
+        *laps = carved;
     }
 
     for (position, lap) in laps.iter_mut().enumerate() {
@@ -858,5 +910,85 @@ mod tests {
         let timer = vec![lap(0, 0.0, 60.0, false), lap(0, 60.0, 250.0, false)];
         let refined = pick_laps(None, counter.clone(), 2, timer, TIMER_SNAP_WINDOW_NS);
         assert_eq!(refined, counter);
+    }
+
+    /// A one-channel source at 1 Hz whose speed is 0 while parked.
+    struct StopSource {
+        channels: Vec<crate::Channel>,
+        values: Vec<f64>,
+    }
+    impl crate::TelemetrySource for StopSource {
+        fn path(&self) -> &str {
+            "synthetic"
+        }
+        fn format(&self) -> &'static str {
+            "synthetic"
+        }
+        fn channels(&self) -> &[crate::Channel] {
+            &self.channels
+        }
+        fn decode(&self, _: usize, _: usize, local_index: u64) -> f64 {
+            self.values[local_index as usize]
+        }
+    }
+    fn stop_source(seconds: u64, parked: std::ops::Range<u64>) -> StopSource {
+        let values = (0..seconds)
+            .map(|i| if parked.contains(&i) { 0.0 } else { 60.0 })
+            .collect();
+        StopSource {
+            values,
+            channels: vec![crate::Channel {
+                id: 0,
+                name: "Speed_Ref".into(),
+                unit: "m/s".into(),
+                unit_source: crate::UnitSource::Declared,
+                sample_type: crate::SampleType::F64,
+                sample_count: seconds,
+                duration_ns: seconds * 1_000_000_000,
+                chunks: vec![crate::Chunk {
+                    time_base_ns: 0,
+                    sample_base: 0,
+                    data_ptr: 0,
+                    sample_count: seconds,
+                    sample_period_ns: 1_000_000_000,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_pit_lap_is_carved_into_in_stop_out() {
+        // A logger that kept counting through the pits: one beacon-to-beacon
+        // interval [50,150] holds the in-lap, 30 s parked at the box, and the
+        // out-lap. The stop must become its own interval, not stay folded into
+        // a lap (the search for a giant lap that only existed as a pit stop).
+        let source = stop_source(200, 100..130);
+        let mut laps = vec![
+            lap(1, 0.0, 50.0, true),
+            lap(2, 50.0, 150.0, true),
+            lap(3, 150.0, 200.0, false),
+        ];
+        classify_laps(&source, &mut laps);
+        let shape: Vec<(LapKind, i64, u64, u64)> = laps
+            .iter()
+            .map(|l| (l.kind, l.stint as i64, l.start_ns, l.end_ns))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (LapKind::Flying, 1, 0, 50_000_000_000),
+                (LapKind::In, 1, 50_000_000_000, 100_000_000_000),
+                (LapKind::Pit, 1, 100_000_000_000, 130_000_000_000),
+                (LapKind::Out, 2, 130_000_000_000, 150_000_000_000),
+                (LapKind::OutIn, 2, 150_000_000_000, 200_000_000_000),
+            ]
+        );
+        // Numbering stays monotonic across the carve.
+        assert_eq!(
+            laps.iter().map(|l| l.number).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        // The stop is never a flying lap.
+        assert!(!laps[2].kind.is_flying());
     }
 }

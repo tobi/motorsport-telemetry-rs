@@ -405,22 +405,34 @@ struct ClockInfo {
 fn derive_clock(source: &dyn TelemetrySource, hash: u64) -> ClockInfo {
     let explicit_absolute = source.absolute_time_range();
     let absolute = names::find(source.channels(), &["gpsweek"]).and_then(|week_index| {
-        let week = samples(source, week_index)
-            .into_iter()
-            .find_map(|(_, value)| finite_u64(value))?;
+        // A recording never spans a GPS week boundary (the week lasts seven
+        // days), so the week is a constant. Take the *dominant* value rather
+        // than the first sample: u-blox receivers can emit a stale week for a
+        // few seconds at power-on (an AiM SmartyCam reported 2117 for 4.5 s
+        // before correcting to 2437), and anchoring the whole recording's UTC
+        // on that startup sample dates it six years early. The time-of-week
+        // (`GPS iTOW`) is unaffected by the stale week, so pairing the modal
+        // week with the first/last iTOW recovers the true span.
+        let week = dominant_gps_week(source, week_index)?;
         let itow_index = names::find(source.channels(), &["gpsitow"])?;
         let itow = samples(source, itow_index);
         let &(first_time, first_value) = itow.first()?;
         let &(_last_time, last_value) = itow.last()?;
         let first_itow = finite_u64(first_value)?;
         let last_itow = finite_u64(last_value)?;
+        // An iTOW that wrapped past the week boundary belongs to the next week.
+        let end_week = if last_itow < first_itow {
+            week.checked_add(1)?
+        } else {
+            week
+        };
         // GPS clock overflow: leave the absolute clock unset on any failure.
         let start_ns = week
             .checked_mul(GPS_WEEK_MS)?
             .checked_add(first_itow)?
             .checked_add(GPS_UNIX_EPOCH_MS)?
             .checked_mul(1_000_000)?;
-        let end_ns = week
+        let end_ns = end_week
             .checked_mul(GPS_WEEK_MS)?
             .checked_add(last_itow)?
             .checked_add(GPS_UNIX_EPOCH_MS)?
@@ -463,6 +475,29 @@ fn derive_clock(source: &dyn TelemetrySource, hash: u64) -> ClockInfo {
             session_key: None,
         }
     }
+}
+
+/// GPS week that covers most of a recording.
+///
+/// A receiver can report a stale week for the first few seconds after a cold
+/// start; the corrected week then holds for the rest of the recording. Because
+/// a recording cannot cross a real week boundary, the modal value is the
+/// authoritative one. Ties are broken by the last occurrence so the corrected
+/// week wins over the startup artifact.
+fn dominant_gps_week(source: &dyn TelemetrySource, week_index: usize) -> Option<u64> {
+    let mut tally: std::collections::BTreeMap<u64, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for (position, (_, value)) in samples(source, week_index).into_iter().enumerate() {
+        if let Some(week) = finite_u64(value) {
+            let entry = tally.entry(week).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = position;
+        }
+    }
+    tally
+        .into_iter()
+        .max_by_key(|(_, (count, last))| (*count, *last))
+        .map(|(week, _)| week)
 }
 
 /// Earliest instant a logger could honestly report: 2000-01-01T00:00:00Z.
@@ -994,6 +1029,67 @@ mod tests {
         fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
             self.0.decode(channel_index, chunk_index, local_index)
         }
+    }
+
+    fn gps_clock_source(weeks: Vec<f64>, itows: Vec<f64>) -> MetadataSource {
+        let names = ["GPS Week", "GPS iTOW"];
+        let count = weeks.len() as u64;
+        let channels = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| Channel {
+                id: index as u32,
+                name: name.into(),
+                unit: if index == 0 {
+                    "count".into()
+                } else {
+                    "ms".into()
+                },
+                unit_source: UnitSource::Unknown,
+                sample_type: SampleType::F64,
+                chunks: vec![Chunk {
+                    sample_period_ns: 1_000_000_000,
+                    sample_count: count,
+                    data_ptr: 0,
+                    sample_base: 0,
+                    time_base_ns: 0,
+                }],
+                sample_count: count,
+                duration_ns: count * 1_000_000_000,
+            })
+            .collect();
+        MetadataSource {
+            path: "gps".into(),
+            channels,
+            values: vec![weeks, itows],
+            absolute_start_ns: 0,
+        }
+    }
+
+    #[test]
+    fn a_stale_startup_gps_week_does_not_date_the_recording() {
+        // AiM SmartyCam SCHD0215 reported GPS week 2117 for the first ~4.5 s
+        // before correcting to 2437. The modal week must win: anchoring on the
+        // first sample dates the recording 2020-08-02 instead of 2026-09-20.
+        let weeks = vec![2117.0, 2117.0, 2437.0, 2437.0, 2437.0, 2437.0];
+        let itows = vec![
+            0.0,
+            900_000.0,
+            1_000_000.0,
+            2_000_000.0,
+            3_000_000.0,
+            4_000_000.0,
+        ];
+        let gps = gps_clock_source(weeks, itows);
+        let metadata = read_source_metadata(&NoClock(gps));
+        assert_eq!(metadata.absolute_clock.as_deref(), Some("gps"));
+        let expected = (2437u64 * 604_800_000 + 315_964_800_000) * 1_000_000;
+        assert_eq!(metadata.absolute_start_ns, Some(expected));
+        assert!(metadata
+            .session_key
+            .as_deref()
+            .unwrap()
+            .starts_with("gps:2437:"));
     }
 
     #[test]
