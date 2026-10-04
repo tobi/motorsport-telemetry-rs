@@ -17,6 +17,7 @@ tempfile.workspace = true
 name = "motorsport_telemetry_core"
 
 [dependencies]
+serde_json.workspace = true
 jiff.workspace = true
 memmap2.workspace = true
 motorsport-track-atlas.workspace = true

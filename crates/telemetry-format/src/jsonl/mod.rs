@@ -6,7 +6,7 @@
 use crate::write::TelemetryFormatError;
 use motorsport_telemetry_core::{
     read_source_metadata, AbsoluteTimeRange, AppliedPass, Channel, ChannelDisplay, ChannelLabel,
-    FileMetadata, LapKind, LapMetadata, SourceIdentity, VideoFileRef,
+    FileMetadata, LapKind, LapMetadata, MetadataMap, SourceIdentity, VideoFileRef,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -51,6 +51,7 @@ pub struct JsonlRecording {
     pub(super) source_format: String,
     pub(super) source_path: String,
     pub(super) identity: SourceIdentity,
+    pub(super) extra: MetadataMap,
     pub(super) clock: Option<AbsoluteTimeRange>,
     pub(super) utc_start_ns: Option<u64>,
     pub(super) timezone: String,
@@ -197,7 +198,7 @@ impl JsonlRecording {
                 video
             })
             .collect();
-        Ok(Some(FileMetadata {
+        let mut metadata = FileMetadata {
             format,
             source_format: if header.source_format.is_empty() {
                 "jsonl".to_owned()
@@ -226,7 +227,9 @@ impl JsonlRecording {
                 .map(|clock| i128::from(clock.start_ns)),
             utc_start_ns: header.utc_start_ns,
             timezone: header.timezone,
+            source_identity: header.identity.clone(),
             identity: header.identity,
+            extra: header.extra,
             driver_ids: header.driver_ids.unwrap_or_default(),
             driver_stints: Vec::new(),
             valid_laps,
@@ -235,7 +238,9 @@ impl JsonlRecording {
             video_frame_count,
             video_presentation_offset_ns: header.video_offset_ns,
             videos,
-        }))
+        };
+        metadata.apply_extra_metadata();
+        Ok(Some(metadata))
     }
 
     /// Parses an owned MTJ buffer, decompressing a zstd frame when present.

@@ -12,8 +12,9 @@ use super::{
 use crate::write::TelemetryFormatError;
 use motorsport_telemetry_core::{
     parse_timespan_ms, timespan_ms_in_range, AbsoluteTimeRange, AppliedPass, Channel,
-    ChannelDisplay, ChannelLabel, ChannelPlot, Chunk, LapKind, LapMetadata, SampleType,
-    SourceIdentity, Span, SpanMetaValue, SpanPrimary, UnitSource, VideoFileRef, TIMESPAN_MS,
+    ChannelDisplay, ChannelLabel, ChannelPlot, Chunk, LapKind, LapMetadata, MetadataMap,
+    SampleType, SourceIdentity, Span, SpanMetaValue, SpanPrimary, UnitSource, VideoFileRef,
+    TIMESPAN_MS,
 };
 use serde_json::{Map, Number, Value};
 use std::io::BufRead;
@@ -26,6 +27,7 @@ pub(super) struct ParsedHeader {
     pub(super) duration_ns: u64,
     pub(super) origin_ns: u64,
     pub(super) identity: SourceIdentity,
+    pub(super) extra: MetadataMap,
     pub(super) clock: Option<AbsoluteTimeRange>,
     pub(super) timezone: String,
     pub(super) utc_start_ns: Option<u64>,
@@ -85,6 +87,18 @@ pub(super) fn parse_header_line(header_line: &str) -> Result<ParsedHeader, Telem
         session: string_field(header, "ses"),
         date: string_field(header, "date"),
         time: string_field(header, "time"),
+    };
+    // File-level metadata is an MTJ field; MTX headers describe groups.
+    let extra = if extension {
+        MetadataMap::new()
+    } else {
+        match header.get("meta") {
+            None => MetadataMap::new(),
+            Some(value) => value
+                .as_object()
+                .ok_or_else(|| invalid("header meta must be a JSON object"))?
+                .clone(),
+        }
     };
     let session_hint = string_field(header, "hint");
     let clock = match (
@@ -217,6 +231,7 @@ pub(super) fn parse_header_line(header_line: &str) -> Result<ParsedHeader, Telem
         duration_ns,
         origin_ns,
         identity,
+        extra,
         clock,
         timezone,
         utc_start_ns,
@@ -256,6 +271,7 @@ impl JsonlRecording {
             duration_ns,
             origin_ns,
             identity,
+            extra,
             clock,
             timezone,
             utc_start_ns,
@@ -368,6 +384,7 @@ impl JsonlRecording {
             source_format,
             source_path,
             identity,
+            extra,
             clock,
             utc_start_ns,
             timezone,

@@ -108,12 +108,28 @@ Three sections, no blanks:
 
 `mtj` `q` `dur` required. `utc` `tz` required on write when known. Optional:
 `o` `src` `srcp` `drv` `veh` `ven` `evt` `ses` `date` `time` `clk` `abs`
-`abe` `hint` `vo` `vf` `vpts` `passes` `hash`. `src` is `aimd` `pds`
+`abe` `hint` `vo` `vf` `vpts` `passes` `meta` `hash`. `src` is `aimd` `pds`
 `motec` `vbo` `telemetry`. Video linkage (`vo` recording presentation
 offset ns, `vf` file refs with BLAKE3, `vpts` per-frame presentation
 times) and pass provenance are normative in
 [`JSONL.md`](crates/telemetry-format/JSONL.md) §4.2; `vpts` requires `vf`,
 and MTX sidecars must not carry any of the three.
+
+`meta` stores file-level descriptive metadata, including resolved `TRACK.yml`
+fields. It is an optional JSON object, omitted when empty. Unknown keys,
+nested objects, arrays, and `null` values survive recording conversion and
+rewrites. For example:
+
+```json
+{"meta":{"driver":{"name":"Tobi"},"track":{"name":"Sebring"},"session":"Practice","setup":{"tyres":["soft",null],"wet":false}}}
+```
+
+The ordinary identity header fields retain the native source identity.
+`metadata().identity` applies recognized descriptive overrides from `meta`;
+`identity()` still returns native values. Both header-only and full reads expose
+the complete object as `FileMetadata.extra`. Date, track, and session overrides
+do not change timestamps, timezone placement, or session keys. `meta` is MTJ-only;
+MTX export does not persist it. See `JSONL.md` §4.3.
 
 ### Laps
 
@@ -191,7 +207,8 @@ python3 crates/telemetry-format/scripts/validate-mtx.py PATH.telemetry.ext.jsonl
 ## Schema
 
 [`telemetry.schema.json`](telemetry.schema.json) is the single writer-strict
-schema. Every defined object is `additionalProperties: false`. Each `$defs`
+schema. Format objects use `additionalProperties: false`; the MTJ `meta`
+object intentionally accepts arbitrary keys and JSON values. Each `$defs`
 entry has `description`, `examples` of how to write the property, and
 `minLength` / `maxLength` on every string. `$comment` explains the JSONL key. Readers still ignore unknown keys
 so old v1 JSONL clients can skip `plt` / `lbl` / `utc`.

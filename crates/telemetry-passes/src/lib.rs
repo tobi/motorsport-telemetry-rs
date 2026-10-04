@@ -257,7 +257,7 @@ pub fn registry() -> Vec<Box<dyn TelemetryPass>> {
 /// re-derivation.
 pub fn apply_registry(
     source: &dyn TelemetrySource,
-) -> Result<(ViewSource<'_>, Vec<PassReport>), PassError> {
+) -> Result<(ViewSource<&dyn TelemetrySource>, Vec<PassReport>), PassError> {
     apply_passes(source, &registry())
 }
 
@@ -269,7 +269,7 @@ pub fn apply_registry(
 pub fn apply_passes<'a>(
     source: &'a dyn TelemetrySource,
     passes: &[Box<dyn TelemetryPass>],
-) -> Result<(ViewSource<'a>, Vec<PassReport>), PassError> {
+) -> Result<(ViewSource<&'a dyn TelemetrySource>, Vec<PassReport>), PassError> {
     let mut passed = ViewSource::new(source);
     let mut reports = Vec::with_capacity(passes.len());
     for pass in passes {

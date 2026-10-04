@@ -3,7 +3,8 @@
 use super::JsonlRecording;
 use motorsport_telemetry_core::{
     AbsoluteTimeRange, AppliedPass, Channel, ChannelDisplay, ChannelLabel, FileMetadata,
-    SourceIdentity, SourceLapMetadata, SourceOrigin, Span, TelemetrySource, VideoFileRef,
+    MetadataMap, SourceIdentity, SourceLapMetadata, SourceOrigin, Span, TelemetrySource,
+    VideoFileRef,
 };
 use std::ops::Range;
 
@@ -86,6 +87,10 @@ impl TelemetrySource for JsonlRecording {
     }
     fn identity(&self) -> SourceIdentity {
         self.identity.clone()
+    }
+
+    fn extra_metadata(&self) -> MetadataMap {
+        self.extra.clone()
     }
 
     /// A JSONL file whose recorded `src` is a real vendor format is a

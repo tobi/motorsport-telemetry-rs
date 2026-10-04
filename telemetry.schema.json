@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://motorsport-telemetry.rs/telemetry.schema.json",
   "title": "Motorsport Telemetry (MTJ / MTX)",
-  "description": "Writer-strict schema for every JSON object in an MTJ recording or MTX sidecar.\n\nA file is JSONL (one JSON value per LF line), not one JSON document. Validate each line:\n  MTJ (.telemetry.jsonl) — line 1 $defs.mtj_header, line 2 $defs.laps, then $defs.channel | $defs.span\n  MTX (.telemetry.ext.jsonl) — one or more groups of $defs.mtx_header then $defs.channel | $defs.span\n\nString lengths are Unicode code points (JSON Schema maxLength). Omit a key instead of writing \"\". Compact JSON, no insignificant whitespace, no BOM, trailing LF.\n\nLimits:\n  name (channel n, span n, MTX group n)     1–64     Speed, Ride Height FL, 443-1, Sebring 12H 2025\n  identity (drv veh ven evt ses)            1–80     Tobi, Sebring\n  unit u                                    1–24     km/h, °C, mm, bpm, %\n  fmt                                       1–16     0.0°C, 000, 000%, 0°   (no whitespace)\n  tz                                        3–64     America/New_York, UTC\n  label text                                1–80     brake lock, bottomed\n  chrome r[].t                              1–120    LMP2 stints during the race\n  chrome pill r[].p[]                       1–32     Avg lap, 1:52.1\n  span p.title                              1–32     #443\n  span p.sub                                1–48     EL · 1:52.1\n  span m name / value                       1–32 / 1–48\n  date / time                               1–32     decorative vendor text\n  clk                                       1–32     gps, utc, time_of_day\n  hint                                      1–64     FP1\n  hash                                      16       0123456789abcdef\n  color c                                   7        #e11d48\n  r items ≤ 8, m items ≤ 16, lbl items ≤ 256\n\nLattice, uniqueness, join (host = ext + ext.utc − host.utc), and MTX vis are enforced by crates/telemetry-format/scripts/validate-mtx.py, not by JSON Schema. Readers ignore unknown keys; this schema sets additionalProperties=false so writers cannot smuggle undefined fields.",
+  "description": "Writer-strict schema for every JSON object in an MTJ recording or MTX sidecar.\n\nA file is JSONL (one JSON value per LF line), not one JSON document. Validate each line:\n  MTJ (.telemetry.jsonl) — line 1 $defs.mtj_header, line 2 $defs.laps, then $defs.channel | $defs.span\n  MTX (.telemetry.ext.jsonl) — one or more groups of $defs.mtx_header then $defs.channel | $defs.span\n\nString lengths are Unicode code points (JSON Schema maxLength). Omit a key instead of writing \"\". Compact JSON, no insignificant whitespace, no BOM, trailing LF.\n\nLimits:\n  name (channel n, span n, MTX group n)     1–64     Speed, Ride Height FL, 443-1, Sebring 12H 2025\n  identity (drv veh ven evt ses)            1–80     Tobi, Sebring\n  unit u                                    1–24     km/h, °C, mm, bpm, %\n  fmt                                       1–16     0.0°C, 000, 000%, 0°   (no whitespace)\n  tz                                        3–64     America/New_York, UTC\n  label text                                1–80     brake lock, bottomed\n  chrome r[].t                              1–120    LMP2 stints during the race\n  chrome pill r[].p[]                       1–32     Avg lap, 1:52.1\n  span p.title                              1–32     #443\n  span p.sub                                1–48     EL · 1:52.1\n  span m name / value                       1–32 / 1–48\n  date / time                               1–32     decorative vendor text\n  clk                                       1–32     gps, utc, time_of_day\n  hint                                      1–64     FP1\n  hash                                      16       0123456789abcdef\n  color c                                   7        #e11d48\n  r items ≤ 8, m items ≤ 16, lbl items ≤ 256\n\nLattice, uniqueness, join (host = ext + ext.utc − host.utc), and MTX vis are enforced by crates/telemetry-format/scripts/validate-mtx.py, not by JSON Schema. Readers ignore unknown keys; format objects set additionalProperties=false; MTJ meta deliberately permits arbitrary keys and JSON values.",
   "$defs": {
     "vis": {
       "title": "Visibility",
@@ -1325,6 +1325,26 @@
         ]
       ]
     },
+    "fileMetadata": {
+      "title": "File-level descriptive metadata",
+      "description": "Additional file-level metadata, including resolved TRACK.yml context. Omit meta when empty. Preserve unknown keys and arbitrary nested JSON values, including null. Recognized fields override effective descriptive identity only; native identity, clocks, timezone placement, samples, video timing, and session keys remain unchanged.",
+      "$comment": "MTJ header meta only; MTX export does not persist file-level metadata. This object deliberately permits arbitrary properties.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": true,
+      "examples": [
+        {
+          "driver": {"name": "Tobi"},
+          "track": {"name": "Sebring"},
+          "session": "Practice",
+          "setup": {
+            "tyres": ["soft", null],
+            "wet": false
+          },
+          "notes": null
+        }
+      ]
+    },
     "mtj_header": {
       "title": "MTJ recording header (line 1)",
       "description": "First line of a .telemetry.jsonl recording. mtj, q, dur required. Write utc and tz whenever known so the file can be placed on the absolute axis. Omit empty optional keys and omit o when it is 0.",
@@ -1441,6 +1461,9 @@
           "items": {
             "$ref": "#/$defs/appliedPass"
           }
+        },
+        "meta": {
+          "$ref": "#/$defs/fileMetadata"
         },
         "hash": {
           "$ref": "#/$defs/hash"

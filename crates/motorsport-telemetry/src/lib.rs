@@ -31,6 +31,9 @@ use std::sync::OnceLock;
 use telemetry_format::{is_jsonl_path, JsonlRecording};
 use thiserror::Error;
 
+mod track_metadata;
+pub use track_metadata::{OpenOptions, TrackMetadataError};
+
 pub use motorsport_telemetry_core;
 pub use motorsport_track_atlas;
 /// Current Motorsport Telemetry JSONL (MTJ) document version.
@@ -51,6 +54,9 @@ pub enum TelemetryError {
     /// The path does not have a supported telemetry extension.
     #[error("unsupported telemetry file {0}")]
     Unsupported(String),
+    /// External metadata or its traversal boundary is invalid.
+    #[error(transparent)]
+    TrackMetadata(#[from] TrackMetadataError),
     /// The `AiM` MP4 parser rejected the input.
     #[error(transparent)]
     Aim(#[from] aim_telemetry::AimError),
@@ -77,75 +83,120 @@ pub enum TelemetryError {
 /// validates the file contents. JSONL compression is detected by content.
 /// Opening a recording does not modify it.
 pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
-    let path = path.as_ref();
-    if is_jsonl_path(path) {
+    open_with_options(path, &OpenOptions::default())
+}
+
+/// Opens a recording with bounded, opt-out `TRACK.yml` metadata discovery.
+/// See [`OpenOptions`] for defaults and root validation.
+pub fn open_with_options(
+    path: impl AsRef<Path>,
+    options: &OpenOptions,
+) -> Result<TelemetryFile, TelemetryError> {
+    open_with_metadata(path.as_ref(), options, false)
+}
+
+/// Opens a recording for metadata and lap-filmstrip construction.
+/// Some vendor readers retain only representative samples for unrelated
+/// channels. Use [`open`] for complete arrays and video-frame indexing.
+/// Loads adjacent `TRACK.yml` metadata by default.
+pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
+    open_metadata_with_options(path, &OpenOptions::default())
+}
+
+/// [`open_metadata`] with explicit filesystem metadata options.
+pub fn open_metadata_with_options(
+    path: impl AsRef<Path>,
+    options: &OpenOptions,
+) -> Result<TelemetryFile, TelemetryError> {
+    open_with_metadata(path.as_ref(), options, true)
+}
+
+fn open_with_metadata(
+    path: &Path,
+    options: &OpenOptions,
+    metadata_only: bool,
+) -> Result<TelemetryFile, TelemetryError> {
+    ensure_supported(path)?;
+    let layers = track_metadata::load(path, options)?;
+    let source = open_native(path, metadata_only)?;
+    if layers
+        .iter()
+        .all(motorsport_telemetry_core::MetadataMap::is_empty)
+    {
+        return Ok(source);
+    }
+    let mut view = motorsport_telemetry_core::ViewSource::new(source);
+    for layer in layers {
+        view = view.with_extra_metadata(&layer);
+    }
+    Ok(Box::new(view))
+}
+
+fn ensure_supported(path: &Path) -> Result<(), TelemetryError> {
+    if is_jsonl_path(path)
+        || matches!(
+            extension(path).as_str(),
+            "mp4" | "pds" | "ld" | "vbo" | "telemetry"
+        )
+    {
+        Ok(())
+    } else {
+        Err(TelemetryError::Unsupported(path.display().to_string()))
+    }
+}
+
+fn open_native(path: &Path, metadata_only: bool) -> Result<TelemetryFile, TelemetryError> {
+    if is_jsonl_path(path) || is_telemetry(path) {
         return Ok(Box::new(JsonlRecording::open(path)?));
     }
     match extension(path).as_str() {
+        "mp4" if metadata_only => Ok(Box::new(AimFile::open_index(path)?)),
         "mp4" => Ok(Box::new(AimFile::open(path)?)),
         "pds" => Ok(Box::new(CosworthFile::open(path)?)),
         "ld" => Ok(Box::new(MotecFile::open(path)?)),
+        "vbo" if metadata_only => Ok(Box::new(RacelogicFile::open_metadata(path)?)),
         "vbo" => Ok(Box::new(RacelogicFile::open(path)?)),
-        "telemetry" => Ok(Box::new(JsonlRecording::open(path)?)),
         _ => Err(TelemetryError::Unsupported(path.display().to_string())),
     }
 }
 
-/// Opens a telemetry file for fast metadata and lap-filmstrip construction.
-///
-/// The returned source preserves every signal needed to derive
-/// [`FileMetadata::laps`] while formats with expensive bulk data may retain
-/// only representative samples for unrelated channels. Use [`open`] when
-/// complete signal arrays or exact video-frame indexing are required.
-pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
-    let path = path.as_ref();
-    if is_jsonl_path(path) {
-        return Ok(Box::new(JsonlRecording::open(path)?));
-    }
-    match extension(path).as_str() {
-        "mp4" => Ok(Box::new(AimFile::open_index(path)?)),
-        "pds" => Ok(Box::new(CosworthFile::open(path)?)),
-        "ld" => Ok(Box::new(MotecFile::open(path)?)),
-        "vbo" => Ok(Box::new(RacelogicFile::open_metadata(path)?)),
-        "telemetry" => Ok(Box::new(JsonlRecording::open(path)?)),
-        _ => Err(TelemetryError::Unsupported(path.display().to_string())),
-    }
-}
-
-/// Quickly returns all format-neutral lap intervals needed by a session or
-/// video filmstrip.
-///
-/// This is the stable public lap-summary API. Parsers may obtain the result
-/// from native lap packets, sidecars, counters, or timer resets; callers do not
-/// need to inspect the optional [`TelemetrySource::source_lap_metadata`] hook.
+/// Returns classified lap intervals, reading only the header for modern MTJ.
 pub fn read_lap_metadata(
     path: impl AsRef<Path>,
 ) -> Result<Vec<motorsport_telemetry_core::LapMetadata>, TelemetryError> {
-    if is_telemetry(path.as_ref()) || is_jsonl_path(path.as_ref()) {
-        return Ok(telemetry_format::read_laps(path)?);
-    }
-    Ok(open_metadata(path)?.metadata().laps)
+    Ok(read_metadata(path)?.laps)
 }
 
-/// Returns the number of flying laps.
-///
-/// For a `.telemetry` this is an O(header) read (see [`read_metadata`]).
+/// Returns the number of flying laps; O(header) for modern MTJ.
 pub fn read_valid_laps(path: impl AsRef<Path>) -> Result<u32, TelemetryError> {
-    if is_telemetry(path.as_ref()) || is_jsonl_path(path.as_ref()) {
-        return Ok(telemetry_format::read_valid_laps(path)?);
-    }
-    Ok(open_metadata(path)?.metadata().valid_laps)
+    Ok(read_metadata(path)?.valid_laps)
 }
 
-/// Format-neutral file summary with the stint model resolved.
-///
-/// For a `.telemetry` this is O(header): a zstd-MTJ document is decoded only
-/// through its header and laps lines. Vendor files are opened.
+/// Format-neutral summary, including adjacent `TRACK.yml` metadata.
+/// Modern MTJ reads stop after the header and laps; vendor files are opened.
 pub fn read_metadata(path: impl AsRef<Path>) -> Result<FileMetadata, TelemetryError> {
-    if is_telemetry(path.as_ref()) || is_jsonl_path(path.as_ref()) {
-        return Ok(telemetry_format::read_metadata(path)?);
+    read_metadata_with_options(path, &OpenOptions::default())
+}
+
+/// [`read_metadata`] with bounded parent traversal or metadata discovery disabled.
+/// Reading external metadata does not require decoding MTJ channel data.
+pub fn read_metadata_with_options(
+    path: impl AsRef<Path>,
+    options: &OpenOptions,
+) -> Result<FileMetadata, TelemetryError> {
+    let path = path.as_ref();
+    ensure_supported(path)?;
+    let layers = track_metadata::load(path, options)?;
+    let mut metadata = if is_telemetry(path) || is_jsonl_path(path) {
+        telemetry_format::read_metadata(path)?
+    } else {
+        open_native(path, true)?.metadata()
+    };
+    for layer in layers {
+        motorsport_telemetry_core::merge_metadata(&mut metadata.extra, &layer);
     }
-    Ok(open_metadata(path)?.metadata())
+    metadata.apply_extra_metadata();
+    Ok(metadata)
 }
 
 fn extension(path: &Path) -> String {

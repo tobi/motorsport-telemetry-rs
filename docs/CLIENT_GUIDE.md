@@ -1,5 +1,10 @@
 # Client guide
 
+External directory metadata is described in [TRACK.yml](TRACK_YML.md):
+adjacent files load by default, optional roots enable bounded parent
+traversal, and `ignore_track_yml` disables discovery. These fields merge
+into the file summary without changing samples or clocks.
+
 ## The client contract: blessed channels, laps, video, clocks
 
 Everything a client application needs is on this page. Two rules hold across

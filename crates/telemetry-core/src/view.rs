@@ -35,15 +35,16 @@ enum Slot {
 /// Construct with [`ViewSource::new`] (keeps every inner channel) then
 /// [`ViewSource::retain`] to drop channels and [`ViewSource::append`] to add
 /// derived ones. `retain` is only valid before the first `append`.
-pub struct ViewSource<'a> {
-    inner: &'a dyn TelemetrySource,
+pub struct ViewSource<S: TelemetrySource> {
+    inner: S,
+    extra: Option<crate::MetadataMap>,
     channels: Vec<Channel>,
     slots: Vec<Slot>,
     visible: Vec<bool>,
     passes: Vec<AppliedPass>,
 }
 
-impl std::fmt::Debug for ViewSource<'_> {
+impl<S: TelemetrySource> std::fmt::Debug for ViewSource<S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ViewSource")
@@ -53,7 +54,8 @@ impl std::fmt::Debug for ViewSource<'_> {
             .field("appended", &self.appended_len())
             .field("visible", &self.visible)
             .field("passes", &self.passes)
-            .finish()
+            .field("extra", &self.extra)
+            .finish_non_exhaustive()
     }
 }
 
@@ -81,10 +83,10 @@ pub enum ViewError {
     DuplicateName(String),
 }
 
-impl<'a> ViewSource<'a> {
+impl<S: TelemetrySource> ViewSource<S> {
     /// Creates a view over `inner` keeping every inner channel, with visibility
     /// and applied passes copied from `inner`.
-    pub fn new(inner: &'a dyn TelemetrySource) -> Self {
+    pub fn new(inner: S) -> Self {
         let channels = inner.channels().to_vec();
         let slots = (0..channels.len()).map(Slot::Inner).collect();
         let inner_visible = inner.channel_visible();
@@ -94,6 +96,7 @@ impl<'a> ViewSource<'a> {
         let passes = inner.applied_passes().to_vec();
         Self {
             inner,
+            extra: None,
             channels,
             slots,
             visible,
@@ -215,8 +218,18 @@ impl<'a> ViewSource<'a> {
     }
 
     /// Returns the inner source this view wraps.
-    pub fn inner(&self) -> &'a dyn TelemetrySource {
-        self.inner
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Overlays file-level metadata without changing channels or native clocks.
+    /// The view may own a boxed source or borrow an existing one.
+    #[must_use]
+    pub fn with_extra_metadata(mut self, overlay: &crate::MetadataMap) -> Self {
+        let mut extra = self.extra_metadata();
+        crate::merge_metadata(&mut extra, overlay);
+        self.extra = Some(extra);
+        self
     }
 
     /// Returns the number of appended (derived) channels in the view.
@@ -247,7 +260,7 @@ fn mirror_chunks(mirror: &Channel, width: usize) -> Vec<Chunk> {
     chunks
 }
 
-impl TelemetrySource for ViewSource<'_> {
+impl<S: TelemetrySource> TelemetrySource for ViewSource<S> {
     fn path(&self) -> &str {
         self.inner.path()
     }
@@ -322,6 +335,11 @@ impl TelemetrySource for ViewSource<'_> {
     fn source_origin(&self) -> Option<SourceOrigin> {
         self.inner.source_origin()
     }
+    fn extra_metadata(&self) -> crate::MetadataMap {
+        self.extra
+            .clone()
+            .unwrap_or_else(|| self.inner.extra_metadata())
+    }
     fn identity(&self) -> SourceIdentity {
         self.inner.identity()
     }
@@ -350,7 +368,10 @@ impl TelemetrySource for ViewSource<'_> {
         self.inner.video_reference_at(time_ns)
     }
     fn metadata(&self) -> FileMetadata {
-        self.inner.metadata()
+        let mut metadata = self.inner.metadata();
+        metadata.extra = self.extra_metadata();
+        metadata.apply_extra_metadata();
+        metadata
     }
     fn sample_times(&self, channel_index: usize) -> SampleTimes<'_> {
         match &self.slots[channel_index] {

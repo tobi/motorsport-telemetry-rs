@@ -14,7 +14,7 @@
 use motorsport_telemetry::motorsport_telemetry_core::{
     Channel, Chunk, SampleType, SourceIdentity, TelemetrySource, UnitSource,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use telemetry_format::write_telemetry;
 
@@ -26,6 +26,314 @@ fn fixture(name: &str) -> PathBuf {
 
 fn cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_motorsport-telemetry"))
+}
+
+fn inspect_json(path: &Path, options: &[&str]) -> serde_json::Value {
+    let output = cli()
+        .args(["inspect", "--json"])
+        .args(options)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn adjacent_track_yml_overrides_inferred_inspection_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let metadata = "\
+track:
+  name: Club Circuit
+  layout: Short Loop
+  length_m: 1234
+car:
+  name: Club Car
+  number: 27
+  class: Touring
+driver:
+  name: Test Driver
+event: Club Weekend
+session: Qualifying
+date: '2001-02-03'
+time: '09:30:00'
+notes:
+  conditions: dry
+  tags: [practice, test]
+";
+    std::fs::write(dir.path().join("TRACK.yml"), metadata).unwrap();
+    // VBOX inspection uses the metadata-oriented loader; MP4 uses the full loader.
+    for name in ["synthetic_aimd.mp4", "synthetic_vbo.vbo"] {
+        let input = dir.path().join(name);
+        std::fs::copy(fixture(name), &input).unwrap();
+        let report = inspect_json(&input, &[]);
+        assert_eq!(report["track_name"], "Club Circuit");
+        assert_eq!(report["layout"], "Short Loop");
+        assert_eq!(report["track_length_m"], 1234.0);
+        assert_eq!(report["car_type"], "Club Car");
+        assert_eq!(report["car_number"], "27");
+        assert_eq!(report["car_class"], "Touring");
+        assert_eq!(report["driver"], "Test Driver");
+        assert_eq!(report["event"], "Club Weekend");
+        assert_eq!(report["session"], "Qualifying");
+        assert_eq!(report["date"], "2001-02-03");
+        assert_eq!(report["time"], "09:30:00");
+        assert_eq!(report["event_date"], "2001-02-03");
+        assert_eq!(report["event_date_source"], "date");
+        assert!(report["event_date_warning"].is_null());
+        assert_eq!(
+            report["extra"]["notes"]["tags"],
+            serde_json::json!(["practice", "test"])
+        );
+    }
+
+    std::fs::write(
+        dir.path().join("TRACK.yml"),
+        format!("{metadata}archive:\n  event_date: '1999-04-05'\n"),
+    )
+    .unwrap();
+    let input = dir.path().join("synthetic_aimd.mp4");
+    let report = inspect_json(&input, &[]);
+    let ignored = inspect_json(&input, &["--ignore-track-yml"]);
+    assert_eq!(report["event_date"], "1999-04-05");
+    assert_eq!(report["event_date_source"], "archive.event_date");
+    assert_eq!(report["date"], "2001-02-03");
+    assert_eq!(report["session_key"], ignored["session_key"]);
+    assert_eq!(report["lap_table"], ignored["lap_table"]);
+    assert_eq!(ignored["track_name"], "Road America");
+    assert_eq!(ignored["event_date"], "2026-08-01");
+    assert_eq!(ignored["extra"], serde_json::json!({}));
+
+    let human = cli().arg("inspect").arg(&input).output().unwrap();
+    assert!(human.status.success(), "{human:?}");
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.contains("track_name: Club Circuit\n"), "{text}");
+    assert!(text.contains("event: Club Weekend\n"), "{text}");
+    assert!(text.contains("session: Qualifying\n"), "{text}");
+    assert!(text.contains("event_date: 1999-04-05\n"), "{text}");
+}
+
+#[test]
+fn explicit_null_metadata_masks_inferred_inspection_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("run.mp4");
+    std::fs::copy(fixture("synthetic_aimd.mp4"), &input).unwrap();
+    std::fs::write(
+        dir.path().join("TRACK.yml"),
+        "track: null\ncar: null\ndriver: null\nevent: null\nsession: null\ndate: null\ntime: null\n",
+    )
+    .unwrap();
+    let report = inspect_json(&input, &[]);
+    for key in [
+        "track_name",
+        "layout",
+        "track_length_m",
+        "car_type",
+        "car_number",
+        "car_class",
+        "driver",
+        "event",
+        "session",
+        "date",
+        "time",
+        "event_date",
+    ] {
+        assert!(report[key].is_null(), "{key}: {}", report[key]);
+    }
+    assert_eq!(report["event_date_source"], "date");
+}
+
+#[test]
+fn folder_mask_loads_metadata_from_explicit_root_through_each_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("archive");
+    let leaf = root.join("weekend/car-1");
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::write(dir.path().join("TRACK.yml"), "outside_root: true\n").unwrap();
+    std::fs::write(
+        root.join("TRACK.yml"),
+        "\
+track:
+  name: Root Circuit
+archive:
+  owner: Team
+  event_date: '2001-01-01'
+overrides:
+  - match: 'weekend/**/*.pds'
+    metadata:
+      session: PDS Session
+  - match: 'weekend/**/*.vbo'
+    metadata:
+      session: VBOX Session
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("weekend/TRACK.yml"),
+        "event: Weekend\narchive:\n  event_date: '2002-02-02'\n",
+    )
+    .unwrap();
+    std::fs::write(leaf.join("TRACK.yml"), "car:\n  name: Leaf Car\n").unwrap();
+    for name in ["synthetic_cosworth.pds", "synthetic_vbo.vbo"] {
+        std::fs::copy(fixture(name), leaf.join(name)).unwrap();
+    }
+
+    let adjacent_only = inspect_json(&root, &["--mask", "**/*.pds"]);
+    let adjacent = &adjacent_only["files"][0];
+    assert_eq!(adjacent["car_type"], "Leaf Car");
+    assert!(adjacent["extra"]["archive"].is_null());
+    assert_eq!(adjacent["track_name"], "Road America");
+
+    let inherited = inspect_json(
+        &root,
+        &[
+            "--mask",
+            "**/*.{pds,vbo}",
+            "--root-path",
+            root.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(inherited["ok"], 2);
+    assert_eq!(inherited["failed"], 0);
+    for report in inherited["files"].as_array().unwrap() {
+        assert_eq!(report["track_name"], "Root Circuit");
+        assert_eq!(report["car_type"], "Leaf Car");
+        assert_eq!(report["event"], "Weekend");
+        assert_eq!(report["event_date"], "2002-02-02");
+        assert_eq!(report["extra"]["archive"]["owner"], "Team");
+        assert!(report["extra"]["outside_root"].is_null());
+        let expected_session = if report["format"] == "pds" {
+            "PDS Session"
+        } else {
+            "VBOX Session"
+        };
+        assert_eq!(report["session"], expected_session);
+        assert!(report["extra"]["overrides"].is_null());
+    }
+}
+
+#[test]
+fn ignore_track_yml_skips_malformed_documents_for_inspect_and_convert() {
+    let dir = tempfile::tempdir().unwrap();
+    let leaf = dir.path().join("logs");
+    std::fs::create_dir(&leaf).unwrap();
+    let input = leaf.join("run.mp4");
+    std::fs::copy(fixture("synthetic_aimd.mp4"), &input).unwrap();
+    for folder in [dir.path(), leaf.as_path()] {
+        std::fs::write(folder.join("TRACK.yml"), "track: [broken\n").unwrap();
+    }
+    let report = inspect_json(
+        &input,
+        &[
+            "--root-path",
+            dir.path().to_str().unwrap(),
+            "--ignore-track-yml",
+        ],
+    );
+    assert_eq!(report["track_name"], "Road America");
+    assert_eq!(report["extra"], serde_json::json!({}));
+    let dest = dir.path().join("run.telemetry");
+    let converted = cli()
+        .args([
+            "convert",
+            "--no-passes",
+            "--ignore-track-yml",
+            "--root-path",
+        ])
+        .arg(dir.path())
+        .arg(&input)
+        .arg(&dest)
+        .output()
+        .unwrap();
+    assert!(converted.status.success(), "{converted:?}");
+    let stored = telemetry_format::read_metadata(&dest).unwrap();
+    assert!(stored.extra.is_empty());
+
+    // Verification concerns stored content, even beside an invalid TRACK.yml.
+    let verified = cli().arg("verify").arg(&dest).output().unwrap();
+    assert!(verified.status.success(), "{verified:?}");
+}
+
+#[test]
+fn explicit_root_is_validated_even_when_track_yml_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("run.mp4");
+    std::fs::copy(fixture("synthetic_aimd.mp4"), &input).unwrap();
+    let unrelated = dir.path().join("unrelated");
+    std::fs::create_dir(&unrelated).unwrap();
+    let missing = dir.path().join("missing");
+    let dest = dir.path().join("output.telemetry");
+    for root in [&unrelated, &missing, &input] {
+        for ignore in [false, true] {
+            for command in ["inspect", "convert"] {
+                let mut invocation = cli();
+                invocation.arg(command).arg("--root-path").arg(root);
+                if ignore {
+                    invocation.arg("--ignore-track-yml");
+                }
+                invocation.arg(&input);
+                if command == "convert" {
+                    invocation.arg(&dest);
+                }
+                let output = invocation.output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "{command}: {root:?}: {output:?}"
+                );
+                assert!(!output.stderr.is_empty());
+                assert!(!dest.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn conversion_persists_effective_metadata_without_changing_clocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("archive");
+    let leaf = root.join("logs");
+    std::fs::create_dir_all(&leaf).unwrap();
+    let input = leaf.join("run.mp4");
+    std::fs::copy(fixture("synthetic_aimd.mp4"), &input).unwrap();
+    let original = motorsport_telemetry::read_metadata(&input).unwrap();
+    std::fs::write(
+        root.join("TRACK.yml"),
+        "track:\n  name: Archive Circuit\narchive:\n  event_date: '1999-01-01'\n  owner: Team\n",
+    )
+    .unwrap();
+    std::fs::write(
+        leaf.join("TRACK.yml"),
+        "car:\n  name: Archive Car\ndate: '2001-01-01'\ntime: '01:02:03'\narchive:\n  owner: Driver\n",
+    )
+    .unwrap();
+    for suffix in ["telemetry", "telemetry.jsonl", "telemetry.jsonl.zstd"] {
+        // Output lives outside the metadata root; inspect must use stored extras.
+        let dest = dir.path().join(format!("converted.{suffix}"));
+        let converted = cli()
+            .arg("convert")
+            .arg(format!("--root-path={}", root.display()))
+            .arg(&input)
+            .arg(&dest)
+            .output()
+            .unwrap();
+        assert!(converted.status.success(), "{suffix}: {converted:?}");
+        let stored = telemetry_format::read_metadata(&dest).unwrap();
+        assert_eq!(stored.extra["archive"]["owner"], "Driver");
+        assert_eq!(stored.identity.venue, "Archive Circuit");
+        assert_eq!(stored.identity.vehicle, "Archive Car");
+        assert_eq!(stored.identity.date, "2001-01-01");
+        assert_eq!(stored.identity.time, "01:02:03");
+        assert_eq!(stored.utc_start_ns, original.utc_start_ns);
+        assert_eq!(stored.absolute_start_ns, original.absolute_start_ns);
+        assert_eq!(stored.clock_offset_ns, original.clock_offset_ns);
+        let report = inspect_json(&dest, &["--ignore-track-yml"]);
+        assert_eq!(report["track_name"], "Archive Circuit");
+        assert_eq!(report["car_type"], "Archive Car");
+        assert_eq!(report["event_date"], "1999-01-01");
+        assert_eq!(report["date"], "2001-01-01");
+        assert_eq!(report["extra"]["archive"]["owner"], "Driver");
+    }
 }
 
 #[test]
@@ -163,11 +471,15 @@ fn command_help_is_specific() {
         String::from_utf8(cli().args(["help", "inspect"]).output().unwrap().stdout).unwrap();
     assert!(inspect.contains("--mask"));
     assert!(inspect.contains("folder"));
+    assert!(inspect.contains("--root-path"));
+    assert!(inspect.contains("--ignore-track-yml"));
 
     let convert =
         String::from_utf8(cli().args(["convert", "--help"]).output().unwrap().stdout).unwrap();
     assert!(convert.contains(".telemetry.jsonl"));
     assert!(convert.contains("Default"));
+    assert!(convert.contains("--root-path"));
+    assert!(convert.contains("--ignore-track-yml"));
 
     let verify =
         String::from_utf8(cli().args(["verify", "--help"]).output().unwrap().stdout).unwrap();
@@ -188,7 +500,7 @@ fn convert_without_output_writes_next_to_the_input() {
     let dest = String::from_utf8(output.stdout).unwrap();
     assert!(dest.contains("run.pds.telemetry"), "{dest}");
     let dest = dest.trim();
-    assert!(std::path::Path::new(dest).is_file());
+    assert!(Path::new(dest).is_file());
 
     let verified = cli().args(["verify", dest]).output().unwrap();
     assert!(verified.status.success(), "{verified:?}");

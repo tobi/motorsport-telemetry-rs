@@ -186,10 +186,12 @@ Line 1 is a JSON object. Writers SHOULD emit keys in the order listed.
 | `vf` | array | no | Linked video files, in index order. See 4.2. |
 | `vpts` | array | no | Presentation-order video frame timestamps, nanoseconds on the movie timeline. Requires `vf`. See 4.2. |
 | `passes` | array | no | Processing passes applied to this file, in application order. See 4.1. |
+| `meta` | object | no | File-level descriptive metadata, including resolved `TRACK.yml` fields. See 4.3. |
 | `hash` | string | no | 16-digit lowercase hex schema hash. |
 
 Omit any optional key whose value is empty, unknown, or `0` for `o`. Do not
-write `null` values. Writers MUST emit `utc` and `tz` whenever they are
+write `null` header values; nested values inside `meta` MAY be `null`.
+Writers MUST emit `utc` and `tz` whenever they are
 known. Readers of a recording MAY accept a document that lacks them (that
 file cannot be placed on the absolute axis).
 
@@ -202,7 +204,8 @@ MUST be JSON integers, not quoted strings and not non-integral numbers.
 **Header-only reads.** `nc`/`nsc`/`ns`/`dids`/`fl`/`ch` plus the laps line
 (§5, with stint fields) make every recording-level fact available without
 reading a channel line. A reader that stops after line 2 has the file's
-identity, clocks, duration, counts, video table, laps with stints and kinds,
+native and effective identity, file-level `meta`, clocks, duration, counts,
+video table, laps with stints and kinds,
 fastest lap, and the channel directory. A document without these keys (written
 before they existed) is complete but must be parsed in full to know them.
 Values in `ch` MUST agree with the channel lines; a reader MAY trust `ch`
@@ -270,6 +273,36 @@ host recording.
         "po":101833333}],
  "vpts":[0,16666666,33333333]}
 ```
+
+### 4.3 File-level descriptive metadata (`meta`)
+
+`meta` is an optional JSON object containing additional file-level metadata,
+including resolved `TRACK.yml` context. Writers MUST omit it when empty.
+Readers MUST treat an absent `meta` as an empty object and MUST reject a
+present value that is not an object. This optional key is additive to MTJ
+version 1; existing documents remain valid.
+
+Keys are unrestricted. Values MAY be any JSON value, including nested objects,
+arrays, numbers, booleans, strings, and `null`. Readers and recording writers
+MUST preserve unknown keys and their values when converting or rewriting MTJ;
+JSON key order and insignificant whitespace need not be preserved.
+
+The header's `drv` / `veh` / `ven` / `evt` / `ses` / `date` / `time` fields
+retain the native source identity. Recognized descriptive fields in `meta`
+override the effective identity returned by `FileMetadata`, using the same
+core rules for header-only and full reads. `TelemetrySource::identity()`
+continues to return native identity; `extra_metadata()` and `FileMetadata.extra`
+expose the complete object. Apply descriptive overrides only after clock and
+session-key derivation. Overrides, including date, track, and session, MUST
+NOT change timestamps, timezone placement, session keys, samples, or video timing.
+
+```json
+{"meta":{"driver":{"name":"Tobi"},"track":{"name":"Sebring"},"session":"Practice","setup":{"tyres":["soft",null],"wet":false},"notes":null}}
+```
+
+`meta` is currently supported only in MTJ recording headers. MTX group headers
+and MTX export do not persist file-level metadata; use an MTJ recording when
+this context must survive conversion.
 
 ## 5. Laps
 

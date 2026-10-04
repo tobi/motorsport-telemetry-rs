@@ -16,12 +16,14 @@
 
 use std::sync::Arc;
 
+/// Format-neutral file and session metadata derivation.
+/// File-level descriptive metadata overlays.
+pub mod context;
 /// Errors, warnings, and notes reported while reading a recording.
 pub mod diag;
 /// How a channel should be drawn.
 pub mod display;
 mod laps;
-/// Format-neutral file and session metadata derivation.
 pub mod metadata;
 pub mod motion;
 /// Punctuation- and case-insensitive channel-name matching.
@@ -42,6 +44,7 @@ pub mod validate;
 /// A window over another source: retained channels plus appended mirrors.
 pub mod view;
 
+pub use context::{merge_metadata, MetadataMap};
 pub use diag::{Diagnostic, Diagnostics, Severity};
 pub use display::{ChannelDisplay, ChannelPlot};
 pub use laps::classify_laps;
@@ -495,6 +498,13 @@ pub trait TelemetrySource: Send + Sync {
         None
     }
 
+    /// Additional descriptive metadata, independent of channels and clocks.
+    ///
+    /// Includes resolved `TRACK.yml` fields when loaded through the facade.
+    fn extra_metadata(&self) -> MetadataMap {
+        MetadataMap::new()
+    }
+
     /// Returns identity fields embedded in the source.
     fn identity(&self) -> SourceIdentity {
         SourceIdentity::default()
@@ -799,6 +809,9 @@ macro_rules! impl_telemetry_source_for_wrapper {
                 }
                 fn source_origin(&self) -> Option<crate::SourceOrigin> {
                     (**self).source_origin()
+                }
+                fn extra_metadata(&self) -> MetadataMap {
+                    (**self).extra_metadata()
                 }
                 fn identity(&self) -> SourceIdentity {
                     (**self).identity()

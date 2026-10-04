@@ -7,11 +7,11 @@
 )]
 
 use motorsport_telemetry::motorsport_telemetry_core::{
-    names, Diagnostic, Diagnostics, FileMetadata, Severity, TelemetrySource,
+    names, Diagnostic, Diagnostics, FileMetadata, Severity, SourceIdentity, TelemetrySource,
 };
 use motorsport_telemetry::{
-    open, open_metadata, verify, SourceExt, TelemetryError, TelemetryFile, VerifyError, VerifyKind,
-    VerifyReport,
+    open_metadata_with_options, open_with_options, verify, OpenOptions, SourceExt, TelemetryError,
+    TelemetryFile, VerifyError, VerifyKind, VerifyReport,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -63,10 +63,14 @@ Arguments:
 
 Options:
   --json               Machine-readable JSON
+  --root-path <path>    Load TRACK.yml from this ancestor through each file's folder
+  --ignore-track-yml    Ignore external TRACK.yml metadata
   -m, --mask <glob>    Keep files whose relative path or file name matches
                        this glob. Repeatable; a file matches if any mask
                        matches. Matching is case-insensitive. Use / in globs.
   -h, --help           Show this help
+
+By default, only TRACK.yml beside each recording is loaded.
 
 Globs:
   *                    Any characters except /
@@ -110,6 +114,10 @@ Arguments:
 Options:
   --no-passes          Convert the source as-is; run no passes
   --strip-passes       Drop previously applied pass outputs
+  --root-path <path>   Load TRACK.yml from this ancestor through the input folder
+  --ignore-track-yml   Ignore external TRACK.yml metadata
+
+By default, only TRACK.yml beside the input recording is loaded.
 
 Output suffix:
   .telemetry                    MTJ, one zstd frame (the default)
@@ -178,6 +186,8 @@ struct Inspection {
     source_format: String,
     source_path: String,
     passes: Vec<String>,
+    identity: SourceIdentity,
+    extra: serde_json::Map<String, serde_json::Value>,
     driver_ids: Vec<i64>,
     laps: usize,
     complete_laps: usize,
@@ -209,8 +219,18 @@ fn main() {
     match arguments(std::env::args_os().skip(1)) {
         Ok(Command::Help { topic }) => print!("{}", help_text(topic)),
         Ok(Command::Version) => println!("motorsport-telemetry {}", env!("CARGO_PKG_VERSION")),
-        Ok(Command::Inspect { path, json, masks }) => {
-            if let Err(error) = run_inspect(&path, json, &masks) {
+        Ok(Command::Inspect {
+            path,
+            json,
+            masks,
+            root_path,
+            ignore_track_yml,
+        }) => {
+            let options = OpenOptions {
+                root_path,
+                ignore_track_yml,
+            };
+            if let Err(error) = run_inspect(&path, json, &masks, &options) {
                 eprintln!("motorsport-telemetry: {error}");
                 std::process::exit(1);
             }
@@ -219,7 +239,17 @@ fn main() {
             input,
             output,
             passes,
-        }) => match convert(&input, output.as_deref(), passes) {
+            root_path,
+            ignore_track_yml,
+        }) => match convert(
+            &input,
+            output.as_deref(),
+            passes,
+            &OpenOptions {
+                root_path,
+                ignore_track_yml,
+            },
+        ) {
             Ok(dest) => println!("{}", dest.display()),
             Err(error) => {
                 eprintln!("motorsport-telemetry: {error}");
@@ -285,11 +315,15 @@ enum Command {
         path: PathBuf,
         json: bool,
         masks: Vec<String>,
+        root_path: Option<PathBuf>,
+        ignore_track_yml: bool,
     },
     Convert {
         input: PathBuf,
         output: Option<PathBuf>,
         passes: PassMode,
+        root_path: Option<PathBuf>,
+        ignore_track_yml: bool,
     },
     Verify {
         paths: Vec<PathBuf>,
@@ -355,6 +389,7 @@ fn parse_inspect(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
     let mut path = None;
     let mut json = false;
     let mut masks = Vec::new();
+    let mut options = OpenOptions::default();
     let mut args = args.into_iter().peekable();
     while let Some(argument) = args.next() {
         if argument == "-h" || argument == "--help" {
@@ -364,6 +399,9 @@ fn parse_inspect(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
         }
         if argument == "--json" {
             json = true;
+            continue;
+        }
+        if parse_open_option(&argument, &mut args, &mut options)? {
             continue;
         }
         let text = argument.to_string_lossy();
@@ -388,14 +426,22 @@ fn parse_inspect(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
             return Err("inspect expects one file or folder".into());
         }
     }
-    path.map(|path| Command::Inspect { path, json, masks })
-        .ok_or_else(|| "inspect is missing a file or folder".into())
+    path.map(|path| Command::Inspect {
+        path,
+        json,
+        masks,
+        root_path: options.root_path,
+        ignore_track_yml: options.ignore_track_yml,
+    })
+    .ok_or_else(|| "inspect is missing a file or folder".into())
 }
 
 fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut positional = Vec::new();
     let mut passes = PassMode::Apply;
-    for argument in args {
+    let mut options = OpenOptions::default();
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
         if argument == "-h" || argument == "--help" {
             return Ok(Command::Help {
                 topic: HelpTopic::Convert,
@@ -409,6 +455,9 @@ fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
             passes = PassMode::Strip;
             continue;
         }
+        if parse_open_option(&argument, &mut args, &mut options)? {
+            continue;
+        }
         if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option {}", argument.to_string_lossy()));
         }
@@ -419,15 +468,46 @@ fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
             input: input.clone(),
             output: None,
             passes,
+            root_path: options.root_path,
+            ignore_track_yml: options.ignore_track_yml,
         }),
         [input, output] => Ok(Command::Convert {
             input: input.clone(),
             output: Some(output.clone()),
             passes,
+            root_path: options.root_path,
+            ignore_track_yml: options.ignore_track_yml,
         }),
         [] => Err("convert is missing an input file".into()),
         _ => Err("convert expects <input> [output]".into()),
     }
+}
+
+fn parse_open_option(
+    argument: &std::ffi::OsStr,
+    args: &mut impl Iterator<Item = OsString>,
+    options: &mut OpenOptions,
+) -> Result<bool, String> {
+    if argument == "--ignore-track-yml" {
+        options.ignore_track_yml = true;
+        return Ok(true);
+    }
+    let value = if argument == "--root-path" {
+        args.next()
+            .ok_or_else(|| "--root-path needs a path".to_owned())?
+    } else if let Some(value) = argument
+        .to_str()
+        .and_then(|text| text.strip_prefix("--root-path="))
+    {
+        OsString::from(value)
+    } else {
+        return Ok(false);
+    };
+    if value.is_empty() || value.to_string_lossy().starts_with('-') {
+        return Err("--root-path needs a path".into());
+    }
+    options.root_path = Some(PathBuf::from(value));
+    Ok(true)
 }
 
 fn parse_verify(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
@@ -449,7 +529,12 @@ fn parse_verify(args: impl IntoIterator<Item = OsString>) -> Result<Command, Str
     Ok(Command::Verify { paths })
 }
 
-fn run_inspect(path: &Path, json: bool, masks: &[String]) -> Result<(), String> {
+fn run_inspect(
+    path: &Path,
+    json: bool,
+    masks: &[String],
+    options: &OpenOptions,
+) -> Result<(), String> {
     let targets = collect_inspect_targets(path, masks)?;
     if targets.is_empty() {
         return Err(if masks.is_empty() {
@@ -463,7 +548,7 @@ fn run_inspect(path: &Path, json: bool, masks: &[String]) -> Result<(), String> 
         });
     }
     if targets.len() == 1 && path.is_file() {
-        let inspection = inspect(&targets[0]).map_err(|error| error.to_string())?;
+        let inspection = inspect(&targets[0], options).map_err(|error| error.to_string())?;
         if json {
             print_json(&inspection);
         } else {
@@ -475,7 +560,7 @@ fn run_inspect(path: &Path, json: bool, masks: &[String]) -> Result<(), String> 
     let mut files = Vec::new();
     let mut errors = Vec::new();
     for (index, target) in targets.iter().enumerate() {
-        match inspect(target) {
+        match inspect(target, options) {
             Ok(inspection) => {
                 if !json {
                     if index > 0 {
@@ -685,9 +770,10 @@ fn convert(
     input: &Path,
     output: Option<&Path>,
     passes: PassMode,
+    options: &OpenOptions,
 ) -> Result<PathBuf, TelemetryError> {
     let dest = output.map_or_else(|| default_telemetry_dest(input), Path::to_path_buf);
-    let file = open(input)?;
+    let file = open_with_options(input, options)?;
     match passes {
         PassMode::Apply => {
             let (passed, reports) = apply_registry(&file)
@@ -854,8 +940,8 @@ fn decode_fault_message(diagnostics: &Diagnostics) -> String {
     message
 }
 
-fn inspect(path: &Path) -> Result<Inspection, TelemetryError> {
-    let file = open_for_inspection(path)?;
+fn inspect(path: &Path, options: &OpenOptions) -> Result<Inspection, TelemetryError> {
+    let file = open_for_inspection(path, options)?;
     let metadata = file.metadata();
     let track = file.match_track();
     let track_gps = track.as_ref().map(|context| context.gps);
@@ -878,25 +964,31 @@ fn inspect(path: &Path) -> Result<Inspection, TelemetryError> {
         Vec::new()
     };
     let identity = &metadata.identity;
-    let car_type = nonempty(&identity.vehicle).or_else(|| {
+    let car_type = extra_text_or_else(&metadata, &["car", "name"], || {
+        nonempty(&identity.vehicle).or_else(|| {
+            first_semantic_value(
+                &file,
+                &["cartype", "vehicletype", "vehiclemodel", "carmodel"],
+            )
+        })
+    });
+    let car_number = extra_text_or_else(&metadata, &["car", "number"], || {
         first_semantic_value(
             &file,
-            &["cartype", "vehicletype", "vehiclemodel", "carmodel"],
+            &[
+                "carnumber",
+                "vehiclenumber",
+                "racenumber",
+                "competitionnumber",
+            ],
         )
     });
-    let car_number = first_semantic_value(
-        &file,
-        &[
-            "carnumber",
-            "vehiclenumber",
-            "racenumber",
-            "competitionnumber",
-        ],
-    );
-    let car_class = first_semantic_value(
-        &file,
-        &["carclass", "vehicleclass", "classid", "competitionclass"],
-    );
+    let car_class = extra_text_or_else(&metadata, &["car", "class"], || {
+        first_semantic_value(
+            &file,
+            &["carclass", "vehicleclass", "classid", "competitionclass"],
+        )
+    });
     let event_date = event_date(path, &metadata);
     let diagnostics = file.validate().into_items();
 
@@ -905,6 +997,8 @@ fn inspect(path: &Path) -> Result<Inspection, TelemetryError> {
         format: metadata.format.clone(),
         source_format: metadata.source_format.clone(),
         source_path: metadata.source_path.clone(),
+        identity: identity.clone(),
+        extra: metadata.extra.clone(),
         passes: metadata
             .passes
             .iter()
@@ -949,15 +1043,24 @@ fn inspect(path: &Path) -> Result<Inspection, TelemetryError> {
         car_number,
         car_class,
         track_gps,
-        track_name: track
-            .as_ref()
-            .map(|context| context.matched.track.name.to_owned())
-            .or_else(|| nonempty(&identity.venue)),
-        layout: track
-            .as_ref()
-            .map(|context| context.matched.layout.name.to_owned()),
-        track_length_m: track.and_then(|context| context.matched.layout.length_m),
-        event_date: event_date.selected.map(|date| date.to_string()),
+        track_name: extra_text_or_else(&metadata, &["track", "name"], || {
+            track
+                .as_ref()
+                .map(|context| context.matched.track.name.to_owned())
+                .or_else(|| nonempty(&identity.venue))
+        }),
+        layout: extra_text_or_else(&metadata, &["track", "layout"], || {
+            track
+                .as_ref()
+                .map(|context| context.matched.layout.name.to_owned())
+        }),
+        track_length_m: match extra_value(&metadata, &["track", "length_m"]) {
+            Some(serde_json::Value::Null) => None,
+            value => value
+                .and_then(serde_json::Value::as_f64)
+                .or_else(|| track.and_then(|context| context.matched.layout.length_m)),
+        },
+        event_date: event_date.selected,
         event_date_source: event_date.source,
         event_date_warning: event_date.warning,
         diagnostics,
@@ -983,12 +1086,27 @@ impl std::fmt::Display for CivilDate {
 
 #[derive(Debug)]
 struct EventDate {
-    selected: Option<CivilDate>,
+    selected: Option<String>,
     source: Option<String>,
     warning: Option<String>,
 }
 
 fn event_date(path: &Path, metadata: &FileMetadata) -> EventDate {
+    // Descriptive dates override this report, never source clocks or session keys.
+    for (keys, source) in [
+        (&["archive", "event_date"][..], "archive.event_date"),
+        (&["date"][..], "date"),
+    ] {
+        let selected = extra_text(metadata, keys);
+        if selected.is_some() || extra_value(metadata, keys).is_some_and(serde_json::Value::is_null)
+        {
+            return EventDate {
+                selected,
+                source: Some(source.into()),
+                warning: None,
+            };
+        }
+    }
     let telemetry = telemetry_date(metadata);
     let created = fs::metadata(path)
         .and_then(|metadata| metadata.created())
@@ -1025,7 +1143,7 @@ fn select_event_date(
         let future_days = -age_days;
         if age_days >= SUSPICIOUS_CLOCK_AGE_DAYS {
             return EventDate {
-                selected: Some(created_date),
+                selected: Some(created_date.to_string()),
                 source: Some("file_created_at".into()),
                 warning: Some(format!(
                     "rejected {telemetry_source} date {telemetry_date}: {age_days} days older than file creation"
@@ -1034,7 +1152,7 @@ fn select_event_date(
         }
         if future_days > 7 {
             return EventDate {
-                selected: Some(created_date),
+                selected: Some(created_date.to_string()),
                 source: Some("file_created_at".into()),
                 warning: Some(format!(
                     "rejected {telemetry_source} date {telemetry_date}: {future_days} days newer than file creation"
@@ -1044,13 +1162,13 @@ fn select_event_date(
     }
     if let Some((date, source)) = telemetry {
         EventDate {
-            selected: Some(date),
+            selected: Some(date.to_string()),
             source: Some(source),
             warning: None,
         }
     } else {
         EventDate {
-            selected: created,
+            selected: created.map(|date| date.to_string()),
             source: created.map(|_| "file_created_at".into()),
             warning: None,
         }
@@ -1143,20 +1261,56 @@ fn civil_from_days(days: i64) -> Option<CivilDate> {
     })
 }
 
-fn open_for_inspection(path: &Path) -> Result<TelemetryFile, TelemetryError> {
+fn open_for_inspection(
+    path: &Path,
+    options: &OpenOptions,
+) -> Result<TelemetryFile, TelemetryError> {
     if path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("vbo"))
     {
-        open_metadata(path)
+        open_metadata_with_options(path, options)
     } else {
-        open(path)
+        open_with_options(path, options)
     }
 }
 
 fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_owned())
+}
+
+/// Preserve explicit null masks, including a null on a containing object.
+fn extra_value<'a>(metadata: &'a FileMetadata, path: &[&str]) -> Option<&'a serde_json::Value> {
+    let (first, rest) = path.split_first()?;
+    let mut value = metadata.extra.get(*first)?;
+    for key in rest {
+        if value.is_null() {
+            return Some(value);
+        }
+        value = value.get(*key)?;
+    }
+    Some(value)
+}
+
+fn extra_text(metadata: &FileMetadata, path: &[&str]) -> Option<String> {
+    match extra_value(metadata, path)? {
+        serde_json::Value::String(value) => nonempty(value),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn extra_text_or_else(
+    metadata: &FileMetadata,
+    path: &[&str],
+    fallback: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if extra_value(metadata, path).is_some_and(serde_json::Value::is_null) {
+        None
+    } else {
+        extra_text(metadata, path).or_else(fallback)
+    }
 }
 
 fn first_semantic_value(file: &TelemetryFile, candidates: &[&str]) -> Option<String> {
@@ -1247,6 +1401,17 @@ fn print_human(inspection: &Inspection) {
     println!("format: {}", inspection.format);
     println!("source_format: {}", inspection.source_format);
     println!("source_path: {}", inspection.source_path);
+    for (key, value) in [
+        ("driver", &inspection.identity.driver),
+        ("event", &inspection.identity.event),
+        ("session", &inspection.identity.session),
+        ("date", &inspection.identity.date),
+        ("time", &inspection.identity.time),
+    ] {
+        if let Some(value) = nonempty(value) {
+            println!("{key}: {value}");
+        }
+    }
     println!(
         "passes: {}",
         if inspection.passes.is_empty() {
@@ -1383,11 +1548,12 @@ fn inspection_json(inspection: &Inspection) -> serde_json::Value {
         .video_included
         .then_some(&inspection.video_filenames)
         .filter(|filenames| !filenames.is_empty());
-    json!({
+    let mut report = json!({
         "file": inspection.file,
         "format": inspection.format,
         "source_format": inspection.source_format,
         "source_path": inspection.source_path,
+        "extra": inspection.extra,
         "passes": inspection.passes,
         "event_date": inspection.event_date,
         "event_date_source": inspection.event_date_source,
@@ -1448,7 +1614,17 @@ fn inspection_json(inspection: &Inspection) -> serde_json::Value {
                 })
             })
             .collect::<Vec<_>>(),
-    })
+    });
+    for (key, value) in [
+        ("driver", &inspection.identity.driver),
+        ("event", &inspection.identity.event),
+        ("session", &inspection.identity.session),
+        ("date", &inspection.identity.date),
+        ("time", &inspection.identity.time),
+    ] {
+        report[key] = json!(nonempty(value));
+    }
+    report
 }
 
 fn display_ids(values: &[i64]) -> String {
@@ -1495,6 +1671,8 @@ mod tests {
                 path: PathBuf::from("run.ld"),
                 json: true,
                 masks: Vec::new(),
+                root_path: None,
+                ignore_track_yml: false,
             })
         );
         assert_eq!(
@@ -1510,6 +1688,8 @@ mod tests {
                 path: PathBuf::from("logs"),
                 json: false,
                 masks: vec!["**/*.pds".into(), "*.telemetry".into()],
+                root_path: None,
+                ignore_track_yml: false,
             })
         );
         assert_eq!(
@@ -1530,6 +1710,8 @@ mod tests {
                 input: PathBuf::from("run.pds"),
                 output: None,
                 passes: PassMode::Apply,
+                root_path: None,
+                ignore_track_yml: false,
             })
         );
         assert_eq!(
@@ -1538,6 +1720,8 @@ mod tests {
                 input: PathBuf::from("run.pds"),
                 output: None,
                 passes: PassMode::Skip,
+                root_path: None,
+                ignore_track_yml: false,
             })
         );
         assert_eq!(
@@ -1550,6 +1734,8 @@ mod tests {
                 input: PathBuf::from("run.telemetry"),
                 output: None,
                 passes: PassMode::Strip,
+                root_path: None,
+                ignore_track_yml: false,
             })
         );
         assert!(arguments(["convert".into(), "--native-zip".into(), "run.pds".into()]).is_err());
@@ -1576,6 +1762,49 @@ mod tests {
             })
         );
         assert!(arguments(["inspect".into(), "--mask".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_track_yml_options() {
+        for root_args in [vec!["--root-path", "logs"], vec!["--root-path=logs"]] {
+            for command in ["inspect", "convert"] {
+                let args = [command, "--ignore-track-yml"]
+                    .into_iter()
+                    .chain(root_args.iter().copied())
+                    .chain(["logs/run.pds"])
+                    .map(OsString::from);
+                let expected = if command == "inspect" {
+                    Command::Inspect {
+                        path: PathBuf::from("logs/run.pds"),
+                        json: false,
+                        masks: Vec::new(),
+                        root_path: Some(PathBuf::from("logs")),
+                        ignore_track_yml: true,
+                    }
+                } else {
+                    Command::Convert {
+                        input: PathBuf::from("logs/run.pds"),
+                        output: None,
+                        passes: PassMode::Apply,
+                        root_path: Some(PathBuf::from("logs")),
+                        ignore_track_yml: true,
+                    }
+                };
+                assert_eq!(arguments(args), Ok(expected));
+            }
+        }
+        for command in ["inspect", "convert"] {
+            for invalid in [
+                vec![command, "--root-path"],
+                vec![command, "--root-path="],
+                vec![command, "--root-path", "--ignore-track-yml"],
+            ] {
+                assert_eq!(
+                    arguments(invalid.into_iter().map(OsString::from)),
+                    Err("--root-path needs a path".into())
+                );
+            }
+        }
     }
 
     #[test]
@@ -1634,7 +1863,7 @@ mod tests {
             day: 8,
         };
         let selected = select_event_date(Some((telemetry, "gps_clock".into())), Some(created));
-        assert_eq!(selected.selected, Some(created));
+        assert_eq!(selected.selected, Some(created.to_string()));
         assert_eq!(selected.source.as_deref(), Some("file_created_at"));
         assert!(selected.warning.unwrap().contains("rejected gps_clock"));
     }

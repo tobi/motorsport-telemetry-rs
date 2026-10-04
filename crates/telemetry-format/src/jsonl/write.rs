@@ -161,12 +161,8 @@ pub(super) fn write_jsonl_document(
     mut writer: impl Write,
     extension: bool,
 ) -> Result<(), TelemetryFormatError> {
-    let mut metadata = read_source_metadata(source);
-    let timezone = motorsport_telemetry_core::placement::resolve_timezone(source);
-    metadata.timezone.clone_from(&timezone);
-    metadata.utc_start_ns = source
-        .utc_start_ns()
-        .or_else(|| motorsport_telemetry_core::placement::utc_from_metadata(&metadata, &timezone));
+    // Core derives clocks and placement before applying descriptive metadata.
+    let metadata = read_source_metadata(source);
     if extension {
         if metadata.utc_start_ns.is_none() {
             return Err(invalid(
@@ -381,13 +377,15 @@ fn write_header(
         writer.write_all(b",\"srcp\":")?;
         write_json_string(writer, &origin_path)?;
     }
-    write_opt_string(writer, "drv", &metadata.identity.driver)?;
-    write_opt_string(writer, "veh", &metadata.identity.vehicle)?;
-    write_opt_string(writer, "ven", &metadata.identity.venue)?;
-    write_opt_string(writer, "evt", &metadata.identity.event)?;
-    write_opt_string(writer, "ses", &metadata.identity.session)?;
-    write_opt_string(writer, "date", &metadata.identity.date)?;
-    write_opt_string(writer, "time", &metadata.identity.time)?;
+    // Keep native identity separate from the descriptive overrides in `meta`.
+    let identity = source.identity();
+    write_opt_string(writer, "drv", &identity.driver)?;
+    write_opt_string(writer, "veh", &identity.vehicle)?;
+    write_opt_string(writer, "ven", &identity.venue)?;
+    write_opt_string(writer, "evt", &identity.event)?;
+    write_opt_string(writer, "ses", &identity.session)?;
+    write_opt_string(writer, "date", &identity.date)?;
+    write_opt_string(writer, "time", &identity.time)?;
     write_placement_fields(writer, metadata.utc_start_ns, &metadata.timezone)?;
     write_clock_fields(writer, metadata)?;
     if let Some(hint) = metadata
@@ -401,6 +399,11 @@ fn write_header(
     }
     write_videos(writer, source)?;
     write_passes(writer, &metadata.passes)?;
+    if !metadata.extra.is_empty() {
+        writer.write_all(b",\"meta\":")?;
+        serde_json::to_writer(&mut *writer, &metadata.extra)
+            .map_err(|error| invalid(format!("cannot write header meta: {error}")))?;
+    }
     write!(writer, ",\"hash\":\"{:016x}\"}}", schema_hash(source))?;
     Ok(())
 }

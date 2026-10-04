@@ -35,7 +35,9 @@ pub fn write_telemetry_stripped(
 }
 
 /// A view with every applied-pass output channel removed and the pass list cleared.
-pub fn stripped_view(source: &dyn TelemetrySource) -> motorsport_telemetry_core::ViewSource<'_> {
+pub fn stripped_view(
+    source: &dyn TelemetrySource,
+) -> motorsport_telemetry_core::ViewSource<&dyn TelemetrySource> {
     let outputs: HashSet<&str> = source
         .applied_passes()
         .iter()

@@ -8,6 +8,8 @@ use motorsport_telemetry_core::{
 
 struct TinySource {
     identity: SourceIdentity,
+    extra: MetadataMap,
+    clock: Option<AbsoluteTimeRange>,
     channels: Vec<Channel>,
     values: Vec<Vec<f64>>,
     laps: Vec<LapMetadata>,
@@ -42,6 +44,12 @@ impl TelemetrySource for TinySource {
     }
     fn identity(&self) -> SourceIdentity {
         self.identity.clone()
+    }
+    fn extra_metadata(&self) -> MetadataMap {
+        self.extra.clone()
+    }
+    fn absolute_time_range(&self) -> Option<AbsoluteTimeRange> {
+        self.clock.clone()
     }
     fn utc_start_ns(&self) -> Option<u64> {
         self.utc_start_ns
@@ -110,6 +118,8 @@ fn tiny() -> TinySource {
             venue: "Road America".into(),
             ..SourceIdentity::default()
         },
+        extra: MetadataMap::new(),
+        clock: None,
         channels: vec![
             channel("Speed", "km/h", 10_000_000, 4, 0),
             channel("GPS Speed", "m/s", 40_000_000, 1, 0),
@@ -1363,5 +1373,186 @@ fn finite_extreme_values_survive_jsonl_round_trip() {
     let opened = JsonlRecording::from_bytes("extreme.telemetry.jsonl", &bytes).unwrap();
     for (index, value) in source.values[0].iter().enumerate() {
         assert_eq!(opened.decode(0, 0, index as u64), *value);
+    }
+}
+
+fn tiny_with_extra_metadata() -> TinySource {
+    let mut source = tiny();
+    source.identity.vehicle = "Native car".into();
+    source.identity.event = "Native event".into();
+    source.identity.session = "Native session".into();
+    source.identity.date = "15/03/2025".into();
+    source.identity.time = "10:00:00".into();
+    source.clock = Some(AbsoluteTimeRange {
+        clock: "utc".into(),
+        start_ns: 1_742_040_000_000_000_000,
+        end_ns: 1_742_040_000_040_000_000,
+        session_hint: "native-session".into(),
+    });
+    source.extra = serde_json::json!({
+        "driver": {"name": "Context driver", "mappings": {"1": "Context driver", "2": null}},
+        "car": {"name": "Context car"},
+        "track": {"name": "Sebring"},
+        "event": "Context event",
+        "session": "Context session",
+        "date": "2099-12-31",
+        "time": "23:59:59",
+        "setup": {
+            "tyres": ["soft", null, {"pressure": 1.85}],
+            "wet": false,
+            "notes": "Quoted \"note\"\nsecond line",
+            "empty": {}
+        },
+        "tags": [],
+        "unknown": null,
+        "counter": 18_446_744_073_709_551_615_u64
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    source
+}
+
+fn assert_metadata_clock_eq(actual: &FileMetadata, expected: &FileMetadata) {
+    assert_eq!(actual.session_key, expected.session_key);
+    assert_eq!(actual.absolute_clock, expected.absolute_clock);
+    assert_eq!(actual.absolute_start_ns, expected.absolute_start_ns);
+    assert_eq!(actual.absolute_end_ns, expected.absolute_end_ns);
+    assert_eq!(actual.clock_offset_ns, expected.clock_offset_ns);
+    assert_eq!(actual.utc_start_ns, expected.utc_start_ns);
+    assert_eq!(actual.timezone, expected.timezone);
+}
+
+#[test]
+fn extra_metadata_round_trip_preserves_native_identity_and_clocks() {
+    let mut source = tiny_with_extra_metadata();
+    let extra = std::mem::take(&mut source.extra);
+    let native = read_source_metadata(&source);
+    source.extra = extra;
+    let effective = read_source_metadata(&source);
+    assert_metadata_clock_eq(&effective, &native);
+    assert_eq!(effective.identity.driver, "Context driver");
+    assert_eq!(effective.identity.venue, "Sebring");
+    assert_eq!(effective.identity.session, "Context session");
+    assert_eq!(effective.identity.date, "2099-12-31");
+
+    let dir = tempfile::tempdir().unwrap();
+    for compress in [false, true] {
+        let path = dir.path().join("metadata.telemetry");
+        write_jsonl_from_source_with(&source, &path, compress).unwrap();
+        let opened = JsonlRecording::open(&path).unwrap();
+        assert_eq!(opened.identity(), source.identity());
+        assert_eq!(opened.extra_metadata(), source.extra);
+        let full = opened.metadata();
+        let quick = JsonlRecording::read_header_metadata(&path)
+            .unwrap()
+            .expect("meta does not require channel data");
+        for metadata in [&full, &quick] {
+            assert_eq!(metadata.extra, source.extra);
+            assert_eq!(metadata.identity, effective.identity);
+            assert_metadata_clock_eq(metadata, &native);
+        }
+
+        let mut rewritten = Vec::new();
+        write_jsonl_to(&opened, &mut rewritten).unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(rewritten.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(header["mtj"], 1);
+        assert_eq!(header["drv"], source.identity.driver);
+        assert_eq!(header["ven"], source.identity.venue);
+        assert_eq!(header["ses"], source.identity.session);
+        assert_eq!(header["date"], source.identity.date);
+        assert_eq!(header["meta"].as_object().unwrap(), &source.extra);
+        let reopened = JsonlRecording::from_bytes("rewritten.telemetry", &rewritten).unwrap();
+        assert_eq!(reopened.identity(), source.identity());
+        assert_eq!(reopened.extra_metadata(), source.extra);
+        assert_eq!(reopened.metadata().identity, effective.identity);
+        assert_metadata_clock_eq(&reopened.metadata(), &native);
+    }
+}
+
+#[test]
+fn extra_metadata_header_only_ignores_malformed_channel_and_trailing_data() {
+    let source = tiny_with_extra_metadata();
+    let mut bytes = Vec::new();
+    write_jsonl_to(&source, &mut bytes).unwrap();
+    let expected = JsonlRecording::from_bytes("full.telemetry", &bytes)
+        .unwrap()
+        .metadata();
+    let prefix = bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(2)
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let dir = tempfile::tempdir().unwrap();
+    for trailing in [b"{malformed channel}\n".as_slice(), &[0xff, b'\n']] {
+        let mut broken = prefix.clone();
+        broken.extend_from_slice(trailing);
+        for compress in [false, true] {
+            let document = if compress {
+                zstd::encode_all(broken.as_slice(), 3).unwrap()
+            } else {
+                broken.clone()
+            };
+            let path = dir.path().join("header-only.telemetry");
+            std::fs::write(&path, &document).unwrap();
+            assert!(JsonlRecording::open(&path).is_err());
+            let quick = JsonlRecording::header_metadata_from_bytes("header-only", &document)
+                .unwrap()
+                .unwrap();
+            let disk = JsonlRecording::read_header_metadata(&path)
+                .unwrap()
+                .unwrap();
+            let public = crate::read_metadata(&path).unwrap();
+            for metadata in [&quick, &disk, &public] {
+                assert_eq!(metadata.extra, expected.extra);
+                assert_eq!(metadata.identity, expected.identity);
+                assert_eq!(metadata.channel_count, expected.channel_count);
+                assert_eq!(metadata.sample_count, expected.sample_count);
+                assert_eq!(metadata.laps, expected.laps);
+                assert_metadata_clock_eq(metadata, &expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn extra_metadata_is_optional_and_empty_maps_are_omitted() {
+    for meta in ["", ",\"meta\":{}"] {
+        let text = format!(
+            "{{\"mtj\":1,\"q\":1000000,\"dur\":0,\"nc\":0,\"nsc\":0,\"ns\":0{meta}}}\n[]\n"
+        );
+        let opened = JsonlRecording::from_bytes("v1.telemetry", text.as_bytes()).unwrap();
+        assert!(opened.extra_metadata().is_empty());
+        assert!(opened.metadata().extra.is_empty());
+        assert!(
+            JsonlRecording::header_metadata_from_bytes("v1.telemetry", text.as_bytes())
+                .unwrap()
+                .unwrap()
+                .extra
+                .is_empty()
+        );
+        let mut rewritten = Vec::new();
+        write_jsonl_to(&opened, &mut rewritten).unwrap();
+        assert!(!String::from_utf8(rewritten).unwrap().contains("\"meta\":"));
+    }
+}
+
+#[test]
+fn extra_metadata_must_be_an_object() {
+    for meta in ["null", "[]", "1", "true", "\"text\""] {
+        let text = format!(
+            "{{\"mtj\":1,\"q\":1000000,\"dur\":0,\"nc\":0,\"nsc\":0,\"ns\":0,\"meta\":{meta}}}\n[]\n"
+        );
+        for error in [
+            JsonlRecording::from_bytes("invalid.telemetry", text.as_bytes()).unwrap_err(),
+            JsonlRecording::header_metadata_from_bytes("invalid.telemetry", text.as_bytes())
+                .unwrap_err(),
+        ] {
+            assert!(error
+                .to_string()
+                .contains("header meta must be a JSON object"));
+        }
     }
 }

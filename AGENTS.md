@@ -38,6 +38,18 @@ that predate them). Anything added to `FileMetadata` or needed by a metadata
 table function must be written into the header too, or it silently turns the
 metadata scan back into a full decode.
 
+## Directory metadata (`TRACK.yml`)
+
+The facade loads adjacent `TRACK.yml` by default; `OpenOptions::root_path`
+enables ancestor traversal within a canonical directory boundary, and
+`ignore_track_yml` disables external metadata. Root-to-leaf defaults and
+ordered relative-path glob overrides merge into `FileMetadata::extra`. The
+legacy YAML `schema` key is ignored. This is descriptive metadata, not
+channels: project onto identity only AFTER native clock/placement derivation.
+Never change UTC, session keys, samples, IDs, laps, or video offsets. Core
+`extra_metadata` and `ViewSource` carry it through passes; MTJ stores it in
+header `meta` for full and O(header) reads. See `docs/TRACK_YML.md`.
+
 ## Laps are stints
 
 `FileMetadata::laps` is the normalised lap model (`telemetry-core/src/laps.rs`,

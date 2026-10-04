@@ -285,8 +285,13 @@ pub struct FileMetadata {
     /// Empty when unknown. Used to format a civil wall time from
     /// [`Self::utc_start_ns`]. Never used as a join key.
     pub timezone: String,
-    /// Human-readable identity embedded in the source.
+    /// Native identity before descriptive metadata overrides.
+    pub source_identity: SourceIdentity,
+    /// Human-readable identity, with descriptive metadata overrides applied.
     pub identity: SourceIdentity,
+    /// Additional file-level metadata, including resolved `TRACK.yml` fields.
+    /// Never changes numeric samples, clocks, video timing, or session keys.
+    pub extra: crate::MetadataMap,
     /// Distinct internal driver identifiers in ascending order.
     pub driver_ids: Vec<i64>,
     /// Driver intervals in file-relative time.
@@ -663,6 +668,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
 
     let (video_frame_count, video_presentation_offset_ns, videos) = video_summary(source);
     let origin = source.source_origin();
+    let identity = source.identity();
     let mut metadata = FileMetadata {
         path: source.path().to_owned(),
         format: source.format().to_owned(),
@@ -696,7 +702,9 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         clock_offset_ns: clock.offset_ns,
         utc_start_ns: None,
         timezone: String::new(),
-        identity: source.identity(),
+        source_identity: identity.clone(),
+        identity,
+        extra: source.extra_metadata(),
         driver_ids,
         driver_stints,
         valid_laps: laps.iter().filter(|lap| lap.kind.is_flying()).count() as u32,
@@ -712,6 +720,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         .or_else(|| crate::placement::utc_from_metadata(&metadata, &timezone));
     metadata.utc_start_ns = utc_start_ns;
     metadata.timezone = timezone;
+    metadata.apply_extra_metadata();
     metadata
 }
 

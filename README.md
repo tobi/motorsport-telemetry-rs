@@ -67,6 +67,7 @@ the header and laps, without decoding channel values.
 ## Documentation
 
 - [Client guide](docs/CLIENT_GUIDE.md): normalized signals, units, laps, clocks, video, and sessions.
+- [TRACK.yml](docs/TRACK_YML.md): directory metadata, overrides, and collection-wide glob rules.
 - [Format guide](TELEMETRY.md): JSONL layout, sidecars, and examples.
 - [JSONL specification](crates/telemetry-format/JSONL.md) and [writer schema](telemetry.schema.json).
 - [Processing passes](crates/telemetry-passes): GPS quality, cleanup, and speed-derived distance.

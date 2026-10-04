@@ -67,6 +67,17 @@ normalizes a source-reported percentage or ratio; missing progress stays
 `None`. Track-progress estimation and cross-lap alignment belong in clients
 such as Omatrack, not this library.
 
+## Directory metadata
+
+`open`, `open_metadata`, and `read_metadata` load an adjacent `TRACK.yml` by
+default. Their `_with_options` variants accept `OpenOptions { root_path,
+ignore_track_yml }`: the optional ancestor root bounds parent traversal, and
+the flag skips all external YAML. Values merge into `FileMetadata.extra` and
+recognized identity fields, never into channels or clocks.
+
+See [TRACK.yml](../../docs/TRACK_YML.md) for merge rules, glob overrides,
+driver mappings, and CLI examples.
+
 ## Multi-file sessions
 
 `open_sessions` opens each input, derives internal metadata, and joins adjacent

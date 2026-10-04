@@ -6,7 +6,7 @@ use motorsport_telemetry_core::{AppliedPass, ViewError, ViewSource};
 /// Appends a pass's output channels to `view` and records its provenance.
 /// Returns the appended channel names.
 pub(crate) fn push_pass(
-    view: &mut ViewSource<'_>,
+    view: &mut ViewSource<&dyn motorsport_telemetry_core::TelemetrySource>,
     name: &str,
     version: u32,
     output: PassOutput,
