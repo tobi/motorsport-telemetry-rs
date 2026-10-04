@@ -258,7 +258,7 @@ pub fn audit_track(
         .iter()
         .filter(|c| c.sample_count > 0)
         .any(|c| {
-            ["lapnumber", "lapnum", "lapcount", "beaconeventcount"]
+            motorsport_telemetry_core::LAP_COUNTER_NAMES
                 .iter()
                 .any(|n| names::eq_with_numeric_suffix(&c.name, n))
         })
@@ -276,7 +276,7 @@ pub fn audit_track(
         .iter()
         .filter(|c| c.sample_count > 0)
         .any(|c| {
-            ["currentlaptime", "laptime", "laptimerunning", "lapprogress"]
+            motorsport_telemetry_core::TIMER_NAMES
                 .iter()
                 .any(|n| names::eq(&c.name, n))
         })
@@ -294,16 +294,10 @@ pub fn audit_track(
         .iter()
         .filter(|c| c.sample_count > 0)
         .any(|c| {
-            [
-                "groundspeed",
-                "speedref",
-                "speedwspdapp",
-                "vehiclespeed",
-                "gpsspeed",
-                "speed",
-            ]
-            .iter()
-            .any(|n| names::eq(&c.name, n))
+            motorsport_telemetry_core::SPEED_NAMES
+                .iter()
+                .chain(["wheelspeed", "vcar"].iter())
+                .any(|n| names::eq(&c.name, n))
         })
     {
         report.add(
@@ -1067,5 +1061,26 @@ mod tests {
                 "{report:?}"
             );
         }
+    }
+    #[test]
+    fn valid_native_alternative_names_are_not_reported_missing() {
+        let mut source = stored_with_duration(Vec::new(), 100);
+        source.channels[0].name = "velocity kmh".into();
+        source.channels[0].unit = "km/h".into();
+        for (id, name) in [(1, "beaconCount"), (2, "Lap Progression")] {
+            let mut c = source.channels[0].clone();
+            c.id = id;
+            c.name = name.into();
+            c.unit = "raw".into();
+            source.channels.push(c);
+        }
+        let report = audit_track(&source, &TrackAuditOptions::default()).unwrap();
+        assert!(
+            !report.findings.iter().any(|f| matches!(
+                f.code,
+                "missing-speed" | "missing-counter" | "missing-timer"
+            )),
+            "{report:?}"
+        );
     }
 }

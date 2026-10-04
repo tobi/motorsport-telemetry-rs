@@ -50,7 +50,10 @@ pub use diag::{Diagnostic, Diagnostics, Severity};
 pub use display::{ChannelDisplay, ChannelPlot};
 mod lap_evidence;
 mod lap_state;
-pub use laps::{classify_laps, inspect_lap_recovery, LapRecoveryObservation};
+pub use laps::{
+    classify_laps, inspect_lap_recovery, LapRecoveryObservation, LAP_COUNTER_NAMES, SPEED_NAMES,
+    TIMER_NAMES,
+};
 pub use metadata::{
     driver_histogram, group_sessions, read_source_metadata, schema_hash, AbsoluteTimeRange,
     DriverStint, FileMetadata, LapBoundary, LapKind, LapMetadata, SessionMetadata, SourceIdentity,

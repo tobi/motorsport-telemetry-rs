@@ -113,7 +113,7 @@ fn timer_activated(source: &dyn TelemetrySource, time_ns: u64) -> bool {
 
 /// Speed channels used for stop detection, by [`names::eq`] spelling, in
 /// priority order. Only a channel with a unit convertible to m/s qualifies.
-pub(crate) const SPEED_NAMES: &[&str] = &[
+pub const SPEED_NAMES: &[&str] = &[
     "groundspeed",
     "speedref",
     "corrspeed",
@@ -137,7 +137,8 @@ pub(crate) fn speed_channel(source: &dyn TelemetrySource) -> Option<usize> {
     })
 }
 
-const LAP_COUNTER_NAMES: &[&str] = &[
+/// Recognized native lap-counter spellings, in recovery priority order.
+pub const LAP_COUNTER_NAMES: &[&str] = &[
     "lapnumber",
     "lapnum",
     "lapcount",
@@ -779,19 +780,19 @@ fn timer_seconds_per_unit(unit: &str, max_value: f64) -> Option<f64> {
 }
 
 /// The running lap-timer / lap-progress channel [`timer_reset_laps`] reads.
+/// Recognized running-timer/progress spellings, in recovery priority order.
+pub const TIMER_NAMES: &[&str] = &[
+    "currentlaptime",
+    "lapcurrentlaptime",
+    "laptime",
+    "laptimerunning",
+    "lapprogression",
+    "lapprogress",
+    "lapprogresspct",
+];
+
 pub(crate) fn timer_channel(source: &dyn TelemetrySource) -> Option<usize> {
-    names::find(
-        source.channels(),
-        &[
-            "currentlaptime",
-            "lapcurrentlaptime",
-            "laptime",
-            "laptimerunning",
-            "lapprogression",
-            "lapprogress",
-            "lapprogresspct",
-        ],
-    )
+    names::find(source.channels(), TIMER_NAMES)
 }
 
 /// Sample period of a channel's first run, or zero when it has none.
