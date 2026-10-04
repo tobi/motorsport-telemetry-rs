@@ -489,17 +489,16 @@ pub trait SourceExt: TelemetrySource {
                 packed_coordinate(raw.0, 90.0, false).zip(packed_coordinate(raw.1, 180.0, true))
             {
                 candidates.push(packed);
-            } else {
-                let continuous = (raw.0 / 60.0, -raw.1 / 60.0);
-                if valid_gps(continuous) {
-                    candidates.push(continuous);
-                }
-                // Some conversion tools export VBOX columns as decimal degrees
-                // while retaining the native column names. Keep that as a
-                // conservative fallback only when packed coordinates are invalid.
-                if valid_gps(raw) {
-                    candidates.push(raw);
-                }
+            }
+            // Native VBOX stores continuous arc-minutes. A numerically valid
+            // DDMM candidate can be thousands of kilometres away; it must
+            // not prevent trying the declared angular-minute convention.
+            let continuous = (raw.0 / 60.0, -raw.1 / 60.0);
+            if valid_gps(continuous) {
+                candidates.push(continuous);
+            }
+            if valid_gps(raw) {
+                candidates.push(raw);
             }
         } else if let Some(converted) = coordinate(raw.0, &lat_unit)
             .zip(coordinate(raw.1, &lon_unit))

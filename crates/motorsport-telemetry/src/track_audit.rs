@@ -1,4 +1,5 @@
 //! Read-only physical and state audits, separate from reader normalization.
+use crate::SourceExt;
 use motorsport_telemetry_core::{
     names,
     track::{trusted_position, TrackGeometry, TrackPosition},
@@ -179,6 +180,13 @@ pub fn audit_track(
             }
         }
     }
+    // Facility lookup can use the existing unit-aware coordinate decoder
+    // even when a logger omits receiver quality. Those coordinates still
+    // cannot certify a crossing or pit location.
+    let coordinate_match = source
+        .match_track()
+        .filter(|m| m.matched.distance_m <= 10_000.0);
+    let mut unqualified_track = false;
     let track = if let Some(slug) = &options.track {
         Some(
             motorsport_track_atlas::find_track(slug)
@@ -192,6 +200,12 @@ pub fn audit_track(
             })
             .or_else(|| {
                 motorsport_track_atlas::find_track_for_venue(&metadata.source_identity.venue)
+            })
+            .or_else(|| {
+                coordinate_match.as_ref().map(|m| {
+                    unqualified_track = true;
+                    m.matched.track
+                })
             })
     };
     let layout = match (track, options.layout.as_deref()) {
@@ -231,6 +245,10 @@ pub fn audit_track(
             None,
             "No atlas track identified; supply --track.",
         );
+    }
+    if unqualified_track {
+        report.add("review", "track-from-unqualified-gps", None, None,
+            "Atlas facility matched using unit-decoded native coordinates without usable receiver quality; layout is a default and physical boundaries remain unverified.");
     }
     if fixes.is_empty() {
         report.add("review","missing-trusted-gps",None,None,"No native GPS with usable fix/accuracy status; physical track/pit boundaries cannot be certified.");
@@ -646,6 +664,7 @@ mod tests {
         tours.observe(3_000_000_000, position(0.8));
         assert_eq!(tours.completed, 0);
     }
+    #[derive(Clone)]
     struct Stored {
         channels: Vec<Channel>,
         laps: Vec<LapMetadata>,
@@ -941,5 +960,68 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.code == "ignored-counter-rearm"));
+    }
+    #[test]
+    fn coordinates_without_receiver_quality_identify_facility_but_do_not_certify_laps() {
+        struct Coordinates {
+            stored: Stored,
+            position: (f64, f64),
+        }
+        impl TelemetrySource for Coordinates {
+            fn path(&self) -> &'static str {
+                "unqualified-gps"
+            }
+            fn format(&self) -> &'static str {
+                "stored"
+            }
+            fn channels(&self) -> &[Channel] {
+                &self.stored.channels
+            }
+            fn decode(&self, channel: usize, _: usize, _: u64) -> f64 {
+                if channel == 0 {
+                    self.position.0
+                } else {
+                    self.position.1
+                }
+            }
+            fn source_lap_metadata(&self) -> Option<SourceLapMetadata> {
+                self.stored.source_lap_metadata()
+            }
+        }
+        let mut stored = stored_with_duration(Vec::new(), 100);
+        stored.channels[0].name = "GPS Latitude".into();
+        stored.channels[0].unit = "deg".into();
+        let mut longitude = stored.channels[0].clone();
+        longitude.id = 1;
+        longitude.name = "GPS Longitude".into();
+        stored.channels.push(longitude);
+        let report = audit_track(
+            &Coordinates {
+                stored: stored.clone(),
+                position: (34.1507, -83.8132),
+            },
+            &TrackAuditOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.track.as_deref(), Some("road-atlanta"));
+        for channel in &mut stored.channels {
+            channel.unit = "min".into();
+        }
+        let arc_minutes = audit_track(
+            &Coordinates {
+                stored,
+                position: (2643.231522, 4720.362240),
+            },
+            &TrackAuditOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(arc_minutes.track.as_deref(), Some("mosport"));
+        assert_eq!(arc_minutes.trusted_gps_samples, 0);
+
+        assert_eq!(report.trusted_gps_samples, 0);
+        assert_eq!(report.gps_checked_boundaries, 0);
+        for code in ["track-from-unqualified-gps", "missing-trusted-gps"] {
+            assert!(report.findings.iter().any(|f| f.code == code), "{report:?}");
+        }
     }
 }

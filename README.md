@@ -104,3 +104,12 @@ and moving GPS pit passes. These preserve evidence after successful normalizatio
 Stored annotations are compared against fresh native recovery when lap signals
 exist; disagreement requests review rather than overwriting authoritative laps.
 A parsed file with missing GPS or an unidentified track is not physically certified.
+
+For older loggers without receiver quality, unit-aware native coordinates may
+identify the atlas facility. This produces `track-from-unqualified-gps` review;
+these coordinates do not certify crossings, pit positions, or the chosen layout.
+Private Road Atlanta acceptance checks can be rerun with:
+
+```sh
+ROAD_ATLANTA_CORPUS=/path/to/weekend cargo test --release -p motorsport-telemetry --test road_atlanta_verify -- --ignored
+```
