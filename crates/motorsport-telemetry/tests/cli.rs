@@ -428,13 +428,24 @@ fn convert_defaults_to_zstd_mtj_and_verify_accepts_all_encodings() {
     let head = std::fs::read(&recording).unwrap();
     assert_eq!(&head[..4], &[0x28, 0xB5, 0x2F, 0xFD], "zstd magic");
 
-    let rejected = cli()
-        .args(["verify", input.to_str().unwrap()])
+    let native = cli()
+        .args([
+            "verify",
+            "--json",
+            "--track",
+            "road-atlanta",
+            input.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
-    assert!(!rejected.status.success());
-    let stderr = String::from_utf8(rejected.stderr).unwrap();
-    assert!(stderr.contains("FAIL"), "{stderr}");
+    assert!(native.status.success(), "{native:?}");
+    let report: serde_json::Value = serde_json::from_slice(&native.stdout).unwrap();
+    assert_eq!(report["track_audit"]["track"], "road-atlanta");
+    assert!(report["track_audit"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["code"] == "missing-trusted-gps"));
 }
 
 #[test]
@@ -600,6 +611,52 @@ fn verify_rejects_garbage() {
 }
 
 #[test]
+fn verify_streams_native_directory_results_and_continues_after_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        fixture("synthetic_cosworth.pds"),
+        dir.path().join("good.pds"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("bad.mp4"), b"invalid").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), b"ignored").unwrap();
+    let output = cli()
+        .args(["verify", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let lines = String::from_utf8(output.stdout).unwrap();
+    let reports: Vec<serde_json::Value> = lines
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(reports.len(), 2);
+    assert!(reports.iter().any(|r| r["error"].is_string()));
+    assert!(reports.iter().any(|r| r["track_audit"].is_object()));
+}
+
+#[test]
+fn verify_rejects_invalid_physical_limits_and_unknown_tracks() {
+    for argument in ["NaN", "-1", "0"] {
+        let output = cli()
+            .args(["verify", "--max-speed", argument])
+            .arg(fixture("synthetic_cosworth.pds"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+    let output = cli()
+        .args(["verify", "--track", "invented-track", "--json"])
+        .arg(fixture("synthetic_cosworth.pds"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let r: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(r["error"].as_str().unwrap().contains("unknown atlas track"));
+}
+
+#[test]
 fn inspect_folder_honors_mask() {
     let dir = tempfile::tempdir().unwrap();
     let nested = dir.path().join("weekend").join("car-1");
@@ -756,8 +813,8 @@ fn verify_help_describes_decode_fault_exit_behavior() {
     let text =
         String::from_utf8(cli().args(["verify", "--help"]).output().unwrap().stdout).unwrap();
     assert!(text.contains("decode fault"), "{text}");
-    assert!(text.contains("Plain warnings do not fail"), "{text}");
-    assert!(text.contains("Exit status is 1"), "{text}");
+    assert!(text.contains("Review findings"), "{text}");
+    assert!(text.contains("Exit 1"), "{text}");
 
     let inspect =
         String::from_utf8(cli().args(["inspect", "--help"]).output().unwrap().stdout).unwrap();

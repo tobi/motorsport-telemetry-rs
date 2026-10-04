@@ -60,6 +60,10 @@ for lap in recording.metadata().laps.iter().filter(|lap| lap.kind.is_flying()) {
 `TelemetrySource` exposes channels in their recorded units. The normalizer
 resolves common signals in fixed units and returns `None` for unknown values.
 Times are file-relative integer nanoseconds; laps are classified across stints.
+Counter resets enter pit or uncertain activity until a supported crossing
+restores track state; delayed re-arming and movement cannot create laps.
+Boundary evidence is available in metadata and MTJ headers. See the
+[TLA+ recovery model and reproducible TLC checks](specs/laps/README.md).
 Use `read_metadata` and `read_lap_metadata` for summaries, and `validate()` for
 reader diagnostics and plausibility checks. Current JSONL summaries read only
 the header and laps, without decoding channel values.
@@ -72,3 +76,31 @@ the header and laps, without decoding channel values.
 - [JSONL specification](crates/telemetry-format/JSONL.md) and [writer schema](telemetry.schema.json).
 - [Processing passes](crates/telemetry-passes): GPS quality, cleanup, and speed-derived distance.
 - [Shared primitives](crates/telemetry-core) and [offline track atlas](crates/motorsport-track-atlas).
+
+## Corpus verification
+
+`verify` audits native sources and converted recordings without writing them.
+Directories are scanned recursively, with one JSON result per file:
+
+```sh
+motorsport-telemetry verify --track road-atlanta --layout gp --min-lap 72 --max-lap 120 --json weekend/ > road-atlanta-audit.jsonl
+motorsport-telemetry verify --json /mnt/nas-home/Racing/collection/ > corpus-audit.jsonl
+```
+
+Omit the track for mixed venues; native GPS/venue supplies atlas matching.
+Without an explicit minimum the atlas length divided by `--max-speed` is a
+loose physical lower bound. `--max-lap` produces review findings, allowing FCY.
+`--corridor` controls centerline tolerance. Missing GPS, uncertain activity,
+missing counters/timers/motion, possible missed crossings, multiple circuit
+tours merged into an out fragment (including unrecorded pit passes), and GPS drift are
+reported explicitly. Impossible interval/state/physical-limit findings fail
+with exit 1; review findings do not. Parsed recordings are not certifications
+of physical accuracy. The stopped-on-track kind covers observed standstill
+on the circuit without inferring crash cause. Moving pit passes can be separated by a corroborated native GPS lane even when the dash counter and timer never reset; atlas-marker boundary times remain estimates. See [the model](specs/laps/README.md).
+
+The audit also reports informational recovery observations: transient timer or
+counter dropouts, ignored counter rearming and pit-lane beacons, motion departures,
+and moving GPS pit passes. These preserve evidence after successful normalization.
+Stored annotations are compared against fresh native recovery when lap signals
+exist; disagreement requests review rather than overwriting authoritative laps.
+A parsed file with missing GPS or an unidentified track is not physically certified.

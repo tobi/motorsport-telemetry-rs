@@ -31,7 +31,9 @@ use std::sync::OnceLock;
 use telemetry_format::{is_jsonl_path, JsonlRecording};
 use thiserror::Error;
 
+mod track_audit;
 mod track_metadata;
+pub use track_audit::{audit_track, TrackAuditOptions, TrackAuditReport, TrackFinding};
 pub use track_metadata::{OpenOptions, TrackMetadataError};
 
 pub use motorsport_telemetry_core;
@@ -215,6 +217,8 @@ fn is_telemetry(path: &Path) -> bool {
 /// Kind of file verified by [`verify`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyKind {
+    /// Native vendor recording.
+    Vendor,
     /// MTJ JSONL recording.
     Mtj,
     /// MTX JSONL sidecar.
@@ -226,6 +230,8 @@ pub enum VerifyKind {
 /// Returned by [`verify`]; the CLI formats it into its one-line report.
 #[derive(Debug)]
 pub struct VerifyReport {
+    /// Physical lap/state audit; absent for MTX annotation sidecars.
+    pub track_audit: Option<TrackAuditReport>,
     /// Container kind that was verified.
     pub kind: VerifyKind,
     /// JSONL document version.
@@ -251,6 +257,12 @@ pub struct VerifyReport {
 /// Errors returned by [`verify`].
 #[derive(Debug, Error)]
 pub enum VerifyError {
+    /// Native recording could not be opened.
+    #[error(transparent)]
+    Open(#[from] TelemetryError),
+    /// Invalid track audit parameters.
+    #[error("{0}")]
+    Parameters(String),
     /// The path is not a `.telemetry` or JSONL document.
     #[error("verify accepts .telemetry, .telemetry.jsonl, and .zstd (not vendor source files)")]
     Unsupported,
@@ -262,22 +274,51 @@ pub enum VerifyError {
     DecodeFault(Diagnostics),
 }
 
-/// Verifies an MTJ recording or MTX sidecar, compressed or plain.
+/// Verifies native recordings and MTJ/MTX documents, compressed or plain.
 ///
 /// Parses the document and runs reader diagnostics and format-neutral
 /// plausibility checks. A proven decode-layout fault returns
 /// [`VerifyError::DecodeFault`]; ordinary warnings remain in the report.
-/// Vendor source files are rejected with [`VerifyError::Unsupported`].
+/// Native recordings also receive the read-only atlas/state audit; MTX sidecars
+/// receive container checks. Missing evidence is reported explicitly.
 pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport, VerifyError> {
+    verify_with(path, &TrackAuditOptions::default())
+}
+
+/// Verifies native or converted recordings with explicit physical parameters.
+/// MTX annotation sidecars receive container checks only.
+pub fn verify_with(
+    path: impl AsRef<Path>,
+    options: &TrackAuditOptions,
+) -> Result<VerifyReport, VerifyError> {
     let path = path.as_ref();
     if is_jsonl_path(path) || is_telemetry(path) {
-        verify_jsonl(path)
+        verify_jsonl(path, options)
     } else {
-        Err(VerifyError::Unsupported)
+        let opened = open(path)?;
+        probe_samples(&*opened);
+        let diagnostics = combine_diagnostics(&*opened);
+        if implies_decode_fault(&diagnostics) {
+            return Err(VerifyError::DecodeFault(diagnostics));
+        }
+        let metadata = opened.metadata();
+        Ok(VerifyReport {
+            kind: VerifyKind::Vendor,
+            jsonl_version: 0,
+            compressed: false,
+            channels: opened.channels().len(),
+            laps: metadata.laps.len(),
+            spans: opened.spans().len(),
+            utc_start_ns: metadata.utc_start_ns,
+            quantum_ns: 0,
+            sidecar_groups: 0,
+            diagnostics,
+            track_audit: Some(audit_track(&*opened, options).map_err(VerifyError::Parameters)?),
+        })
     }
 }
 
-fn verify_jsonl(path: &Path) -> Result<VerifyReport, VerifyError> {
+fn verify_jsonl(path: &Path, options: &TrackAuditOptions) -> Result<VerifyReport, VerifyError> {
     let opened = JsonlRecording::open(path)?;
     probe_samples(&opened);
     // JSONL is text: a sample is many bytes of text, not `byte_width`, so the
@@ -289,6 +330,11 @@ fn verify_jsonl(path: &Path) -> Result<VerifyReport, VerifyError> {
     }
     let extension = opened.is_extension();
     Ok(VerifyReport {
+        track_audit: if extension {
+            None
+        } else {
+            Some(audit_track(&opened, options).map_err(VerifyError::Parameters)?)
+        },
         kind: if extension {
             VerifyKind::Mtx
         } else {

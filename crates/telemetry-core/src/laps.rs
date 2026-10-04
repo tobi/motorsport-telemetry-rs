@@ -29,6 +29,47 @@ use crate::metadata::{
 use crate::motion::{longest_stop_interval, longest_stop_ns, stationary_lead_in};
 use crate::{convert, names, TelemetrySource};
 
+/// Native evidence that changed the interpretation of a dash event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LapRecoveryObservation {
+    /// Stable identifier for corpus aggregation.
+    pub code: &'static str,
+    /// File-relative time of the observed source event.
+    pub time_ns: u64,
+}
+
+fn observe(observations: &mut Vec<LapRecoveryObservation>, code: &'static str, time_ns: u64) {
+    observations.push(LapRecoveryObservation { code, time_ns });
+}
+
+/// Recompute laps from native channels, ignoring persisted lap annotations.
+/// Also expose recovered source anomalies without treating the corrected laps
+/// as errors. This is a full signal audit, never a metadata/header read.
+pub fn inspect_lap_recovery(
+    source: &dyn TelemetrySource,
+) -> (Vec<LapMetadata>, Vec<LapRecoveryObservation>) {
+    let duration = source
+        .channels()
+        .iter()
+        .map(|c| c.duration_ns)
+        .max()
+        .unwrap_or(0);
+    let (index, mut counter, crossings) = select_lap_counter(source, duration);
+    let mut observations = Vec::new();
+    if let Some(index) = index {
+        (counter, _) = increasing_counter_laps(source, index, duration, &mut observations);
+    }
+    let timer = timer_reset_laps_observed(source, duration, index, &mut observations);
+    let window = snap_window_ns(
+        channel_period_ns(source, index),
+        channel_period_ns(source, timer_channel(source)),
+    );
+    let mut laps = pick_laps(None, counter, crossings, timer, window);
+    validate_crossings(source, &mut laps);
+    classify_laps(source, &mut laps);
+    (laps, observations)
+}
+
 /// A counter drop that has not recovered this long after it happened is a
 /// stint reset, not a transient glitch.
 pub(crate) const RESET_CONFIRM_NS: u64 = 5_000_000_000;
@@ -161,7 +202,8 @@ fn select_lap_counter(
         else {
             continue;
         };
-        let (laps, crossings) = increasing_counter_laps(source, index, duration_ns);
+        let (laps, crossings) =
+            increasing_counter_laps(source, index, duration_ns, &mut Vec::new());
         if laps.is_empty() {
             continue;
         }
@@ -210,6 +252,7 @@ fn increasing_counter_laps(
     source: &dyn TelemetrySource,
     channel_index: usize,
     duration_ns: u64,
+    observations: &mut Vec<LapRecoveryObservation>,
 ) -> (Vec<LapMetadata>, usize) {
     let channel = &source.channels()[channel_index];
     let completed_count = is_completed_lap_counter(channel);
@@ -376,6 +419,7 @@ fn increasing_counter_laps(
                     })
                     .any(|&(_, later)| later >= before);
             if recovers {
+                observe(observations, "recovered-counter-dropout", time_ns);
                 continue;
             }
             let was_active = matches!(phase, Phase::Initial | Phase::OnTrack | Phase::Out);
@@ -401,6 +445,7 @@ fn increasing_counter_laps(
                         .last()
                         .is_some_and(|lap: &LapMetadata| lap.end_ns == open.start_ns);
                 if let Some(in_lap) = laps.last_mut().filter(|_| pit_event) {
+                    observe(observations, "recovered-pit-close-beacon", open.start_ns);
                     in_lap.end_ns = time_ns;
                     in_lap.duration_ns = time_ns - in_lap.start_ns;
                     in_lap.complete = false;
@@ -472,6 +517,7 @@ fn increasing_counter_laps(
                                 })))
                 }));
         if !completed_count && before == 0 && counter == 1 && !first_crossing {
+            observe(observations, "ignored-counter-rearm", time_ns);
             phase.apply(Event::Rearm);
             if let Some(open) = &mut current {
                 open.stint_lap = stint_lap;
@@ -480,10 +526,14 @@ fn increasing_counter_laps(
             continue;
         }
         if gps_crossing == Some(false) && evidence.slow_before(time_ns) {
+            observe(observations, "ignored-pit-lane-beacon", time_ns);
             // The parallel pit lane can trip the dash beacon. It does not
             // close a track lap or create a new track anchor.
             high_water = Some(counter);
             continue;
+        }
+        if !completed_count && before == 0 && counter == 1 && first_crossing {
+            observe(observations, "recovered-first-crossing", time_ns);
         }
         // Only independently corroborated departure can leave pit activity.
         // Close the pit interval at the observed end of standstill, before
@@ -576,6 +626,15 @@ pub(crate) fn timer_reset_laps(
     duration_ns: u64,
     lap_channel_index: Option<usize>,
 ) -> Vec<LapMetadata> {
+    timer_reset_laps_observed(source, duration_ns, lap_channel_index, &mut Vec::new())
+}
+
+fn timer_reset_laps_observed(
+    source: &dyn TelemetrySource,
+    duration_ns: u64,
+    lap_channel_index: Option<usize>,
+    observations: &mut Vec<LapRecoveryObservation>,
+) -> Vec<LapMetadata> {
     let timer_resets = timer_channel(source)
         .map(|index| {
             let values = samples(source, index);
@@ -650,6 +709,7 @@ pub(crate) fn timer_reset_laps(
                                 && ((later - before) * seconds_per_unit - elapsed_s).abs() <= 2.0
                         });
                     if recovers {
+                        observe(observations, "recovered-timer-dropout", pair[1].0);
                         return None;
                     }
                     Some(pair[1].0.saturating_sub(elapsed_ns))

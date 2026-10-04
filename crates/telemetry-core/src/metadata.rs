@@ -1444,6 +1444,11 @@ mod tests {
                 }
                 let metadata = read_source_metadata(&source);
                 assert_eq!(metadata.valid_laps, 0, "{unit}, {dropout_samples}");
+                let (_, observations) = crate::inspect_lap_recovery(&source);
+                assert!(observations
+                    .iter()
+                    .any(|o| o.code == "recovered-timer-dropout"));
+
                 assert!(metadata.fastest_lap.is_none());
                 assert_eq!(metadata.laps.len(), 2);
                 assert!(metadata.laps.iter().all(|lap| !lap.kind.is_flying()));
@@ -1558,6 +1563,10 @@ mod tests {
             );
             let metadata = read_source_metadata(&source);
             assert_eq!(metadata.laps.len(), 3, "delay {delay}: {:?}", metadata.laps);
+            let (_, observations) = crate::inspect_lap_recovery(&source);
+            assert!(observations
+                .iter()
+                .any(|o| o.code == "ignored-counter-rearm"));
             let pit = metadata.laps.last().unwrap();
             assert_eq!(pit.kind, LapKind::Pit);
             assert_eq!(
@@ -1595,6 +1604,10 @@ mod tests {
                 ("Ref_Lap_Time", "s", vec![80.0; 300]),
             ],
         );
+        let (_, observations) = crate::inspect_lap_recovery(&source);
+        assert!(observations
+            .iter()
+            .any(|o| o.code == "recovered-first-crossing"));
         let m = read_source_metadata(&source);
         assert_eq!(
             m.laps.iter().map(|l| l.kind).collect::<Vec<_>>(),

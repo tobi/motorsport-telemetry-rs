@@ -10,8 +10,8 @@ use motorsport_telemetry::motorsport_telemetry_core::{
     names, Diagnostic, Diagnostics, FileMetadata, Severity, SourceIdentity, TelemetrySource,
 };
 use motorsport_telemetry::{
-    open_metadata_with_options, open_with_options, verify, OpenOptions, SourceExt, TelemetryError,
-    TelemetryFile, VerifyError, VerifyKind, VerifyReport,
+    open_metadata_with_options, open_with_options, verify_with, OpenOptions, SourceExt,
+    TelemetryError, TelemetryFile, TrackAuditOptions, VerifyError, VerifyKind, VerifyReport,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -136,31 +136,30 @@ Examples:
 ";
 
 const VERIFY_HELP: &str = "\
-Usage: motorsport-telemetry verify <file>...
+Usage: motorsport-telemetry verify [options] <file-or-directory>...
 
-Check that each file is a valid MTJ recording or MTX sidecar (plain
-or zstd-compressed JSONL). Decodes one sample from every channel.
+Read-only audit of native MP4/PDS/LD/VBO recordings and each MTJ recording or MTX sidecar (plain or zstd-compressed JSONL).
+Directories are scanned recursively; symlink directories are not followed.
 
-After the format check, reader diagnostics and plausibility findings are
-printed for every file. A file whose channels claim more sample bytes than
-the file holds, or whose decoded values are absurdly large, is a decode
-fault (the bytes were read at the wrong width) and fails even though it
-opened. Plain warnings do not fail the command.
+  --track <slug>       Atlas track, e.g. road-atlanta (otherwise GPS/venue)
+  --layout <id>        Atlas layout, e.g. gp (otherwise the first layout)
+  --min-lap <seconds>  Minimum plausible flying lap; default length/max-speed
+  --max-lap <seconds>  Slow-lap review threshold; FCY does not fail this check
+  --max-speed <m/s>    Physical speed ceiling (default 120)
+  --corridor <metres>  Centerline tolerance (default 30)
+  --json              Stream one JSON object per file, including failures
 
-Accepted names:
-  .telemetry
-  .telemetry.jsonl  .jsonl  .mtj
-  .telemetry.ext.jsonl
-  those names with .zstd / .zst
+Checks lap states, crossing evidence, numbering, timing, missing signals,
+GPS circuit traversal, position jumps, stopped-on-track versus pit labels,
+and fastest/valid-lap consistency. Missing GPS remains an explicit finding;
+a parsed file is not a certification of physical accuracy. Pit entry/exit
+landmarks do not define a surveyed pit polygon. MTX receives container checks.
 
-A compressed frame still verifies under a .telemetry.jsonl name (zstd
-magic is sniffed). Vendor files (.pds .ld .mp4 .vbo) are rejected.
+Exit 1: parse/decode fault or an impossible state/physical-limit violation.
+Review findings (including slow/FCY laps) do not fail. Exit 2: usage error.
 
-Exit status is 1 if any file fails or is a decode fault, 2 on usage errors.
-
-Examples:
-  motorsport-telemetry verify run.telemetry
-  motorsport-telemetry verify run.telemetry.jsonl run.telemetry.jsonl.zstd
+Example:
+  motorsport-telemetry verify --track road-atlanta --min-lap 72 --max-lap 120 --json weekend/
 ";
 
 const SUSPICIOUS_CLOCK_AGE_DAYS: i64 = 365 * 2;
@@ -256,13 +255,65 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Ok(Command::Verify { paths }) => {
-            let mut failed = 0usize;
+        Ok(Command::Verify {
+            paths,
+            options,
+            json,
+        }) => {
+            let mut audit_options = TrackAuditOptions::default();
+            for (key, value) in &options {
+                match key.as_str() {
+                    "--track" => audit_options.track = Some(value.clone()),
+                    "--layout" => audit_options.layout = Some(value.clone()),
+                    "--min-lap" => audit_options.min_lap_s = value.parse().ok(),
+                    "--max-lap" => audit_options.max_lap_s = value.parse().ok(),
+                    "--max-speed" => audit_options.max_speed_mps = value.parse().unwrap_or(120.0),
+                    "--corridor" => audit_options.corridor_m = value.parse().unwrap_or(30.0),
+                    _ => {}
+                }
+            }
+            let mut targets = BTreeSet::new();
             for path in &paths {
-                match verify(path) {
-                    Ok(report) => println!("{}", format_verify_report(path, &report)),
+                match collect_inspect_targets(path, &[]) {
+                    Ok(files) => targets.extend(files),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if targets.is_empty() {
+                eprintln!("no telemetry files to verify");
+                std::process::exit(1);
+            }
+            let mut failed = 0usize;
+            for path in &targets {
+                match verify_with(path, &audit_options) {
+                    Ok(report) => {
+                        if report
+                            .track_audit
+                            .as_ref()
+                            .is_some_and(motorsport_telemetry::TrackAuditReport::has_errors)
+                        {
+                            failed += 1;
+                        }
+                        if json {
+                            println!(
+                                "{}",
+                                json!({"path":path,"status":if report.track_audit.as_ref().is_some_and(motorsport_telemetry::TrackAuditReport::has_errors) {"fail"} else {"parsed"},"track_audit":report.track_audit,"diagnostics":report.diagnostics.items().iter().map(|d|json!({"code":d.code,"message":d.message})).collect::<Vec<_>>() })
+                            );
+                        } else {
+                            println!("{}", format_verify_report(path, &report));
+                        }
+                    }
                     Err(VerifyError::DecodeFault(diagnostics)) => {
                         failed += 1;
+                        if json {
+                            println!(
+                                "{}",
+                                json!({"path":path,"status":"fail","error":decode_fault_message(&diagnostics)})
+                            );
+                        }
                         eprintln!(
                             "{}: FAIL  {}",
                             path.display(),
@@ -271,6 +322,12 @@ fn main() {
                     }
                     Err(error) => {
                         failed += 1;
+                        if json {
+                            println!(
+                                "{}",
+                                json!({"path":path,"status":"fail","error":error.to_string()})
+                            );
+                        }
                         eprintln!("{}: FAIL  {error}", path.display());
                     }
                 }
@@ -327,6 +384,8 @@ enum Command {
     },
     Verify {
         paths: Vec<PathBuf>,
+        options: Vec<(String, String)>,
+        json: bool,
     },
 }
 
@@ -512,21 +571,59 @@ fn parse_open_option(
 
 fn parse_verify(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut paths = Vec::new();
-    for argument in args {
+    let mut options = Vec::new();
+    let mut json = false;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
         if argument == "-h" || argument == "--help" {
             return Ok(Command::Help {
                 topic: HelpTopic::Verify,
             });
         }
-        if argument.to_string_lossy().starts_with('-') {
-            return Err(format!("unknown option {}", argument.to_string_lossy()));
+        if argument == "--json" {
+            json = true;
+            continue;
+        }
+        let text = argument.to_string_lossy();
+        if [
+            "--track",
+            "--layout",
+            "--min-lap",
+            "--max-lap",
+            "--max-speed",
+            "--corridor",
+        ]
+        .contains(&text.as_ref())
+        {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("{text} needs a value"))?
+                .to_string_lossy()
+                .into_owned();
+            if text != "--track" && text != "--layout" {
+                let number = value
+                    .parse::<f64>()
+                    .map_err(|_| format!("{text} requires seconds, m/s, or metres"))?;
+                if !number.is_finite() || number <= 0.0 {
+                    return Err(format!("{text} must be finite and positive"));
+                }
+            }
+            options.push((text.into_owned(), value));
+            continue;
+        }
+        if text.starts_with('-') {
+            return Err(format!("unknown option {text}"));
         }
         paths.push(PathBuf::from(argument));
     }
     if paths.is_empty() {
-        return Err("verify is missing a telemetry file".into());
+        return Err("verify is missing a telemetry file or directory".into());
     }
-    Ok(Command::Verify { paths })
+    Ok(Command::Verify {
+        paths,
+        options,
+        json,
+    })
 }
 
 fn run_inspect(
@@ -643,7 +740,7 @@ fn walk_inspect(
     for entry in entries {
         let path = entry.path();
         let name = entry.file_name();
-        if name == ".git" {
+        if name == ".git" || name == "@eaDir" {
             continue;
         }
         let metadata = match entry.file_type() {
@@ -858,6 +955,7 @@ fn format_verify_report(path: &Path, report: &VerifyReport) -> String {
         .utc_start_ns
         .map_or_else(|| "none".into(), |utc| utc.to_string());
     let kind = match report.kind {
+        VerifyKind::Vendor => "vendor",
         VerifyKind::Mtj => "mtj",
         VerifyKind::Mtx => "mtx",
     };
@@ -867,8 +965,17 @@ fn format_verify_report(path: &Path, report: &VerifyReport) -> String {
         format!("  laps={}", report.laps)
     };
     let mut out = format!(
-        "{}: ok  {kind}:{}{}  channels={} spans={} utc={} q={}{}",
+        "{}: {}  {kind}:{}{}  channels={} spans={} utc={} q={}{}",
         path.display(),
+        if report
+            .track_audit
+            .as_ref()
+            .is_some_and(motorsport_telemetry::TrackAuditReport::has_errors)
+        {
+            "FAIL"
+        } else {
+            "ok"
+        },
         report.jsonl_version,
         if report.compressed { "  zstd" } else { "" },
         report.channels,
@@ -878,6 +985,24 @@ fn format_verify_report(path: &Path, report: &VerifyReport) -> String {
         extra
     );
     out.push_str(&format_diagnostics_block(report.diagnostics.items()));
+    if let Some(audit) = &report.track_audit {
+        let _ = write!(
+            out,
+            "\n  track={} layout={} GPS={}/{} checked-boundaries={}",
+            audit.track.as_deref().unwrap_or("unknown"),
+            audit.layout.as_deref().unwrap_or("unknown"),
+            audit.trusted_gps_samples,
+            audit.gps_samples,
+            audit.gps_checked_boundaries
+        );
+        for finding in &audit.findings {
+            let _ = write!(
+                out,
+                "\n  {} {} lap={:?}: {}",
+                finding.severity, finding.code, finding.lap, finding.message
+            );
+        }
+    }
     out
 }
 
@@ -1750,6 +1875,8 @@ mod tests {
                     PathBuf::from("a.telemetry"),
                     PathBuf::from("b.telemetry.jsonl"),
                 ],
+                options: vec![],
+                json: false,
             })
         );
         assert!(arguments(Vec::<OsString>::new()).is_err());
