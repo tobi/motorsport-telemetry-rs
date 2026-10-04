@@ -690,6 +690,16 @@ fn parse_laps(value: &Value, quantum_ns: u64) -> Result<Vec<LapMetadata>, Teleme
             stint,
             stint_lap,
             kind,
+            start_boundary: fields
+                .get(8)
+                .and_then(Value::as_str)
+                .map(motorsport_telemetry_core::LapBoundary::parse)
+                .unwrap_or_default(),
+            end_boundary: fields
+                .get(9)
+                .and_then(Value::as_str)
+                .map(motorsport_telemetry_core::LapBoundary::parse)
+                .unwrap_or_default(),
         });
     }
     Ok(laps)

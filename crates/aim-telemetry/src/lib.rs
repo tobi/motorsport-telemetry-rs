@@ -1029,7 +1029,6 @@ fn ingest_packet(
     context: &mut IngestContext<'_>,
     has_gps: bool,
     gps_samples: &mut Vec<SampleRef>,
-    lap_channels: Option<&[bool]>,
 ) -> Result<(), AimError> {
     let IngestContext {
         display,
@@ -1067,12 +1066,6 @@ fn ingest_packet(
             at = start + 2;
             continue;
         };
-        if let Some(lap) = lap_channels {
-            if !lap[index] {
-                at = start + 2;
-                continue;
-            }
-        }
         let width = aim_channels[index].width;
         let value = start + 8;
         if packet.get(value + width) != Some(&b')') {
@@ -1087,9 +1080,7 @@ fn ingest_packet(
         at = value + width + 1;
     }
 
-    // GPS records are only processed during full ingestion passes (no
-    // lap-metadata filter). Lap-metadata passes skip GPS entirely.
-    if lap_channels.is_none() {
+    {
         let mut gps_at = 10usize;
         while let Some(header) = gps_record_start(packet, gps_at) {
             let size = le32(packet, header + 6).unwrap_or(0) as usize;
@@ -1136,6 +1127,18 @@ fn is_lap_metadata_channel(name: &str) -> bool {
             | "previouslt"
             | "previouslaptime"
             | "lastlaptime"
+            | "groundspeed"
+            | "speedref"
+            | "corrspeed"
+            | "vehiclespeed"
+            | "vehrefspeed"
+            | "wheelspeed"
+            | "speedwspdapp"
+            | "vcar"
+            | "speed"
+            | "gpsspeed"
+            | "velocitykmh"
+            | "driverid"
     )
 }
 
@@ -1144,9 +1147,9 @@ fn index_packet_indexes(available_samples: usize) -> Vec<usize> {
     (0..selected_count)
         .map(|slot| {
             if selected_count <= 1 {
-                1
+                0
             } else {
-                1 + (available_samples - 1) * slot / (selected_count - 1)
+                (available_samples - 1) * slot / (selected_count - 1)
             }
         })
         .collect()
@@ -1168,11 +1171,11 @@ impl AimFile {
     #[cfg(not(target_os = "emscripten"))]
     /// Opens a bounded, index-only view of an `AiM` MP4.
     ///
-    /// This reads the channel schema, all samples belonging to lap counters or
-    /// timers, and at most 19 evenly distributed packets for other channel
-    /// previews and GPS. It is intended for fast library indexes and returns
-    /// complete format-neutral lap metadata without materializing bulk signal
-    /// samples or video frame indexes. Use [`Self::open`] for analysis data.
+    /// All records are structurally walked to recover native timing. Lap,
+    /// motion and GPS evidence remains complete; unrelated channels retain
+    /// at most 19 representative samples. Video frame indexing is omitted.
+    /// The scan temporarily holds native sample references, never decoded
+    /// bulk signal values. Use [`Self::open`] for analysis data.
     pub fn open_index(path: impl AsRef<Path>) -> Result<Self, AimError> {
         let path_ref = path.as_ref();
         let display = path_ref.to_string_lossy().into_owned();
@@ -1189,7 +1192,7 @@ impl AimFile {
 
     /// Parses a bounded metadata view from an owned MP4 byte buffer.
     ///
-    /// Lap counters and timers remain complete; unrelated channels retain only
+    /// Lap, motion and GPS signals remain complete; unrelated channels retain only
     /// representative samples and video frame indexing is omitted.
     pub fn from_bytes_index(path: impl Into<String>, data: Vec<u8>) -> Result<Self, AimError> {
         Self::parse(path.into(), Storage::from_vec(data), ParseMode::Index)
@@ -1216,30 +1219,20 @@ impl AimFile {
         let definitions = schema(first_bytes, &display, &mut diagnostics)?;
         let (mut channels, mut aim_channels): (Vec<_>, Vec<_>) = definitions.into_iter().unzip();
         let available_samples = track.samples.len().saturating_sub(1);
-        let preview_capacity = available_samples.min(INDEX_PACKET_SAMPLES);
-        for (channel, raw) in channels.iter().zip(&mut aim_channels) {
-            raw.samples.reserve(match mode {
-                ParseMode::Full => available_samples,
-                ParseMode::Index if is_lap_metadata_channel(&channel.name) => available_samples,
-                ParseMode::Index => preview_capacity,
-            });
+        // Both modes walk the same validated records. Native timestamps must
+        // determine duration before any unrelated channel is subsampled.
+        for raw in &mut aim_channels {
+            raw.samples.reserve(available_samples);
         }
         // Record IDs are protocol u16 values and occur in every scalar sample.
         // Most loggers assign a compact range, so use a range-relative table
         // instead of zeroing all 65,536 possible entries. Unusually sparse
         // schemas use a sorted compact table.
         let by_record = RecordDispatch::new(&aim_channels);
-        let lap_channels = channels
-            .iter()
-            .map(|channel| is_lap_metadata_channel(&channel.name))
-            .collect::<Vec<_>>();
         let has_gps = aim_channels
             .iter()
             .any(|channel| channel.representation.is_gps());
-        let mut gps_samples = Vec::with_capacity(match mode {
-            ParseMode::Full => available_samples,
-            ParseMode::Index => preview_capacity,
-        });
+        let mut gps_samples = Vec::with_capacity(available_samples);
         let mut stats = IngestStats::default();
         {
             let mut ingest = IngestContext {
@@ -1248,47 +1241,8 @@ impl AimFile {
                 aim_channels: &mut aim_channels,
                 stats: &mut stats,
             };
-            match mode {
-                ParseMode::Full => {
-                    for &(offset, size) in track.samples.iter().skip(1) {
-                        ingest_packet(
-                            &data,
-                            (offset, size),
-                            &mut ingest,
-                            has_gps,
-                            &mut gps_samples,
-                            None,
-                        )?;
-                    }
-                }
-                ParseMode::Index => {
-                    let selected = index_packet_indexes(available_samples);
-                    for &sample_index in &selected {
-                        let (offset, size) = track.samples[sample_index];
-                        ingest_packet(
-                            &data,
-                            (offset, size),
-                            &mut ingest,
-                            has_gps,
-                            &mut gps_samples,
-                            None,
-                        )?;
-                    }
-                    for (sample_index, &(offset, size)) in track.samples.iter().enumerate().skip(1)
-                    {
-                        if selected.binary_search(&sample_index).is_ok() {
-                            continue;
-                        }
-                        ingest_packet(
-                            &data,
-                            (offset, size),
-                            &mut ingest,
-                            has_gps,
-                            &mut gps_samples,
-                            Some(&lap_channels),
-                        )?;
-                    }
-                }
+            for &sample in track.samples.iter().skip(1) {
+                ingest_packet(&data, sample, &mut ingest, has_gps, &mut gps_samples)?;
             }
         }
         if stats.unknown_record_id > 0 {
@@ -1356,7 +1310,7 @@ impl AimFile {
         normalize_samples(&mut gps_samples, origin);
         let gps_times = gps_samples.iter().map(|sample| sample.time_ns).collect();
         let gps_chunks = period_chunks(&gps_samples);
-        for (channel, raw) in channels.iter_mut().zip(&aim_channels) {
+        for (channel, raw) in channels.iter_mut().zip(&mut aim_channels) {
             let samples = if raw.representation.is_gps() {
                 &gps_samples
             } else {
@@ -1371,6 +1325,22 @@ impl AimFile {
             channel.duration_ns = samples.last().map_or(0, |sample| {
                 sample.time_ns + channel.first_period_ns().unwrap_or(1)
             });
+        }
+        if matches!(mode, ParseMode::Index) {
+            for (channel, raw) in channels.iter_mut().zip(&mut aim_channels) {
+                if raw.representation.is_gps() || is_lap_metadata_channel(&channel.name) {
+                    continue;
+                }
+                let selected = index_packet_indexes(raw.samples.len());
+                raw.samples = selected
+                    .into_iter()
+                    .map(|index| raw.samples[index])
+                    .collect();
+                raw.times = raw.samples.iter().map(|sample| sample.time_ns).collect();
+                channel.sample_count = raw.samples.len() as u64;
+                channel.chunks = period_chunks(&raw.samples);
+                // Keep the duration computed from the complete native timeline.
+            }
         }
         let videos = Path::new(&display)
             .file_name()
@@ -2229,6 +2199,7 @@ mod tests {
         let indexed_metadata = indexed.metadata();
         assert_eq!(indexed_metadata.laps, full_metadata.laps);
         assert_eq!(indexed_metadata.fastest_lap, full_metadata.fastest_lap);
+        assert_eq!(indexed_metadata.duration_ns, full_metadata.duration_ns);
         assert_eq!(indexed_metadata.laps.len(), 3);
         let lap_channel = indexed
             .channels()
@@ -2245,6 +2216,34 @@ mod tests {
                 .sample_count
                 <= INDEX_PACKET_SAMPLES as u64
         );
+    }
+
+    #[test]
+    fn index_previews_do_not_inflate_duration_or_parse_markers_inside_values() {
+        let bytes = multilap_fixture_mp4(60);
+        let source = AimFile::from_bytes("native.mp4", bytes.clone()).unwrap();
+        let track = aimd_track(&bytes, "native.mp4").unwrap();
+        let mut changed = bytes;
+        for (index, &(offset, _)) in track.samples.iter().skip(1).enumerate() {
+            // RPM is an unrelated preview channel. Give every record a real
+            // native timestamp and put a protocol marker inside its value.
+            let start = offset as usize + 10;
+            changed[start + 2..start + 6]
+                .copy_from_slice(&((index as u32 + 1) * 100).to_le_bytes());
+            changed[start + 8..start + 12].copy_from_slice(b"(Sxx");
+        }
+        let full = AimFile::from_bytes("native.mp4", changed.clone()).unwrap();
+        let index = AimFile::from_bytes_index("native.mp4", changed).unwrap();
+        assert_eq!(index.metadata().duration_ns, full.metadata().duration_ns);
+        assert_eq!(index.metadata().laps, full.metadata().laps);
+        let rpm = names::find(source.channels(), &["rpm"]).unwrap();
+        assert_eq!(full.channels()[rpm].sample_count, 60);
+        assert_eq!(index.channels()[rpm].sample_count, 19);
+        assert_eq!(
+            index.channels()[rpm].duration_ns,
+            full.channels()[rpm].duration_ns
+        );
+        assert!(index.diagnostics.is_empty(), "{:?}", index.diagnostics);
     }
 
     #[test]

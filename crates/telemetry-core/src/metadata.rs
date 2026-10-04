@@ -52,9 +52,18 @@ pub enum LapKind {
     In,
     /// A stint with no beacon at all: one fragment from start to stop.
     OutIn,
-    /// Beacon to beacon, but the car stood still for a pit-stop's worth of
-    /// time inside it: an in-lap and out-lap the counter did not separate.
+    /// Pit activity established by a counter reset with independent zero
+    /// car speed, or independently supplied pit identity. Standstill alone
+    /// never identifies pit activity.
+    /// May include movement until the next supported crossing confirms a
+    /// return to the circuit; it does not mean stationary box time alone.
     Pit,
+    /// Activity after a counter reset without corroborating pit evidence.
+    /// A further supported crossing is needed before flying laps can resume.
+    Uncertain,
+    /// Sustained standstill located on the circuit by valid native GPS.
+    /// Does not imply a crash cause and cannot be counted as a flying lap.
+    Stopped,
 }
 
 impl LapKind {
@@ -67,6 +76,8 @@ impl LapKind {
             Self::In => "in",
             Self::OutIn => "out-in",
             Self::Pit => "pit",
+            Self::Uncertain => "uncertain",
+            Self::Stopped => "stopped",
         }
     }
 
@@ -78,6 +89,8 @@ impl LapKind {
             "in" => Self::In,
             "out-in" => Self::OutIn,
             "pit" => Self::Pit,
+            "uncertain" => Self::Uncertain,
+            "stopped" => Self::Stopped,
             _ => Self::Unknown,
         }
     }
@@ -85,6 +98,71 @@ impl LapKind {
     /// True for a complete beacon-to-beacon lap without a stop.
     pub fn is_flying(self) -> bool {
         self == Self::Flying
+    }
+}
+
+/// Signal supporting an interval boundary. This records evidence, not a
+/// claim that every timer reset or counter change is a physical beacon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LapBoundary {
+    /// Older metadata or a vendor-supplied interval without signal detail.
+    #[default]
+    Unspecified,
+    /// Start or end of the recording, rather than a crossing.
+    RecordingEdge,
+    /// Confirmed increment of the selected lap counter.
+    CounterCrossing,
+    /// Confirmed running-timer reset, possibly refining a counter crossing.
+    TimerCrossing,
+    /// Candidate crossing contradicted by the recording's reference-lap
+    /// lower bound. Cannot anchor a flying lap.
+    RejectedCrossing,
+    /// Sustained drop of the lap counter; closes the active stint.
+    CounterReset,
+    /// Boundary of an observed stationary interval.
+    Stationary,
+    /// End of standstill, corroborated by sustained subsequent circuit-speed
+    /// motion. Backdated evidence, not a GPS pit-exit gate timestamp.
+    MotionDeparture,
+    /// Separate pit-lane traversal corroborated by native GPS. Timestamp
+    /// estimated at the atlas pit-entry marker, not a surveyed lane gate.
+    GpsPitEntry,
+    /// GPS return to the circuit beyond the atlas pit-exit marker.
+    /// Does not establish a start/finish anchor.
+    GpsPitExit,
+}
+
+impl LapBoundary {
+    /// Stable token persisted in MTJ lap tuples.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::RecordingEdge => "recording-edge",
+            Self::CounterCrossing => "counter-crossing",
+            Self::TimerCrossing => "timer-crossing",
+            Self::RejectedCrossing => "rejected-crossing",
+            Self::CounterReset => "counter-reset",
+            Self::Stationary => "stationary",
+            Self::MotionDeparture => "motion-departure",
+            Self::GpsPitEntry => "gps-pit-entry",
+            Self::GpsPitExit => "gps-pit-exit",
+        }
+    }
+
+    /// Parses a persisted token; unknown tokens retain unspecified evidence.
+    pub fn parse(token: &str) -> Self {
+        match token {
+            "recording-edge" => Self::RecordingEdge,
+            "counter-crossing" => Self::CounterCrossing,
+            "timer-crossing" => Self::TimerCrossing,
+            "rejected-crossing" => Self::RejectedCrossing,
+            "counter-reset" => Self::CounterReset,
+            "stationary" => Self::Stationary,
+            "motion-departure" => Self::MotionDeparture,
+            "gps-pit-entry" => Self::GpsPitEntry,
+            "gps-pit-exit" => Self::GpsPitExit,
+            _ => Self::Unspecified,
+        }
     }
 }
 
@@ -107,7 +185,8 @@ pub struct LapMetadata {
     pub end_ns: u64,
     /// Lap duration in nanoseconds.
     pub duration_ns: u64,
-    /// Whether both lap boundaries are known to fall within the recording.
+    /// Whether both lap crossings fall within the recording. Reset-bounded
+    /// pit/uncertain activity is incomplete even when both endpoints exist.
     pub complete: bool,
     /// Presentation-order video frame at [`Self::start_ns`], when known.
     pub first_video_frame: Option<u64>,
@@ -119,6 +198,10 @@ pub struct LapMetadata {
     pub stint_lap: i64,
     /// Normalised role of this interval.
     pub kind: LapKind,
+    /// Evidence supporting the start of this interval.
+    pub start_boundary: LapBoundary,
+    /// Evidence supporting the end of this interval.
+    pub end_boundary: LapBoundary,
 }
 
 impl LapMetadata {
@@ -135,6 +218,8 @@ impl LapMetadata {
             stint: 0,
             stint_lap: number,
             kind: LapKind::Unknown,
+            start_boundary: LapBoundary::Unspecified,
+            end_boundary: LapBoundary::Unspecified,
         }
     }
 
@@ -150,6 +235,8 @@ impl LapMetadata {
             LapKind::In => format!("S{stint} in"),
             LapKind::OutIn => format!("S{stint} out-in"),
             LapKind::Pit => format!("S{stint} pit L{}", self.stint_lap),
+            LapKind::Uncertain => format!("S{stint} uncertain"),
+            LapKind::Stopped => format!("S{stint} stopped on track"),
         }
     }
 }
@@ -656,6 +743,9 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         timer_laps,
         snap_window_ns,
     );
+    if authoritative.is_none() {
+        laps::validate_crossings(source, &mut laps);
+    }
     laps::classify_laps(source, &mut laps);
     let mut fastest_lap = laps::fastest_lap(source, &laps, authoritative.as_ref());
 
@@ -830,6 +920,8 @@ pub fn group_sessions(files: &[FileMetadata], max_gap_ns: u64) -> Vec<SessionMet
                             stint: lap.stint,
                             stint_lap: lap.stint_lap,
                             kind: lap.kind,
+                            start_boundary: lap.start_boundary,
+                            end_boundary: lap.end_boundary,
                         });
                     }
                 }
@@ -841,7 +933,10 @@ pub fn group_sessions(files: &[FileMetadata], max_gap_ns: u64) -> Vec<SessionMet
                     if previous.number == lap.number
                         && lap.start_ns <= previous.end_ns.saturating_add(max_gap_ns)
                     {
-                        previous.end_ns = previous.end_ns.max(lap.end_ns);
+                        if lap.end_ns > previous.end_ns {
+                            previous.end_ns = lap.end_ns;
+                            previous.end_boundary = lap.end_boundary;
+                        }
                         previous.duration_ns = previous.end_ns.saturating_sub(previous.start_ns);
                         continue;
                     }
@@ -1317,11 +1412,84 @@ mod tests {
     }
 
     #[test]
+    fn timer_dropout_does_not_turn_an_out_in_recording_into_a_flying_lap() {
+        // Road Atlanta FP2 Run06: a 10 ms zero in Current_Lap_Time at
+        // 5.176 s immediately resumes the previous 48 s timer. The only
+        // sustained reset is in the pit box at 135.626 s (110 ms elapsed).
+        // Treating both as crossings invented a 130.340 s flying lap.
+        for (unit, scale) in [("", 1000.0), ("ms", 1000.0), ("s", 1.0)] {
+            for dropout_samples in [1, 10, 50] {
+                let values = (0..14_001u32)
+                    .map(|index| {
+                        let time_s = f64::from(index) / 100.0 + 0.006;
+                        if (517..517 + dropout_samples).contains(&index) {
+                            0.0
+                        } else if index >= 13_562 {
+                            (time_s - 135.516) * scale
+                        } else {
+                            (43.0 + time_s) * scale
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut source = channels_source(
+                    10_000_000,
+                    vec![
+                        ("Current_Lap_Time", unit, values),
+                        ("Lap_Number", "", vec![1.0; 14_001]),
+                    ],
+                );
+                for channel in &mut source.channels {
+                    channel.chunks[0].time_base_ns = 6_000_000;
+                    channel.duration_ns += 6_000_000;
+                }
+                let metadata = read_source_metadata(&source);
+                assert_eq!(metadata.valid_laps, 0, "{unit}, {dropout_samples}");
+                assert!(metadata.fastest_lap.is_none());
+                assert_eq!(metadata.laps.len(), 2);
+                assert!(metadata.laps.iter().all(|lap| !lap.kind.is_flying()));
+                assert_eq!(metadata.laps[0].end_ns, 135_516_000_000);
+                assert_eq!(metadata.laps[1].start_ns, 135_516_000_000);
+                assert!(metadata.laps.iter().all(|lap| !lap.complete));
+            }
+        }
+    }
+
+    #[test]
+    fn timer_dropout_preserves_later_beacons_and_a_reset_at_the_recording_end() {
+        // A dropout can last through invalid samples. Genuine resets at
+        // 9.9 s and 29.9 s must still delimit a complete 20 s lap, even
+        // when the last reset has no following sample to confirm it.
+        let source = channels_source(
+            1_000_000_000,
+            vec![(
+                "Lap Time",
+                "s",
+                (0..31u32)
+                    .map(|time| match time {
+                        3 => 0.0,
+                        4 => f64::NAN,
+                        0..=9 => 40.0 + f64::from(time),
+                        10..=29 => f64::from(time - 10) + 0.1,
+                        _ => 0.1,
+                    })
+                    .collect(),
+            )],
+        );
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.laps.len(), 3);
+        assert_eq!(metadata.valid_laps, 1);
+        let fastest = metadata.fastest_lap.unwrap();
+        assert_eq!(fastest.start_ns, 9_900_000_000);
+        assert_eq!(fastest.end_ns, 29_900_000_000);
+        assert_eq!(fastest.duration_ns, 20_000_000_000);
+    }
+
+    #[test]
     fn upward_lap_counter_is_preferred_and_a_reset_starts_a_new_stint() {
         // 10 s samples: the drop to 0 at 60 s is not recovered within
         // RESET_CONFIRM_NS, so it is a stint boundary, not a glitch. Lap 3
-        // becomes stint 1's in-lap; the 0 -> 1 climb is stint 2's out-lap
-        // and its tail fragment. Virtual numbers run straight through.
+        // becomes stint 1's in-lap; the delayed 0 -> 1 is re-arming, not
+        // a crossing. Without speed evidence the remaining time is uncertain.
         let source = counter_source("Lap Number", vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 0.0, 1.0]);
         let metadata = read_source_metadata(&source);
         assert_eq!(
@@ -1341,8 +1509,7 @@ mod tests {
                 (1, 1, 1, 0, 20_000_000_000, LapKind::Out),
                 (2, 1, 2, 20_000_000_000, 40_000_000_000, LapKind::Flying),
                 (3, 1, 3, 40_000_000_000, 60_000_000_000, LapKind::In),
-                (4, 2, 0, 60_000_000_000, 70_000_000_000, LapKind::Out),
-                (5, 2, 1, 70_000_000_000, 80_000_000_000, LapKind::In),
+                (4, 2, 1, 60_000_000_000, 80_000_000_000, LapKind::Uncertain),
             ]
         );
         assert_eq!(
@@ -1351,9 +1518,423 @@ mod tests {
                 .iter()
                 .map(LapMetadata::label)
                 .collect::<Vec<_>>(),
-            ["S1 out", "S1 L2", "S1 in", "S2 out", "S2 in"]
+            ["S1 out", "S1 L2", "S1 in", "S2 uncertain"]
         );
         assert_eq!(metadata.valid_laps, 1);
+    }
+
+    #[test]
+    fn delayed_rearming_movement_and_timer_resets_do_not_exit_pit_state() {
+        for delay in [2u32, 6, 26, 60] {
+            let end = 50 + delay;
+            let source = channels_source(
+                1_000_000_000,
+                vec![
+                    (
+                        "Lap_Number",
+                        "",
+                        (0..end)
+                            .map(|t| match t {
+                                0..=9 => 1.0,
+                                10..=29 => 2.0,
+                                _ if t < 30 + delay || t >= end - 3 => 0.0,
+                                _ => 1.0,
+                            })
+                            .collect(),
+                    ),
+                    (
+                        "Speed_Wspd_App",
+                        "",
+                        (0..end)
+                            .map(|t| if (30..=34).contains(&t) { 0.0 } else { 35.0 })
+                            .collect(),
+                    ),
+                    (
+                        "Current_Lap_Time",
+                        "s",
+                        (0..end).map(|t| f64::from(t % 10)).collect(),
+                    ),
+                ],
+            );
+            let metadata = read_source_metadata(&source);
+            assert_eq!(metadata.laps.len(), 3, "delay {delay}: {:?}", metadata.laps);
+            let pit = metadata.laps.last().unwrap();
+            assert_eq!(pit.kind, LapKind::Pit);
+            assert_eq!(
+                (pit.start_ns, pit.end_ns),
+                (30_000_000_000, u64::from(end) * 1_000_000_000)
+            );
+            assert_eq!(pit.start_boundary, LapBoundary::CounterReset);
+            assert_eq!(pit.end_boundary, LapBoundary::RecordingEdge);
+            assert_eq!(metadata.valid_laps, 0);
+        }
+    }
+
+    #[test]
+    fn recording_head_stop_and_first_moving_zero_to_one_crossing_are_recovered() {
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                (
+                    "Lap_Number",
+                    "",
+                    (0..300)
+                        .map(|t| match t {
+                            0..=119 => 0.0,
+                            120..=199 => 1.0,
+                            200..=279 => 2.0,
+                            _ => 3.0,
+                        })
+                        .collect(),
+                ),
+                (
+                    "Speed_Wspd_App",
+                    "",
+                    (0..300).map(|t| if t < 40 { 0.0 } else { 200.0 }).collect(),
+                ),
+                ("Ref_Lap_Time", "s", vec![80.0; 300]),
+            ],
+        );
+        let m = read_source_metadata(&source);
+        assert_eq!(
+            m.laps.iter().map(|l| l.kind).collect::<Vec<_>>(),
+            [
+                LapKind::Pit,
+                LapKind::Out,
+                LapKind::Flying,
+                LapKind::Flying,
+                LapKind::In
+            ]
+        );
+        assert_eq!(
+            (m.laps[0].end_ns, m.laps[1].end_ns),
+            (40_000_000_000, 120_000_000_000)
+        );
+        assert_eq!(m.valid_laps, 2);
+    }
+
+    #[test]
+    fn native_gps_separates_a_moving_pit_pass_without_a_dash_reset() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/road-atlanta-moving-pit-pass.json"
+        ))
+        .unwrap();
+        let rows = fixture["rows"].as_array().unwrap();
+        let channels = fixture["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (
+                    c[0].as_str().unwrap(),
+                    c[1].as_str().unwrap(),
+                    rows.iter()
+                        .map(|r| r[i].as_f64().unwrap_or(f64::NAN))
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut source = channels_source(fixture["period_ns"].as_u64().unwrap(), channels);
+        let metadata = read_source_metadata(&source);
+        assert_eq!(
+            metadata.laps.iter().map(|l| l.kind).collect::<Vec<_>>(),
+            [
+                LapKind::Pit,
+                LapKind::OutIn,
+                LapKind::Pit,
+                LapKind::Out,
+                LapKind::Flying,
+                LapKind::In,
+                LapKind::Pit
+            ]
+        );
+        assert_eq!(metadata.laps[2].start_boundary, LapBoundary::GpsPitEntry);
+        assert_eq!(metadata.laps[2].end_boundary, LapBoundary::GpsPitExit);
+        assert!((170_000_000_000..171_000_000_000).contains(&metadata.laps[2].start_ns));
+        assert!((208_000_000_000..209_000_000_000).contains(&metadata.laps[2].end_ns));
+        assert_eq!(metadata.laps[3].start_boundary, LapBoundary::GpsPitExit);
+        assert_eq!(metadata.valid_laps, 1);
+        assert!(
+            (80_000_000_000..82_000_000_000).contains(&metadata.fastest_lap.unwrap().duration_ns)
+        );
+        // A receiver without a valid fix cannot manufacture this split.
+        let fix = source
+            .channels
+            .iter()
+            .position(|c| c.name == "GPS Fix Type")
+            .unwrap();
+        let original_fix = source.values[fix].clone();
+        source.values[fix].fill(0.0);
+        let unsupported = read_source_metadata(&source);
+        assert!(!unsupported.laps.iter().any(|l| matches!(
+            l.start_boundary,
+            LapBoundary::GpsPitEntry | LapBoundary::GpsPitExit
+        )));
+        source.values[fix] = original_fix;
+        // The same slow speed and dash silence on the actual circuit is
+        // not a pit visit. Move only the lane positions onto atlas outline.
+        let geo: serde_json::Value = serde_json::from_str(
+            motorsport_track_atlas::find_track("road-atlanta")
+                .unwrap()
+                .layouts[0]
+                .centerline_geojson,
+        )
+        .unwrap();
+        let line = geo["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["properties"]["role"] == "outline")
+            .unwrap()["geometry"]["coordinates"]
+            .as_array()
+            .unwrap();
+        let lat = source
+            .channels
+            .iter()
+            .position(|c| c.name == "GPS Latitude")
+            .unwrap();
+        let lon = source
+            .channels
+            .iter()
+            .position(|c| c.name == "GPS Longitude")
+            .unwrap();
+        for i in 850..1042 {
+            let a = source.values[lat][i];
+            let b = source.values[lon][i];
+            let nearest = line
+                .iter()
+                .min_by(|p, q| {
+                    let distance = |point: &serde_json::Value| {
+                        (point[1].as_f64().unwrap() - a).hypot(point[0].as_f64().unwrap() - b)
+                    };
+                    distance(p).total_cmp(&distance(q))
+                })
+                .unwrap();
+            source.values[lat][i] = nearest[1].as_f64().unwrap();
+            source.values[lon][i] = nearest[0].as_f64().unwrap();
+        }
+        let slow_on_circuit = read_source_metadata(&source);
+        assert!(!slow_on_circuit.laps.iter().any(|l| matches!(
+            l.start_boundary,
+            LapBoundary::GpsPitEntry | LapBoundary::GpsPitExit
+        )));
+    }
+
+    #[test]
+    fn slow_pit_beacon_before_reset_cannot_create_an_eleven_second_in_lap() {
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                (
+                    "Lap_Number",
+                    "",
+                    (0..190)
+                        .map(|t| match t {
+                            0..=79 => 1.0,
+                            80..=169 => 2.0,
+                            170..=180 => 3.0,
+                            _ => 0.0,
+                        })
+                        .collect(),
+                ),
+                (
+                    "Speed_Wspd_App",
+                    "",
+                    (0..190)
+                        .map(|t| {
+                            if t < 150 {
+                                240.0
+                            } else if t < 180 {
+                                60.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect(),
+                ),
+                ("Ref_Lap_Time", "s", vec![80.0; 190]),
+            ],
+        );
+        let m = read_source_metadata(&source);
+        assert_eq!(
+            m.laps.iter().map(|l| l.kind).collect::<Vec<_>>(),
+            [LapKind::Out, LapKind::In, LapKind::Pit]
+        );
+        assert_eq!(
+            (m.laps[1].start_ns, m.laps[1].end_ns),
+            (80_000_000_000, 181_000_000_000)
+        );
+        assert_eq!(m.valid_laps, 0);
+    }
+
+    #[test]
+    fn a_stopped_car_on_the_circuit_is_not_pit_time() {
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                (
+                    "Lap_Number",
+                    "",
+                    (0..100)
+                        .map(|t| {
+                            if t < 40 {
+                                1.0
+                            } else if t < 75 {
+                                2.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect(),
+                ),
+                (
+                    "Ground Speed",
+                    "m/s",
+                    (0..100).map(|t| if t < 60 { 50.0 } else { 0.0 }).collect(),
+                ),
+                ("GPS Latitude", "deg", vec![34.136_191; 100]),
+                ("GPS Longitude", "deg", vec![-83.817_3; 100]),
+                (
+                    "GPS Fix Type",
+                    "raw",
+                    (0..100).map(|t| if t <= 61 { 3.0 } else { 0.0 }).collect(),
+                ),
+                ("GPS Position Accuracy", "m", vec![1.0; 100]),
+            ],
+        );
+        let m = read_source_metadata(&source);
+        assert!(m.laps.iter().any(|l| l.kind == LapKind::Stopped));
+        assert!(!m.laps.iter().any(|l| l.kind == LapKind::Pit));
+        assert_eq!(m.valid_laps, 0);
+    }
+
+    #[test]
+    fn parked_binary_counter_reset_is_not_a_transient_glitch() {
+        let source = channels_source(
+            100_000_000,
+            vec![
+                (
+                    "Lap_Number",
+                    "",
+                    (0..100)
+                        .map(|t| if (50..=61).contains(&t) { 0.0 } else { 1.0 })
+                        .collect(),
+                ),
+                (
+                    "Speed_Wspd_App",
+                    "",
+                    (0..100).map(|t| if t >= 48 { 0.0 } else { 50.0 }).collect(),
+                ),
+            ],
+        );
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.laps.len(), 2);
+        assert_eq!(metadata.laps[0].kind, LapKind::OutIn);
+        assert_eq!(metadata.laps[1].kind, LapKind::Pit);
+        assert_eq!(metadata.laps[1].start_ns, 5_000_000_000);
+        assert_eq!(metadata.valid_laps, 0);
+    }
+
+    #[test]
+    fn a_supported_crossing_reestablishes_track_state_and_long_laps_are_preserved() {
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                (
+                    "Lap_Number",
+                    "",
+                    (0..400)
+                        .map(|t| match t {
+                            0..=9 | 60..=99 => 1.0,
+                            10..=29 | 100..=349 => 2.0,
+                            30..=59 => 0.0,
+                            _ => 3.0,
+                        })
+                        .collect(),
+                ),
+                ("Ref Lap Time", "s", vec![75.356; 400]),
+            ],
+        );
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.laps[2].kind, LapKind::Uncertain);
+        let flying = &metadata.laps[3];
+        assert_eq!(flying.kind, LapKind::Flying);
+        assert_eq!(flying.duration_ns, 250_000_000_000);
+        assert_eq!(flying.start_boundary, LapBoundary::CounterCrossing);
+        assert_eq!(flying.end_boundary, LapBoundary::CounterCrossing);
+        assert_eq!(metadata.valid_laps, 1);
+    }
+
+    #[test]
+    fn implausible_crossings_clear_the_anchor_until_a_supported_lap_start() {
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                (
+                    "Lap Number",
+                    "",
+                    (0..430)
+                        .map(|t| match t {
+                            0..=89 => 1.0,
+                            90..=179 => 2.0,
+                            180..=201 => 3.0,
+                            202..=213 => 4.0,
+                            214..=313 => 5.0,
+                            314..=413 => 6.0,
+                            _ => 7.0,
+                        })
+                        .collect(),
+                ),
+                ("Ref Lap Time", "s", vec![75.356; 430]),
+            ],
+        );
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.valid_laps, 2);
+        assert_eq!(metadata.laps[1].kind, LapKind::Flying);
+        for lap in &metadata.laps[2..5] {
+            assert_eq!(lap.kind, LapKind::Uncertain);
+            assert!(!lap.complete);
+        }
+        assert_eq!(metadata.laps[2].end_boundary, LapBoundary::RejectedCrossing);
+        assert_eq!(
+            metadata.laps[3].start_boundary,
+            LapBoundary::RejectedCrossing
+        );
+        assert_eq!(metadata.laps[3].end_boundary, LapBoundary::RejectedCrossing);
+        assert_eq!(metadata.laps[5].kind, LapKind::Flying);
+        assert_eq!(metadata.fastest_lap.unwrap().number, 2);
+    }
+
+    #[test]
+    fn timer_only_implausible_crossings_are_uncertain_through_recording_end() {
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                (
+                    "Lap Time",
+                    "s",
+                    (0..70)
+                        .map(|t| match t {
+                            0..=19 => 30.0 + f64::from(t),
+                            20..=41 => f64::from(t - 20),
+                            42..=53 => f64::from(t - 42),
+                            _ => f64::from(t - 54),
+                        })
+                        .collect(),
+                ),
+                ("Ref Lap Time", "ms", vec![75356.0; 70]),
+            ],
+        );
+        let metadata = read_source_metadata(&source);
+        assert_eq!(metadata.valid_laps, 0);
+        assert!(metadata.laps[1..]
+            .iter()
+            .all(|lap| lap.kind == LapKind::Uncertain && !lap.complete));
+        assert_eq!(
+            metadata.laps.last().unwrap().end_boundary,
+            LapBoundary::RecordingEdge
+        );
     }
 
     /// Builds a multi-channel synthetic source; every channel shares one
@@ -1455,10 +2036,11 @@ mod tests {
                 (1, 1, 1, LapKind::Out, false),
                 (2, 1, 2, LapKind::Flying, true),
                 (3, 1, 3, LapKind::In, false),
-                (4, 2, 1, LapKind::Out, false),
-                (5, 2, 2, LapKind::Flying, true),
-                (6, 2, 3, LapKind::Flying, true),
-                (7, 2, 4, LapKind::In, false),
+                (4, 2, 1, LapKind::Pit, false),
+                (5, 2, 1, LapKind::Out, false),
+                (6, 2, 2, LapKind::Flying, true),
+                (7, 2, 3, LapKind::Flying, true),
+                (8, 2, 4, LapKind::In, false),
             ]
         );
         assert_eq!(
@@ -1467,13 +2049,22 @@ mod tests {
                 .iter()
                 .map(LapMetadata::label)
                 .collect::<Vec<_>>(),
-            ["S1 out", "S1 L2", "S1 in", "S2 out", "S2 L2", "S2 L3", "S2 in"]
+            [
+                "S1 out",
+                "S1 L2",
+                "S1 in",
+                "S2 pit L1",
+                "S2 out",
+                "S2 L2",
+                "S2 L3",
+                "S2 in"
+            ]
         );
         // No 1 s fragment between the dash's pit-event increment (43 s) and
         // the counter reset (44 s): the in-lap absorbs it. Its end sits on
-        // the pit-event timer reset (first post-reset sample 50 ms -> 42.95
-        // s), which the counter drop a second later snaps onto.
-        assert_eq!(metadata.laps[2].end_ns, 42_950_000_000);
+        // the confirmed counter reset. A timer reset must never snap a
+        // pit boundary onto an unconfirmed beacon.
+        assert_eq!(metadata.laps[2].end_ns, 44_000_000_000);
         assert_eq!(metadata.laps[3].start_ns, metadata.laps[2].end_ns);
         assert_eq!(metadata.valid_laps, 3);
         // The 8 s in-lap fragment (36 -> 44 s) is shorter than every flying
@@ -1496,7 +2087,7 @@ mod tests {
     /// "complete" lap. It is a pit lap, closes its stint, and is never the
     /// fastest lap even when a broken beacon made it short.
     #[test]
-    fn a_complete_lap_with_a_pit_length_stop_is_a_pit_lap_and_closes_the_stint() {
+    fn standstill_without_location_is_uncertain_and_does_not_invent_a_pit_stint() {
         let mut lap_number = Vec::new();
         let mut speed = Vec::new();
         for t in 0..60u32 {
@@ -1527,12 +2118,12 @@ mod tests {
             [
                 (1, 1, LapKind::Out, "out"),
                 (1, 2, LapKind::Flying, "flying"),
-                (1, 3, LapKind::Pit, "pit"),
-                (2, 4, LapKind::Flying, "flying"),
-                (2, 5, LapKind::In, "in"),
+                (1, 3, LapKind::Uncertain, "uncertain"),
+                (1, 4, LapKind::Flying, "flying"),
+                (1, 5, LapKind::In, "in"),
             ]
         );
-        assert_eq!(metadata.laps[2].label(), "S1 pit L3");
+        assert_eq!(metadata.laps[2].label(), "S1 uncertain");
         assert_eq!(metadata.valid_laps, 2);
         assert_ne!(metadata.fastest_lap.as_ref().unwrap().kind, LapKind::Pit);
     }
@@ -1561,7 +2152,7 @@ mod tests {
         );
         let metadata = read_source_metadata(&source);
         let stints: Vec<u32> = metadata.laps.iter().map(|lap| lap.stint).collect();
-        assert_eq!(stints, [1, 1, 1, 2, 2], "{:?}", metadata.laps);
+        assert_eq!(stints, [1, 1, 1, 2], "{:?}", metadata.laps);
     }
 
     /// A source-reported fastest lap (VBO gate, LDX details) that classifies
@@ -1602,7 +2193,7 @@ mod tests {
             vec![("Ground Speed", "m/s", speed)],
         ));
         let metadata = read_source_metadata(&source);
-        assert_eq!(metadata.laps[1].kind, LapKind::Pit);
+        assert_eq!(metadata.laps[1].kind, LapKind::Uncertain);
         let fastest = metadata.fastest_lap.as_ref().unwrap();
         assert!(fastest.kind.is_flying(), "{fastest:?}");
         assert_eq!(fastest.stint_lap, 1);

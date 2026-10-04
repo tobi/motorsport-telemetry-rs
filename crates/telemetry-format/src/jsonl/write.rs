@@ -535,6 +535,16 @@ fn write_laps(writer: &mut impl Write, laps: &[LapMetadata]) -> Result<(), Telem
                 lap.stint_lap,
                 lap.kind.as_str()
             )?;
+            if lap.start_boundary != motorsport_telemetry_core::LapBoundary::Unspecified
+                || lap.end_boundary != motorsport_telemetry_core::LapBoundary::Unspecified
+            {
+                write!(
+                    writer,
+                    ",\"{}\",\"{}\"",
+                    lap.start_boundary.as_str(),
+                    lap.end_boundary.as_str()
+                )?;
+            }
         }
         writer.write_all(b"]")?;
     }

@@ -312,6 +312,7 @@ Line 2 is a JSON array. Each element is a lap tuple:
 [number, start_ns, end_ns, complete]
 [number, start_ns, end_ns, complete, first_video_frame]
 [number, start_ns, end_ns, complete, first_video_frame_or_null, stint, stint_lap, kind]
+[number, start_ns, end_ns, complete, first_video_frame_or_null, stint, stint_lap, kind, start_boundary, end_boundary]
 ```
 
 | Position | Type | Meaning |
@@ -323,11 +324,16 @@ Line 2 is a JSON array. Each element is a lap tuple:
 | 4 | integer ≥ 0 or `null` | Optional presentation-order video frame at `start_ns`. `null` when absent but later positions are present. |
 | 5 | integer ≥ 1 | Stint index. |
 | 6 | integer | The vendor counter's value for this lap (stint-local; may be 0). |
-| 7 | string | Lap kind: `"flying"`, `"out"`, `"in"`, `"out-in"`, `"pit"`. |
+| 7 | string | Lap kind: `"flying"`, `"out"`, `"in"`, `"out-in"`, `"pit"`, `"uncertain"`, `"stopped"`. |
+| 8–9 | string | Optional boundary evidence: `"recording-edge"`, `"counter-crossing"`, `"timer-crossing"`, `"rejected-crossing"`, `"counter-reset"`, `"stationary"`, `"motion-departure"`, `"gps-pit-entry"`, `"gps-pit-exit"`, or `"unspecified"`. GPS pit markers describe estimated pit boundaries and never supply start/finish anchors. |
 
 Writers emit positions 5–7 for every classified lap. Readers that find a
 4-tuple treat the lap as unclassified and MAY classify it from the
-intervals and a speed channel. Readers MUST ignore positions beyond 7.
+intervals and a speed channel. Writers append positions 8–9 when evidence
+is available; older tuples default to unspecified evidence. Readers MUST
+ignore positions beyond 9. Pit/uncertain activity after a reset is incomplete
+and excluded from flying-lap statistics. Pit activity may include movement
+while the actual pit exit is unobserved; it is not necessarily stationary time.
 
 `end_ns` MUST be greater than `start_ns`. Both MUST be lattice points.
 `duration_ns` is `end_ns - start_ns` and MUST NOT be stored separately.

@@ -1285,10 +1285,10 @@
     },
     "lap": {
       "title": "Lap tuple",
-      "description": "[number, start_ns, end_ns, complete] or with first_video_frame. complete is 0 or 1. end > start. Both lattice points. Duration is end-start and is not stored.",
+      "description": "[number, start_ns, end_ns, complete, first_video_frame_or_null, stint, stint_lap, kind, start_boundary, end_boundary]. Trailing fields are optional for older documents. end > start; boundaries lie on the time lattice.",
       "type": "array",
       "minItems": 4,
-      "maxItems": 5,
+      "maxItems": 10,
       "prefixItems": [
         {
           "type": "integer"
@@ -1306,7 +1306,60 @@
           ]
         },
         {
-          "$ref": "#/$defs/ns"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ns"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "enum": [
+            "flying",
+            "out",
+            "in",
+            "out-in",
+            "pit",
+            "uncertain",
+            "stopped"
+          ]
+        },
+        {
+          "enum": [
+            "unspecified",
+            "recording-edge",
+            "counter-crossing",
+            "timer-crossing",
+            "rejected-crossing",
+            "counter-reset",
+            "stationary",
+            "motion-departure",
+            "gps-pit-entry",
+            "gps-pit-exit"
+          ]
+        },
+        {
+          "enum": [
+            "unspecified",
+            "recording-edge",
+            "counter-crossing",
+            "timer-crossing",
+            "rejected-crossing",
+            "counter-reset",
+            "stationary",
+            "motion-departure",
+            "gps-pit-entry",
+            "gps-pit-exit"
+          ]
         }
       ],
       "examples": [

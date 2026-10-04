@@ -142,6 +142,8 @@ fn tiny() -> TinySource {
             stint: 0,
             stint_lap: 1,
             kind: LapKind::Unknown,
+            start_boundary: motorsport_telemetry_core::LapBoundary::Unspecified,
+            end_boundary: motorsport_telemetry_core::LapBoundary::Unspecified,
         }],
     }
 }
@@ -229,6 +231,39 @@ fn writes_header_laps_then_compact_channels() {
         lines[3],
         "{\"n\":\"GPS Speed\",\"hz\":25,\"u\":\"m/s\",\"v\":[2.8]}"
     );
+}
+
+#[test]
+fn boundary_evidence_and_uncertain_activity_survive_header_only_reads() {
+    use motorsport_telemetry_core::LapBoundary;
+    for (kind, boundary) in [
+        (LapKind::Uncertain, LapBoundary::CounterReset),
+        (LapKind::Stopped, LapBoundary::MotionDeparture),
+        (LapKind::OutIn, LapBoundary::GpsPitEntry),
+        (LapKind::Pit, LapBoundary::GpsPitExit),
+    ] {
+        let mut source = tiny();
+        let lap = &mut source.laps[0];
+        lap.kind = kind;
+        lap.stint = 1;
+        lap.start_boundary = boundary;
+        lap.end_boundary = LapBoundary::RecordingEdge;
+        let (bytes, opened) = write_alignment_jsonl(&source);
+        let text = String::from_utf8(bytes).unwrap();
+        let prefix = text.lines().take(2).collect::<Vec<_>>().join("\n");
+        let damaged = format!("{prefix}\n{{invalid channel data\n");
+        let metadata = JsonlRecording::header_metadata_from_bytes("evidence", damaged.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.laps, opened.metadata().laps);
+        assert_eq!(metadata.laps[0].kind, kind);
+        assert_eq!(metadata.laps[0].start_boundary, boundary);
+        assert_eq!(metadata.laps[0].end_boundary, LapBoundary::RecordingEdge);
+        assert_eq!(metadata.valid_laps, 0);
+        let laps: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(laps[0][8], boundary.as_str());
+        assert_eq!(laps[0][9], "recording-edge");
+    }
 }
 
 #[test]
@@ -1152,6 +1187,8 @@ fn alignment_snap_laps_and_spans_to_lattice() {
                 stint: 0,
                 stint_lap: 1,
                 kind: LapKind::Unknown,
+                start_boundary: motorsport_telemetry_core::LapBoundary::Unspecified,
+                end_boundary: motorsport_telemetry_core::LapBoundary::Unspecified,
             }],
             quantum_ns,
         )
@@ -1185,6 +1222,8 @@ fn alignment_snap_laps_and_spans_to_lattice() {
             stint: 0,
             stint_lap: 1,
             kind: LapKind::Unknown,
+            start_boundary: motorsport_telemetry_core::LapBoundary::Unspecified,
+            end_boundary: motorsport_telemetry_core::LapBoundary::Unspecified,
         },
         LapMetadata {
             number: 2,
@@ -1196,6 +1235,8 @@ fn alignment_snap_laps_and_spans_to_lattice() {
             stint: 0,
             stint_lap: 2,
             kind: LapKind::Unknown,
+            start_boundary: motorsport_telemetry_core::LapBoundary::Unspecified,
+            end_boundary: motorsport_telemetry_core::LapBoundary::Unspecified,
         },
     ];
     source.spans = vec![

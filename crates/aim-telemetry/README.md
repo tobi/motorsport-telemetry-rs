@@ -20,9 +20,11 @@ record layout, and compatibility policy.
 
 The standalone library exposes `AimFile::open(path)` for full analysis and
 `AimFile::open_index(path)` for fast metadata and filmstrip laps. Index mode
-walks every `aimd` packet only for lap counters/timers, while retaining at most
-19 representative packets for unrelated channel previews and GPS; it does not
-build the video-frame index. `from_bytes` and `from_bytes_index` are the owned
+walks the same validated records as the full reader and computes durations
+from native timelines before subsampling. Lap, motion and GPS evidence stays
+complete; unrelated channels retain at most 19 samples. The scan temporarily
+holds native sample references but does not decode bulk values or build the
+video-frame index. `from_bytes` and `from_bytes_index` are the owned
 buffer equivalents.
 
 `aim_telemetry::read_metadata(path)` returns a fast `FileMetadata` summary,

@@ -38,6 +38,7 @@ pub mod span;
 pub mod storage;
 /// Race-time durations stored as integer milliseconds.
 pub mod timespan;
+pub mod track;
 pub mod units;
 /// Physical plausibility checks over a loaded source.
 pub mod validate;
@@ -47,10 +48,12 @@ pub mod view;
 pub use context::{merge_metadata, MetadataMap};
 pub use diag::{Diagnostic, Diagnostics, Severity};
 pub use display::{ChannelDisplay, ChannelPlot};
+mod lap_evidence;
+mod lap_state;
 pub use laps::classify_laps;
 pub use metadata::{
     driver_histogram, group_sessions, read_source_metadata, schema_hash, AbsoluteTimeRange,
-    DriverStint, FileMetadata, LapKind, LapMetadata, SessionMetadata, SourceIdentity,
+    DriverStint, FileMetadata, LapBoundary, LapKind, LapMetadata, SessionMetadata, SourceIdentity,
     SourceLapMetadata, VideoFileRef, VideoReference,
 };
 pub use pass::{AppliedPass, SourceOrigin};

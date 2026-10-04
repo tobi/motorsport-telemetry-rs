@@ -84,9 +84,10 @@ fn same_fixture_without_ldx_prefers_the_upward_counter_and_splits_the_shutdown_r
         .iter()
         .map(|lap| (lap.stint, lap.stint_lap, lap.kind))
         .collect();
-    assert_eq!(restart, vec![(2, 1, LapKind::OutIn)]);
+    // A logger restart supplies no evidence that another out-lap began.
+    assert_eq!(restart, vec![(2, 1, LapKind::Uncertain)]);
     assert_eq!(metadata.laps.last().unwrap().number, 13);
-    assert_eq!(metadata.laps.last().unwrap().label(), "S2 out-in");
+    assert_eq!(metadata.laps.last().unwrap().label(), "S2 uncertain");
     let fastest = metadata.fastest_lap.as_ref().unwrap();
     assert_eq!(
         (fastest.number, fastest.stint_lap, fastest.label()),

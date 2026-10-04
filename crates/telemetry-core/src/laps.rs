@@ -9,9 +9,10 @@
 //!    it actually counts (high-water >= 2); a 0/1 flag loses to
 //!    `beaconEventCount` / `lap_beacon` counts. A counter that drops and
 //!    stays down is a **stint boundary** (pit stop, logger restart): the
-//!    interval ending there is an in-lap, the one starting there an out-lap,
-//!    and the climb that follows is a new stint's laps. A drop that recovers
-//!    within [`RESET_CONFIRM_NS`] is a transient and ignored.
+//!    active interval ends there; the next activity stays pit/uncertain until
+//!    a supported crossing restores the track anchor. Re-arming is not a
+//!    crossing, regardless of delay. A drop that promptly recovers is ignored
+//!    unless sustained parked zero evidence identifies reset/re-arming.
 //! 3. [`timer_reset_laps`] — a running timer or progress channel that resets.
 //! 4. Otherwise no laps.
 //!
@@ -21,8 +22,11 @@
 //! monotonic across stints. [`fastest_lap`] derives the fastest *flying* lap
 //! from the classified laps and any reported previous-lap channel.
 
-use crate::metadata::{finite_i64, finite_u64, samples, LapKind, LapMetadata, SourceLapMetadata};
-use crate::motion::{longest_stop_interval, longest_stop_ns};
+use crate::lap_state::{Event, Phase};
+use crate::metadata::{
+    finite_i64, finite_u64, samples, LapBoundary, LapKind, LapMetadata, SourceLapMetadata,
+};
+use crate::motion::{longest_stop_interval, longest_stop_ns, stationary_lead_in};
 use crate::{convert, names, TelemetrySource};
 
 /// A counter drop that has not recovered this long after it happened is a
@@ -35,6 +39,36 @@ pub(crate) const RESET_CONFIRM_NS: u64 = 5_000_000_000;
 pub(crate) const PIT_STOP_NS: u64 = 15_000_000_000;
 /// Unrecorded time between consecutive laps that separates two stints.
 pub(crate) const STINT_GAP_NS: u64 = 10_000_000_000;
+
+/// Zero wheel/car speed immediately before the reset, or a continuous zero
+/// run starting at the reset and lasting one second. This handles a dash
+/// reset arriving in the same sample as the car first reaches zero. Missing
+/// samples and GPS-without-fix zero never corroborate a pit reset.
+fn stationary_at_reset(source: &dyn TelemetrySource, time_ns: u64) -> bool {
+    stationary_lead_in(source, time_ns).is_some()
+        || stationary_lead_in(source, time_ns.saturating_add(1_000_000_000))
+            .is_some_and(|(_, start)| start <= time_ns)
+}
+
+// A receiver can lose its fix when a stopped car is switched off. Continuous
+// independently recorded zero wheel speed preserves the last stop location;
+// a stale moving position alone cannot do so. No GPS samples are backfilled.
+fn stationary_on_circuit(source: &dyn TelemetrySource, time_ns: u64) -> bool {
+    crate::track::on_circuit(source, time_ns)
+        || stationary_lead_in(source, time_ns)
+            .is_some_and(|(_, start)| crate::track::on_circuit(source, start))
+}
+
+// Some AiM recordings start with counter/timer both zero until the first
+// physical beacon. This differs from re-arming a previously running timer.
+fn timer_activated(source: &dyn TelemetrySource, time_ns: u64) -> bool {
+    let Some(timer) = timer_channel(source) else {
+        return false;
+    };
+    let before = source.sample_at(timer, time_ns.saturating_sub(1_000_000_000), false);
+    let after = source.sample_at(timer, time_ns.saturating_add(1_000_000_000), false);
+    before == Some(0.0) && after.is_some_and(|v| v.is_finite() && v > 0.0)
+}
 
 /// Speed channels used for stop detection, by [`names::eq`] spelling, in
 /// priority order. Only a channel with a unit convertible to m/s qualifies.
@@ -168,9 +202,8 @@ struct OpenLap {
     /// Counter value (plus beacon-count offset) for this interval.
     stint_lap: i64,
     start_ns: u64,
-    /// True when the interval began at a counter increment (a beacon), false
-    /// when it began at the recording start or at a stint reset.
-    starts_at_beacon: bool,
+    /// Signal supporting the interval start, distinct from a reset/edge.
+    start_boundary: LapBoundary,
 }
 
 fn increasing_counter_laps(
@@ -186,7 +219,22 @@ fn increasing_counter_laps(
     let mut high_water: Option<i64> = None;
     let mut crossings = 0;
     let mut stint = 1u32;
-    let mut last_reset_ns: Option<u64> = None;
+    let mut phase = Phase::Initial;
+    let evidence = crate::lap_evidence::Evidence::new(source, channel_index);
+    let pit_events: Vec<_> = evidence
+        .pit_visits
+        .iter()
+        .flat_map(|&(entry, exit)| [(entry, false), (exit, true)])
+        .collect();
+    let mut next_pit_event = 0;
+    let reference = reference_lap_ns(source);
+    if evidence.initially_parked() {
+        phase = if crate::track::on_circuit(source, 0) {
+            Phase::Stopped
+        } else {
+            Phase::Pit
+        };
+    }
 
     // Only finite, non-negative samples take part; the look-ahead below needs
     // them as a flat list.
@@ -199,31 +247,91 @@ fn increasing_counter_laps(
         })
         .collect();
 
-    let close =
-        |laps: &mut Vec<LapMetadata>, open: OpenLap, end_ns: u64, at_beacon: bool, stint: u32| {
-            if end_ns <= open.start_ns {
-                return;
-            }
-            let kind = match (open.starts_at_beacon, at_beacon) {
-                (true, true) => LapKind::Unknown, // flying or pit: needs the speed trace
-                (false, true) => LapKind::Out,
-                (true, false) => LapKind::In,
-                (false, false) => LapKind::OutIn,
-            };
-            laps.push(LapMetadata {
-                number: 0,
-                start_ns: open.start_ns,
-                end_ns,
-                duration_ns: end_ns - open.start_ns,
-                complete: open.starts_at_beacon && at_beacon,
-                first_video_frame: None,
-                stint,
-                stint_lap: open.stint_lap,
-                kind,
-            });
-        };
+    let close = |laps: &mut Vec<LapMetadata>,
+                 open: OpenLap,
+                 end_ns: u64,
+                 kind: LapKind,
+                 end_boundary: LapBoundary,
+                 stint: u32| {
+        if end_ns <= open.start_ns {
+            return;
+        }
+        laps.push(LapMetadata {
+            number: 0,
+            start_ns: open.start_ns,
+            end_ns,
+            duration_ns: end_ns - open.start_ns,
+            complete: kind == LapKind::Flying,
+            first_video_frame: None,
+            stint,
+            stint_lap: open.stint_lap,
+            kind,
+            start_boundary: open.start_boundary,
+            end_boundary,
+        });
+    };
 
+    let mut process_pit_events = |through: u64,
+                                  laps: &mut Vec<LapMetadata>,
+                                  current: &mut Option<OpenLap>,
+                                  phase: &mut Phase,
+                                  stint: &mut u32| {
+        while let Some(&(at, is_exit)) = pit_events
+            .get(next_pit_event)
+            .filter(|(at, _)| *at <= through)
+        {
+            next_pit_event += 1;
+            let Some(mut open) = *current else {
+                continue;
+            };
+            if at <= open.start_ns {
+                continue;
+            }
+            if !is_exit && matches!(*phase, Phase::Pit | Phase::Stopped | Phase::Uncertain) {
+                // A separately confirmed circuit outing ending at a GPS pit
+                // entry also corroborates the earlier motion departure.
+                if let Some(departure) = evidence.departure(open.start_ns, at) {
+                    if departure > open.start_ns {
+                        let kind = phase.apply(Event::Departure).unwrap_or(LapKind::Uncertain);
+                        close(
+                            laps,
+                            open,
+                            departure,
+                            kind,
+                            LapBoundary::MotionDeparture,
+                            *stint,
+                        );
+                        open.start_ns = departure;
+                        open.start_boundary = LapBoundary::MotionDeparture;
+                        *current = Some(open);
+                    }
+                }
+            }
+            let event = if is_exit {
+                Event::Departure
+            } else {
+                Event::PitEntry
+            };
+            if let Some(kind) = phase.apply(event) {
+                let boundary = if is_exit {
+                    LapBoundary::GpsPitExit
+                } else {
+                    LapBoundary::GpsPitEntry
+                };
+                close(laps, open, at, kind, boundary, *stint);
+                if !is_exit {
+                    *stint += 1;
+                }
+                *current = Some(OpenLap {
+                    start_ns: at,
+                    start_boundary: boundary,
+                    ..open
+                });
+            }
+        }
+    };
     for (position, &(time_ns, counter)) in values.iter().enumerate() {
+        process_pit_events(time_ns, &mut laps, &mut current, &mut phase, &mut stint);
         let Some(before) = high_water else {
             high_water = Some(counter);
             // counter + beacon offset overflowed i64: drop this sample
@@ -233,7 +341,7 @@ fn increasing_counter_laps(
             current = Some(OpenLap {
                 stint_lap,
                 start_ns: time_ns,
-                starts_at_beacon: false,
+                start_boundary: LapBoundary::RecordingEdge,
             });
             continue;
         };
@@ -247,22 +355,48 @@ fn increasing_counter_laps(
             // stopped in the pits (AiM resets `Lap_Number` to 0 there) or
             // the logger was power-cycled. Either way the lap in progress
             // ended without a beacon and a new stint begins here.
-            let recovers = values[position + 1..]
-                .iter()
-                .take_while(|&&(later_ns, _)| later_ns.saturating_sub(time_ns) <= RESET_CONFIRM_NS)
-                .any(|&(_, later)| later >= before);
+            let stationary = stationary_at_reset(source, time_ns);
+            let stopped_on_track = stationary && stationary_on_circuit(source, time_ns);
+            // A parked active counter can reset 1 -> 0 -> 1 before the
+            // recovery window expires. Sustained zero then re-arming is
+            // different from a single corrupt zero sample recovering to 1.
+            let parked_rearm = !completed_count
+                && before == 1
+                && counter == 0
+                && stationary
+                && values[position + 1..]
+                    .iter()
+                    .take_while(|&&(_, later)| later == 0)
+                    .any(|&(later_ns, _)| later_ns.saturating_sub(time_ns) >= 500_000_000);
+            let recovers = !parked_rearm
+                && values[position + 1..]
+                    .iter()
+                    .take_while(|&&(later_ns, _)| {
+                        later_ns.saturating_sub(time_ns) <= RESET_CONFIRM_NS
+                    })
+                    .any(|&(_, later)| later >= before);
             if recovers {
                 continue;
             }
-            if let Some(open) = current.take() {
+            let was_active = matches!(phase, Phase::Initial | Phase::OnTrack | Phase::Out);
+            let closing_kind = phase.apply(if stopped_on_track {
+                Event::TrackStop
+            } else {
+                Event::Reset { stationary }
+            });
+            if let Some(open) = if was_active { current.take() } else { None } {
                 // An AiM dash closes the running lap when the car stops in
                 // the box — counter +1, `Previous_LT` published — and resets
                 // to 0 a second or two later. That increment is the pit
                 // event, not a beacon: the interval it closed is the in-lap
                 // (it ends here, at the reset) and the seconds-long
                 // fragment it opened is nothing.
-                let pit_event = open.starts_at_beacon
-                    && time_ns.saturating_sub(open.start_ns) <= RESET_CONFIRM_NS
+                let pit_event = open.start_boundary == LapBoundary::CounterCrossing
+                    && (time_ns.saturating_sub(open.start_ns) <= RESET_CONFIRM_NS
+                        || (stationary
+                            && reference
+                                .is_some_and(|r| time_ns.saturating_sub(open.start_ns) < r / 2)
+                            && evidence.slow_before(open.start_ns)))
                     && laps
                         .last()
                         .is_some_and(|lap: &LapMetadata| lap.end_ns == open.start_ns);
@@ -270,6 +404,7 @@ fn increasing_counter_laps(
                     in_lap.end_ns = time_ns;
                     in_lap.duration_ns = time_ns - in_lap.start_ns;
                     in_lap.complete = false;
+                    in_lap.end_boundary = LapBoundary::CounterReset;
                     in_lap.kind = if in_lap.kind == LapKind::Out {
                         LapKind::OutIn
                     } else {
@@ -277,17 +412,32 @@ fn increasing_counter_laps(
                     };
                     crossings -= 1;
                 } else {
-                    close(&mut laps, open, time_ns, false, stint);
+                    close(
+                        &mut laps,
+                        open,
+                        time_ns,
+                        closing_kind.unwrap_or(LapKind::Uncertain),
+                        LapBoundary::CounterReset,
+                        stint,
+                    );
                 }
             }
-            stint += 1;
+            if was_active {
+                stint += 1;
+            }
             high_water = Some(counter);
-            last_reset_ns = Some(time_ns);
-            current = counter.checked_add(number_offset).map(|stint_lap| OpenLap {
-                stint_lap,
-                start_ns: time_ns,
-                starts_at_beacon: false,
-            });
+            if was_active {
+                current = counter.checked_add(number_offset).map(|stint_lap| OpenLap {
+                    stint_lap,
+                    start_ns: time_ns,
+                    start_boundary: LapBoundary::CounterReset,
+                });
+            } else if let Some(open) = &mut current {
+                open.stint_lap = counter.saturating_add(number_offset);
+            }
+            if stopped_on_track {
+                phase = Phase::Stopped;
+            }
             continue;
         }
         // A counter that jumps by more than one lap and is not held by
@@ -306,28 +456,92 @@ fn increasing_counter_laps(
         let Some(stint_lap) = counter.checked_add(number_offset) else {
             continue;
         };
-        // The same dash arms the next lap with 0 -> 1 a second or two after
-        // the reset, still parked. Part of the reset sequence, not a beacon:
-        // the out-lap fragment keeps its start and takes the new count.
-        if last_reset_ns.is_some_and(|reset| time_ns.saturating_sub(reset) <= RESET_CONFIRM_NS) {
+        // Active-lap counters re-arm at 0 -> 1, regardless of delay. A
+        // completed-beacon counter's 0 -> 1 is a real crossing instead.
+        let gps_crossing = evidence.crossing(time_ns);
+        let first_crossing = gps_crossing == Some(true)
+            || (gps_crossing.is_none()
+                && reference.is_some_and(|r| {
+                    current.is_some_and(|open| time_ns.saturating_sub(open.start_ns) >= r / 2)
+                        && (evidence.moving_before(time_ns, (r / 5).max(10_000_000_000))
+                            || (timer_activated(source, time_ns)
+                                && current.is_some_and(|open| {
+                                    evidence.departure(open.start_ns, time_ns).is_some_and(
+                                        |departure| time_ns.saturating_sub(departure) >= r / 2,
+                                    )
+                                })))
+                }));
+        if !completed_count && before == 0 && counter == 1 && !first_crossing {
+            phase.apply(Event::Rearm);
             if let Some(open) = &mut current {
                 open.stint_lap = stint_lap;
             }
             high_water = Some(counter);
             continue;
         }
+        if gps_crossing == Some(false) && evidence.slow_before(time_ns) {
+            // The parallel pit lane can trip the dash beacon. It does not
+            // close a track lap or create a new track anchor.
+            high_water = Some(counter);
+            continue;
+        }
+        // Only independently corroborated departure can leave pit activity.
+        // Close the pit interval at the observed end of standstill, before
+        // interpreting the later counter event. Re-arming alone cannot do it.
+        if matches!(phase, Phase::Pit | Phase::Uncertain | Phase::Stopped) {
+            if let Some(open) = current {
+                if let Some(departure) = evidence.departure(open.start_ns, time_ns) {
+                    if departure > open.start_ns {
+                        let kind = phase.apply(Event::Departure).unwrap_or(LapKind::Uncertain);
+                        close(
+                            &mut laps,
+                            open,
+                            departure,
+                            kind,
+                            LapBoundary::MotionDeparture,
+                            stint,
+                        );
+                        current = Some(OpenLap {
+                            start_ns: departure,
+                            start_boundary: LapBoundary::MotionDeparture,
+                            ..open
+                        });
+                    }
+                }
+            }
+        }
+        if matches!(phase, Phase::Pit | Phase::Stopped) {
+            high_water = Some(counter);
+            continue;
+        }
+        let kind = phase.apply(Event::Crossing).unwrap_or(LapKind::Uncertain);
         if let Some(open) = current.replace(OpenLap {
             stint_lap,
             start_ns: time_ns,
-            starts_at_beacon: true,
+            start_boundary: LapBoundary::CounterCrossing,
         }) {
-            close(&mut laps, open, time_ns, true, stint);
+            close(
+                &mut laps,
+                open,
+                time_ns,
+                kind,
+                LapBoundary::CounterCrossing,
+                stint,
+            );
         }
         high_water = Some(counter);
         crossings += 1;
     }
+    process_pit_events(duration_ns, &mut laps, &mut current, &mut phase, &mut stint);
     if let Some(open) = current {
-        close(&mut laps, open, duration_ns, false, stint);
+        close(
+            &mut laps,
+            open,
+            duration_ns,
+            phase.apply(Event::End).unwrap_or(LapKind::Uncertain),
+            LapBoundary::RecordingEdge,
+            stint,
+        );
     }
     (laps, crossings)
 }
@@ -355,6 +569,8 @@ pub(crate) fn counter_laps(
 /// available; otherwise laps are numbered by position. Reset detection treats
 /// percentage progression and absolute timers separately. An inverted boundary
 /// (`end < start`) is dropped instead of producing a zero-duration lap.
+/// A timer dropout that resumes its pre-drop trajectory within
+/// [`RESET_CONFIRM_NS`] is not a crossing.
 pub(crate) fn timer_reset_laps(
     source: &dyn TelemetrySource,
     duration_ns: u64,
@@ -389,7 +605,8 @@ pub(crate) fn timer_reset_laps(
             let max_elapsed_ns = 2_000_000_000u64.saturating_add(period_ns.saturating_mul(2));
             values
                 .windows(2)
-                .filter_map(|pair| {
+                .enumerate()
+                .filter_map(|(position, pair)| {
                     let before = pair[0].1;
                     let after = pair[1].1;
                     if !before.is_finite() || !after.is_finite() {
@@ -412,6 +629,27 @@ pub(crate) fn timer_reset_laps(
                     // the logger's reported lap times.
                     let elapsed_ns = finite_u64(after * seconds_per_unit * 1e9)?;
                     if elapsed_ns > max_elapsed_ns {
+                        return None;
+                    }
+                    // AiM dash/CAN timers can briefly read zero and then
+                    // resume the old running timer (Road Atlanta FP2 Run06:
+                    // 48.110 s -> 0 -> 48.150 s in 20 ms). Confirm that the
+                    // old trajectory stays gone before using the drop as a
+                    // beacon. Compare elapsed time as well as values so a
+                    // genuine new lap counting upward is never mistaken for
+                    // recovery. Allow 2 s of dash update latency, as above.
+                    let recovers = values[position + 2..]
+                        .iter()
+                        .take_while(|&&(later_ns, _)| {
+                            later_ns.saturating_sub(pair[1].0) <= RESET_CONFIRM_NS
+                        })
+                        .any(|&(later_ns, later)| {
+                            let elapsed_s = later_ns.saturating_sub(pair[0].0) as f64 / 1e9;
+                            later.is_finite()
+                                && later >= 0.0
+                                && ((later - before) * seconds_per_unit - elapsed_s).abs() <= 2.0
+                        });
+                    if recovers {
                         return None;
                     }
                     Some(pair[1].0.saturating_sub(elapsed_ns))
@@ -451,12 +689,21 @@ pub(crate) fn timer_reset_laps(
             last_number = Some(number);
             // inverted boundary: drop rather than report a zero-duration lap
             pair[1].checked_sub(pair[0])?;
-            (number > 0).then_some(LapMetadata::interval(
-                number,
-                pair[0],
-                pair[1],
-                index > 0 && index + 1 < count,
-            ))
+            (number > 0).then(|| {
+                let mut lap =
+                    LapMetadata::interval(number, pair[0], pair[1], index > 0 && index + 1 < count);
+                lap.start_boundary = if index == 0 {
+                    LapBoundary::RecordingEdge
+                } else {
+                    LapBoundary::TimerCrossing
+                };
+                lap.end_boundary = if index + 1 == count {
+                    LapBoundary::RecordingEdge
+                } else {
+                    LapBoundary::TimerCrossing
+                };
+                lap
+            })
         })
         .collect()
 }
@@ -512,8 +759,8 @@ pub(crate) fn snap_window_ns(counter_period_ns: u64, timer_period_ns: u64) -> u6
 
 /// Applies the lap-recovery precedence: authoritative > counter > timer.
 ///
-/// A counter with zero crossings falls through to timer laps when any exist,
-/// otherwise the counter's single incomplete lap (or empty vec) is kept.
+/// Counter reset evidence also wins over timer fallback, even without any
+/// crossings. A constant counter with no reset may fall through to timers.
 pub(crate) fn pick_laps(
     authoritative: Option<&SourceLapMetadata>,
     counter_laps: Vec<LapMetadata>,
@@ -523,7 +770,11 @@ pub(crate) fn pick_laps(
 ) -> Vec<LapMetadata> {
     if let Some(source_laps) = authoritative {
         source_laps.laps.clone()
-    } else if counter_crossings > 0 {
+    } else if counter_crossings > 0
+        || counter_laps
+            .iter()
+            .any(|lap| lap.end_boundary == LapBoundary::CounterReset)
+    {
         refine_with_timer(counter_laps, &timer_laps, snap_window_ns)
     } else if !timer_laps.is_empty() {
         timer_laps
@@ -560,6 +811,28 @@ fn refine_with_timer(
         .collect();
     resets.sort_unstable();
     resets.dedup();
+    let is_barrier = |boundary| {
+        matches!(
+            boundary,
+            LapBoundary::CounterReset
+                | LapBoundary::MotionDeparture
+                | LapBoundary::Stationary
+                | LapBoundary::GpsPitEntry
+                | LapBoundary::GpsPitExit
+                | LapBoundary::RejectedCrossing
+        )
+    };
+    let activity_barriers: Vec<u64> = laps
+        .iter()
+        .flat_map(|lap| {
+            [
+                is_barrier(lap.start_boundary).then_some(lap.start_ns),
+                is_barrier(lap.end_boundary).then_some(lap.end_ns),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect();
     let snap = |boundary: u64| -> u64 {
         let at = resets.partition_point(|reset| *reset < boundary);
         let candidates = [at.checked_sub(1), (at < resets.len()).then_some(at)];
@@ -568,6 +841,11 @@ fn refine_with_timer(
             .flatten()
             .map(|index| resets[index])
             .filter(|reset| reset.abs_diff(boundary) <= snap_window_ns)
+            .filter(|reset| {
+                !activity_barriers
+                    .iter()
+                    .any(|barrier| (boundary.min(*reset)..=boundary.max(*reset)).contains(barrier))
+            })
             .min_by_key(|reset| reset.abs_diff(boundary))
             .unwrap_or(boundary)
     };
@@ -580,11 +858,29 @@ fn refine_with_timer(
         // follows by the counter's lag.
         let head = index == 0 && !lap.complete;
         let tail = index + 1 == count && !lap.complete;
-        if !head {
-            lap.start_ns = snap(lap.start_ns);
+        if !head
+            && matches!(
+                lap.start_boundary,
+                LapBoundary::CounterCrossing | LapBoundary::Unspecified
+            )
+        {
+            let snapped = snap(lap.start_ns);
+            if snapped != lap.start_ns {
+                lap.start_boundary = LapBoundary::TimerCrossing;
+            }
+            lap.start_ns = snapped;
         }
-        if !tail {
-            lap.end_ns = snap(lap.end_ns);
+        if !tail
+            && matches!(
+                lap.end_boundary,
+                LapBoundary::CounterCrossing | LapBoundary::Unspecified
+            )
+        {
+            let snapped = snap(lap.end_ns);
+            if snapped != lap.end_ns {
+                lap.end_boundary = LapBoundary::TimerCrossing;
+            }
+            lap.end_ns = snapped;
         }
     }
     laps.retain(|lap| lap.end_ns > lap.start_ns);
@@ -603,15 +899,13 @@ fn refine_with_timer(
 /// * more than [`STINT_GAP_NS`] of unrecorded time between two laps, or an
 ///   incomplete lap followed by another incomplete one (an in-lap and the
 ///   next out-lap that no counter separated);
-/// * a complete lap in which the car stood still for [`PIT_STOP_NS`] — a
-///   logger that keeps counting through the pits produces one
-///   beacon-to-beacon interval holding both the in- and the out-lap. That
-///   lap is [`LapKind::Pit`] and closes its stint.
+/// * an independently identified complete pit interval. Standstill alone
+///   remains uncertain; GPS-located circuit standstill is stopped on track.
 ///
 /// Kinds a reader already stored are kept; [`LapKind::Unknown`] is resolved
 /// from position in the stint and the speed trace. Complete laps with a
-/// pit-length stop become [`LapKind::Pit`] even when stored as flying, since
-/// a stop is a fact of the trace, not a labelling choice.
+/// stops become [`LapKind::Uncertain`] or GPS-located [`LapKind::Stopped`],
+/// unless pit identity was independently supplied.
 ///
 /// A [`LapKind::Pit`] lap is then *carved*: the standing time is split out as
 /// its own [`LapKind::Pit`] interval, bounded by an [`LapKind::In`] and an
@@ -631,6 +925,16 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) 
         })
         .collect();
     let pit_stop = |index: usize| stops[index] >= PIT_STOP_NS;
+    let track_stops: Vec<bool> = laps
+        .iter()
+        .enumerate()
+        .map(|(i, lap)| {
+            pit_stop(i)
+                && speed
+                    .and_then(|s| longest_stop_interval(source, s, lap.start_ns, lap.end_ns))
+                    .is_some_and(|(a, b)| stationary_on_circuit(source, a + (b - a) / 2))
+        })
+        .collect();
 
     if laps.iter().any(|lap| lap.stint == 0) {
         let mut stint = 1u32;
@@ -640,7 +944,7 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) 
                 let current = &laps[index];
                 let gap = current.start_ns.saturating_sub(previous.end_ns) > STINT_GAP_NS;
                 let in_then_out = !previous.complete && !current.complete;
-                let after_pit_lap = previous.complete && pit_stop(index - 1);
+                let after_pit_lap = previous.complete && previous.kind == LapKind::Pit;
                 if gap || in_then_out || after_pit_lap {
                     stint += 1;
                 }
@@ -661,10 +965,15 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) 
             let first = offset == 0;
             let last = offset + 1 == count;
             let stopped = pit_stop(index + offset);
+            if track_stops[index + offset] {
+                lap.kind = LapKind::Stopped;
+                lap.complete = false;
+                continue;
+            }
             lap.kind = match lap.kind {
                 LapKind::Unknown if lap.complete => {
                     if stopped {
-                        LapKind::Pit
+                        LapKind::Uncertain
                     } else {
                         LapKind::Flying
                     }
@@ -673,11 +982,25 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) 
                 LapKind::Unknown if first => LapKind::Out,
                 LapKind::Unknown if last => LapKind::In,
                 LapKind::Unknown => LapKind::Out,
-                LapKind::Flying if stopped => LapKind::Pit,
+                LapKind::Flying if stopped => LapKind::Uncertain,
                 kept => kept,
             };
         }
         index = end;
+    }
+
+    // Standstill alone cannot distinguish a pit stop, FCY stop, or crash.
+    // It also cannot provide the next lap's track anchor.
+    let mut needs_anchor = false;
+    for lap in laps.iter_mut() {
+        if needs_anchor && lap.kind == LapKind::Flying {
+            lap.kind = LapKind::Out;
+            lap.complete = false;
+        }
+        needs_anchor = lap.kind == LapKind::Stopped;
+        if matches!(lap.kind, LapKind::Stopped | LapKind::Uncertain) {
+            lap.complete = false;
+        }
     }
 
     // A pit lap closes its stint whichever way the stints were assigned: a
@@ -687,6 +1010,7 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) 
     for index in 0..laps.len() {
         if index > 0
             && laps[index - 1].kind == LapKind::Pit
+            && laps[index - 1].complete
             && laps[index].stint == laps[index - 1].stint - bump
         {
             bump += 1;
@@ -703,7 +1027,7 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) 
     if let Some(speed) = speed {
         let mut carved = Vec::with_capacity(laps.len());
         for lap in laps.drain(..) {
-            let stop = (lap.kind == LapKind::Pit)
+            let stop = (lap.kind == LapKind::Pit && lap.complete)
                 .then(|| longest_stop_interval(source, speed, lap.start_ns, lap.end_ns))
                 .flatten();
             if let Some((stop_start, stop_end)) = stop {
@@ -715,16 +1039,20 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) 
                     in_lap.end_ns = stop_start;
                     in_lap.duration_ns = stop_start - lap.start_ns;
                     in_lap.kind = LapKind::In;
+                    in_lap.end_boundary = LapBoundary::Stationary;
                     in_lap.complete = false;
                     let mut pit = lap.clone();
                     pit.start_ns = stop_start;
                     pit.end_ns = stop_end;
                     pit.duration_ns = stop_end - stop_start;
                     pit.complete = false;
+                    pit.start_boundary = LapBoundary::Stationary;
+                    pit.end_boundary = LapBoundary::Stationary;
                     let mut out_lap = lap.clone();
                     out_lap.start_ns = stop_end;
                     out_lap.duration_ns = lap.end_ns - stop_end;
                     out_lap.kind = LapKind::Out;
+                    out_lap.start_boundary = LapBoundary::Stationary;
                     out_lap.complete = false;
                     out_lap.stint = lap.stint + 1;
                     out_lap.stint_lap = 0;
@@ -741,6 +1069,74 @@ pub fn classify_laps(source: &dyn TelemetrySource, laps: &mut Vec<LapMetadata>) 
 
     for (position, lap) in laps.iter_mut().enumerate() {
         lap.number = position as i64 + 1;
+    }
+}
+
+/// The source's reference-lap duration, using the same unit interpretation
+/// for classification and fastest selection.
+fn reference_lap_ns(source: &dyn TelemetrySource) -> Option<u64> {
+    let index = names::find(source.channels(), &["reflaptime", "referencelaptime"])?;
+    let values = samples(source, index);
+    let max_value = values
+        .iter()
+        .map(|(_, value)| *value)
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, f64::max);
+    let scale = timer_seconds_per_unit(&source.channels()[index].unit, max_value)? * 1e9;
+    values
+        .into_iter()
+        .map(|(_, value)| value)
+        .find(|value| value.is_finite() && *value > 0.0)
+        .and_then(|value| finite_u64(value * scale))
+}
+
+/// A timer and counter may agree on a dash reset that is not a physical lap.
+/// Reuse the existing reference lower bound; never apply the upper bound to
+/// classification because slow/FCY laps are still track laps. A rejected
+/// crossing clears the anchor until a subsequent accepted crossing, so its
+/// following interval cannot silently remain a flying lap either.
+pub(crate) fn validate_crossings(source: &dyn TelemetrySource, laps: &mut [LapMetadata]) {
+    let Some(reference) = reference_lap_ns(source) else {
+        return;
+    };
+    let mut phase = Phase::Initial;
+    let mut previous_end = None;
+    for lap in laps {
+        if matches!(
+            lap.start_boundary,
+            LapBoundary::MotionDeparture | LapBoundary::GpsPitExit
+        ) {
+            phase.apply(Event::Departure);
+        }
+        if let Some((end, LapBoundary::RejectedCrossing)) = previous_end {
+            if lap.start_ns == end {
+                lap.start_boundary = LapBoundary::RejectedCrossing;
+            }
+        }
+        let rejected = lap.complete && lap.duration_ns < reference / 2;
+        let event = if rejected {
+            Event::RejectedCrossing
+        } else {
+            match lap.end_boundary {
+                LapBoundary::CounterCrossing | LapBoundary::TimerCrossing => Event::Crossing,
+                LapBoundary::CounterReset => Event::Reset {
+                    stationary: stationary_at_reset(source, lap.end_ns),
+                },
+                LapBoundary::GpsPitEntry => Event::PitEntry,
+                LapBoundary::GpsPitExit => Event::Departure,
+                _ => Event::End,
+            }
+        };
+        let was_uncertain = phase == Phase::Uncertain;
+        let kind = phase.apply(event);
+        if rejected || was_uncertain {
+            lap.kind = kind.unwrap_or(LapKind::Uncertain);
+            lap.complete = false;
+        }
+        if rejected {
+            lap.end_boundary = LapBoundary::RejectedCrossing;
+        }
+        previous_end = Some((lap.end_ns, lap.end_boundary));
     }
 }
 
@@ -761,23 +1157,7 @@ pub(crate) fn fastest_lap(
 ) -> Option<LapMetadata> {
     let reference_lap_ns = authoritative
         .is_none()
-        .then(|| {
-            names::find(source.channels(), &["reflaptime", "referencelaptime"]).and_then(|index| {
-                let values = samples(source, index);
-                let max_value = values
-                    .iter()
-                    .map(|(_, value)| *value)
-                    .filter(|value| value.is_finite())
-                    .fold(0.0_f64, f64::max);
-                let scale =
-                    timer_seconds_per_unit(&source.channels()[index].unit, max_value)? * 1e9;
-                values
-                    .into_iter()
-                    .map(|(_, value)| value)
-                    .find(|value| value.is_finite() && *value > 0.0)
-                    .and_then(|value| finite_u64(value * scale))
-            })
-        })
+        .then(|| reference_lap_ns(source))
         .flatten();
     let plausible_lap = |duration_ns: u64| {
         duration_ns >= 10_000_000_000
@@ -826,6 +1206,31 @@ mod tests {
             (end_s * 1e9) as u64,
             complete,
         )
+    }
+
+    #[test]
+    fn timer_refinement_cannot_move_a_crossing_across_an_activity_boundary() {
+        let mut counter = vec![
+            lap(1, 0.0, 10.0, false),
+            lap(2, 10.0, 11.0, false),
+            lap(3, 11.0, 20.0, false),
+        ];
+        counter[0].end_boundary = LapBoundary::CounterCrossing;
+        counter[1].start_boundary = LapBoundary::CounterCrossing;
+        let timer = vec![lap(1, 0.0, 11.5, false), lap(2, 11.5, 20.0, false)];
+        for boundary in [
+            LapBoundary::CounterReset,
+            LapBoundary::MotionDeparture,
+            LapBoundary::Stationary,
+            LapBoundary::GpsPitEntry,
+            LapBoundary::GpsPitExit,
+            LapBoundary::RejectedCrossing,
+        ] {
+            counter[1].end_boundary = boundary;
+            counter[2].start_boundary = boundary;
+            let refined = refine_with_timer(counter.clone(), &timer, 2_000_000_000);
+            assert_eq!(refined, counter, "{boundary:?}");
+        }
     }
 
     #[test]
@@ -966,6 +1371,8 @@ mod tests {
             lap(2, 50.0, 150.0, true),
             lap(3, 150.0, 200.0, false),
         ];
+        // Pit identity is independent input; zero speed alone is ambiguous.
+        laps[1].kind = LapKind::Pit;
         classify_laps(&source, &mut laps);
         let shape: Vec<(LapKind, i64, u64, u64)> = laps
             .iter()
