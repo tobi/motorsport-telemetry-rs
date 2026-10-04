@@ -378,11 +378,14 @@ pub fn audit_track(
         .map_or(laps.as_slice(), |m| m.laps.as_slice())
         .windows(2)
     {
-        if matches!(pair[0].kind, LapKind::Pit | LapKind::Stopped)
-            && pair[1].kind == LapKind::Flying
+        if (matches!(pair[0].kind, LapKind::Pit | LapKind::Stopped)
+            && matches!(pair[1].kind, LapKind::Flying | LapKind::In))
+            || (pair[0].kind == LapKind::Stopped
+                && pair[1].kind == LapKind::Pit
+                && pair[0].end_ns == pair[1].start_ns)
         {
             report.add("error", "impossible-transition", Some(pair[1].number), Some(pair[1].start_ns),
-                "Pit/stopped activity transitions directly to a flying lap without an out fragment.");
+                "Pit/stopped activity skips departure/out activity, or a circuit stop becomes pit time without intervening departure.");
         }
     }
 
@@ -483,23 +486,21 @@ pub fn audit_track(
             }
         }
         if lap.kind == LapKind::Flying {
-            let invalid_boundary = matches!(
-                lap.start_boundary,
-                LapBoundary::CounterReset
-                    | LapBoundary::Stationary
-                    | LapBoundary::MotionDeparture
-                    | LapBoundary::GpsPitEntry
-                    | LapBoundary::GpsPitExit
-                    | LapBoundary::RejectedCrossing
-                    | LapBoundary::RecordingEdge
-            ) || matches!(
-                lap.end_boundary,
-                LapBoundary::CounterReset
-                    | LapBoundary::GpsPitEntry
-                    | LapBoundary::GpsPitExit
-                    | LapBoundary::RejectedCrossing
-                    | LapBoundary::RecordingEdge
-            );
+            let eligible = |boundary| {
+                matches!(
+                    boundary,
+                    LapBoundary::CounterCrossing
+                        | LapBoundary::TimerCrossing
+                        | LapBoundary::Unspecified
+                )
+            };
+            let invalid_boundary = !eligible(lap.start_boundary) || !eligible(lap.end_boundary);
+            if lap.start_boundary == LapBoundary::Unspecified
+                || lap.end_boundary == LapBoundary::Unspecified
+            {
+                report.add("review", "missing-boundary-evidence", Some(lap.number), Some(lap.start_ns),
+                    "Stored flying lap omits crossing provenance; duration alone cannot certify its anchors.");
+            }
             if !lap.complete || invalid_boundary {
                 report.add(
                     "error",
@@ -1022,6 +1023,49 @@ mod tests {
         assert_eq!(report.gps_checked_boundaries, 0);
         for code in ["track-from-unqualified-gps", "missing-trusted-gps"] {
             assert!(report.findings.iter().any(|f| f.code == code), "{report:?}");
+        }
+    }
+    #[test]
+    fn stationary_endpoints_and_skipped_departures_cannot_supply_flying_laps() {
+        for boundary in [LapBoundary::Stationary, LapBoundary::MotionDeparture] {
+            let mut flying = LapMetadata::interval(1, 0, 80_000_000_000, true);
+            flying.kind = LapKind::Flying;
+            flying.stint = 1;
+            flying.start_boundary = LapBoundary::CounterCrossing;
+            flying.end_boundary = boundary;
+            let report = audit_track(
+                &stored_with_duration(vec![flying], 100),
+                &TrackAuditOptions::default(),
+            )
+            .unwrap();
+            assert!(report
+                .findings
+                .iter()
+                .any(|f| f.code == "flying-without-crossings"));
+        }
+        for (before, after) in [
+            (LapKind::Pit, LapKind::In),
+            (LapKind::Stopped, LapKind::In),
+            (LapKind::Stopped, LapKind::Pit),
+        ] {
+            let mut a = LapMetadata::interval(1, 0, 20_000_000_000, false);
+            a.kind = before;
+            a.stint = 1;
+            let mut b = LapMetadata::interval(2, 20_000_000_000, 40_000_000_000, false);
+            b.kind = after;
+            b.stint = 1;
+            let report = audit_track(
+                &stored_with_duration(vec![a, b], 100),
+                &TrackAuditOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.code == "impossible-transition"),
+                "{report:?}"
+            );
         }
     }
 }
