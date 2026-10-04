@@ -145,3 +145,89 @@ PNG/SVG previews, `native-inspect.json`, `native-verify.log`, red/green
 regression logs and workspace/clippy logs. These generated artifacts and the
 real-file cache are intentionally not committed. The durable record is this
 report plus the NAS-independent synthetic tests.
+
+## 2026-10-04 lap/state collection audit
+
+The new verifier pass attempted all 3,533 supported-extension recordings in
+`/mnt/nas-home/Racing/collection`, including native MP4/PDS/LD/VBO and
+`.telemetry` documents. Each manifest path has exactly one final result;
+supporting documents/media and `@eaDir` are excluded. Earlier partial audits
+above remain historical evidence. The parser/verifier revision is `37eb222`
+(with lap-normalization semantics from `770dadd`).
+
+| Final category | Files |
+|---|---:|
+| No review/error findings | 75 |
+| Needs review | 2,667 |
+| Hard state/physical audit violations | 0 |
+| Video without AiM telemetry | 677 |
+| Legacy ZIP telemetry archives | 32 |
+| Cannot open/decode as supported telemetry | 82 |
+
+These counts are verification outcomes, not physical certification. Missing
+trusted GPS, timers, counters or motion evidence remains visible. Review
+findings also expose disagreements with stored lap annotations. Unavailable
+files include malformed/unsupported vendor files and three PDS recordings
+with widespread implausible decoded magnitudes; the verifier refuses those
+sources rather than presenting lap conclusions. Legacy ZIP archives require
+reconversion from original vendor data; this pass did not migrate them.
+
+All original files were read only. Three large Indianapolis race MP4s initially
+timed out; all three succeeded after sequential local staging. The remaining
+slow MP4 checks likewise used local byte copies retaining original filenames
+and adjacent track metadata. Previously completed final-parser audits were
+retained, and older missing-input flags were checked against the shared parser
+channel-name lists. Full initial/intermediate/final JSONL, the manifest and
+HTML reports are retained in BB thread storage. No NAS rewrites occurred.
+
+The 27-file Road Atlanta weekend was rechecked with explicit 72–120-second
+review bounds. Full and metadata-only readers agree on timing, classification,
+numbering, stints, completeness and boundary evidence for all 367 intervals;
+there are no hard audit violations or lap-duration/file-size coverage
+mismatches. Long race laps remain flying laps and may be FCY. GPS pit gates
+and motion departure timestamps are estimates, not surveyed boundaries.
+
+The private acceptance test in
+`crates/motorsport-telemetry/tests/road_atlanta_verify.rs` passed all nine
+reported cases against byte-identical real recordings at the final revision:
+
+| Recording | Required verifier finding |
+|---|---|
+| `26IMSAR07_PLM_FP1_Run01_MB.MP4` | `recovered-first-crossing` |
+| `26IMSAR07_PLM_FP1_Run04_DHH.MP4` | `ignored-pit-lane-beacon` |
+| `26IMSAR07_PLM_FP2_Run06_TL.MP4` | `recovered-timer-dropout` |
+| `26IMSAR07_PLM_FP3_Run01_TL.MP4` | `recovered-moving-pit-pass` |
+| `26IMSAR07_PLM_Q_Run01_TL.MP4` | `ignored-counter-rearm` |
+| `SCHD0295.MP4` | `recovered-motion-departure` |
+| `SCHD0301.MP4` | `rejected-short-crossing` |
+| `SCHD0304.MP4` | `recovered-motion-departure` |
+| `SCHD0306.MP4` | `short-in-lap` |
+
+Recovery findings are informational: corrected metadata still explains the
+native ambiguity that triggered recovery. `short-in-lap` and unresolved
+activity remain review findings. A located stop on the circuit is `Stopped`,
+not pit activity; termination alone does not prove a crash. The reducer's
+bounded TLC results and mutation checks are documented in `specs/laps/`;
+those checks do not prove sensor inference correct or unbounded behavior.
+
+The collection scan also exposed a false 24.907-second flying lap in four
+Road America FP2 copies. The unrecognized `Lap_Number_001` counter and an
+always-zero reference timer caused timer-only recovery to ignore the sustained
+counter reset. Strict numeric-suffix counter recognition plus a permissive
+trusted-GPS/atlas physical floor removes that flying lap. All four copies now
+verify without hard errors; the short in-lap fragment remains flagged for
+review. No upper classification cutoff was added for FCY laps.
+
+To repeat the private acceptance checks:
+
+```sh
+ROAD_ATLANTA_CORPUS=/mnt/nas-home/Racing/collection/2026/2026-10-01_IMSA_Road-Atlanta-10H \
+  cargo +1.97.1 test --release -p motorsport-telemetry --test road_atlanta_verify -- --ignored
+```
+
+For a fresh recursive scan, `motorsport-telemetry verify --json <directory>`
+emits one result per candidate, including failures. `--track`, `--layout`,
+`--min-lap`, `--max-lap`, `--max-speed` and `--corridor` control the track
+checks. The default mixed-track scan uses a permissive atlas physical lower
+bound and no upper lap-time cutoff; a default atlas layout does not establish
+the recording's actual configuration.
