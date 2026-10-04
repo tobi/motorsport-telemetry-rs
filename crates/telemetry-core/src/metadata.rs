@@ -29,7 +29,7 @@ const GPS_UNIX_EPOCH_MS: u64 = 315_964_800_000;
 
 /// What a lap interval is, once stints are known.
 ///
-/// A vendor lap counter is really a *stint* lap counter: an AiM dash resets
+/// A vendor lap counter is really a *stint* lap counter: an `AiM` dash resets
 /// `Lap_Number` to 0 when the car stops in the pits, a Cosworth logger keeps
 /// counting across a stop, a power-cycled logger starts again at 1. The
 /// intervals between crossings are therefore not all laps of the same kind,
@@ -61,30 +61,30 @@ impl LapKind {
     /// Stable lowercase token used in labels and on disk.
     pub fn as_str(self) -> &'static str {
         match self {
-            LapKind::Unknown => "unknown",
-            LapKind::Flying => "flying",
-            LapKind::Out => "out",
-            LapKind::In => "in",
-            LapKind::OutIn => "out-in",
-            LapKind::Pit => "pit",
+            Self::Unknown => "unknown",
+            Self::Flying => "flying",
+            Self::Out => "out",
+            Self::In => "in",
+            Self::OutIn => "out-in",
+            Self::Pit => "pit",
         }
     }
 
     /// Inverse of [`Self::as_str`]; anything else is [`LapKind::Unknown`].
-    pub fn parse(token: &str) -> LapKind {
+    pub fn parse(token: &str) -> Self {
         match token {
-            "flying" => LapKind::Flying,
-            "out" => LapKind::Out,
-            "in" => LapKind::In,
-            "out-in" => LapKind::OutIn,
-            "pit" => LapKind::Pit,
-            _ => LapKind::Unknown,
+            "flying" => Self::Flying,
+            "out" => Self::Out,
+            "in" => Self::In,
+            "out-in" => Self::OutIn,
+            "pit" => Self::Pit,
+            _ => Self::Unknown,
         }
     }
 
     /// True for a complete beacon-to-beacon lap without a stop.
     pub fn is_flying(self) -> bool {
-        self == LapKind::Flying
+        self == Self::Flying
     }
 }
 
@@ -96,7 +96,7 @@ impl LapKind {
 /// The vendor counter's value lives in `stint_lap`; the stint index in
 /// `stint`; the normalised role in `kind`; and [`Self::label`] renders the
 /// three as one human string (`S2 L3`, `S1 in`).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LapMetadata {
     /// Virtual session lap number (1-based, monotonic across stints). Zero
     /// only on a lap that has not been through [`read_source_metadata`].
@@ -125,7 +125,7 @@ impl LapMetadata {
     /// A lap with only its interval known; stint, kind and virtual number
     /// are filled in by [`read_source_metadata`].
     pub fn interval(number: i64, start_ns: u64, end_ns: u64, complete: bool) -> Self {
-        LapMetadata {
+        Self {
             number,
             start_ns,
             end_ns,
@@ -145,18 +145,17 @@ impl LapMetadata {
     pub fn label(&self) -> String {
         let stint = self.stint.max(1);
         match self.kind {
-            LapKind::Flying => format!("S{stint} L{}", self.stint_lap),
+            LapKind::Flying | LapKind::Unknown => format!("S{stint} L{}", self.stint_lap),
             LapKind::Out => format!("S{stint} out"),
             LapKind::In => format!("S{stint} in"),
             LapKind::OutIn => format!("S{stint} out-in"),
             LapKind::Pit => format!("S{stint} pit L{}", self.stint_lap),
-            LapKind::Unknown => format!("S{stint} L{}", self.stint_lap),
         }
     }
 }
 
 /// Authoritative lap information supplied directly by a source format.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceLapMetadata {
     /// Known lap intervals in file-relative time.
     pub laps: Vec<LapMetadata>,
@@ -165,7 +164,7 @@ pub struct SourceLapMetadata {
 }
 
 /// A contiguous interval attributed to one internal driver identifier.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverStint {
     /// Format-specific numeric driver identifier.
     pub driver_id: i64,
@@ -238,7 +237,7 @@ pub struct VideoReference {
 }
 
 /// Format-neutral summary derived for one telemetry file.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMetadata {
     /// Source path or caller-supplied name.
     pub path: String,
@@ -250,8 +249,6 @@ pub struct FileMetadata {
     /// Path of the original recording as seen at first conversion. Equals
     /// [`Self::path`] when the file is itself the origin.
     pub source_path: String,
-    /// `.telemetry` catalog version. Absent on vendor source files.
-    pub format_version: Option<u16>,
     /// Processing passes applied to this file, in application order.
     ///
     /// Empty on raw vendor files and raw conversions. Every listed pass only
@@ -309,7 +306,7 @@ pub struct FileMetadata {
 }
 
 /// Metadata merged across files that belong to one recording session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetadata {
     /// Unique derived key for this grouped session.
     pub session_key: String,
@@ -485,8 +482,7 @@ fn derive_clock(source: &dyn TelemetrySource, hash: u64) -> ClockInfo {
 /// authoritative one. Ties are broken by the last occurrence so the corrected
 /// week wins over the startup artifact.
 fn dominant_gps_week(source: &dyn TelemetrySource, week_index: usize) -> Option<u64> {
-    let mut tally: std::collections::BTreeMap<u64, (usize, usize)> =
-        std::collections::BTreeMap::new();
+    let mut tally: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
     for (position, (_, value)) in samples(source, week_index).into_iter().enumerate() {
         if let Some(week) = finite_u64(value) {
             let entry = tally.entry(week).or_insert((0, 0));
@@ -604,18 +600,18 @@ fn video_summary(source: &dyn TelemetrySource) -> (Option<u64>, Option<i128>, Ve
 
 /// Stable FNV-1a of lowercased channel names, raw units, and sample-type codes.
 pub fn schema_hash(source: &dyn TelemetrySource) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for channel in source.channels() {
         for byte in channel.name.bytes().map(|byte| byte.to_ascii_lowercase()) {
             hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
         for byte in channel.unit.bytes().map(|byte| byte.to_ascii_lowercase()) {
             hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
         hash ^= u64::from(channel.sample_type.code());
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
 }
@@ -637,17 +633,16 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
     let (driver_ids, driver_stints) = driver_stints(source, duration_ns);
 
     let authoritative = laps::authoritative_laps(source);
-    let (counter_laps, counter_crossings, timer_laps, snap_window_ns) = match &authoritative {
-        Some(_) => (Vec::new(), 0, Vec::new(), 0),
-        None => {
-            let (index, counter_laps, crossings) = laps::counter_laps(source, duration_ns);
-            let timer_laps = laps::timer_reset_laps(source, duration_ns, index);
-            let snap_window_ns = laps::snap_window_ns(
-                laps::channel_period_ns(source, index),
-                laps::channel_period_ns(source, laps::timer_channel(source)),
-            );
-            (counter_laps, crossings, timer_laps, snap_window_ns)
-        }
+    let (counter_laps, counter_crossings, timer_laps, snap_window_ns) = if authoritative.is_some() {
+        (Vec::new(), 0, Vec::new(), 0)
+    } else {
+        let (index, counter_laps, crossings) = laps::counter_laps(source, duration_ns);
+        let timer_laps = laps::timer_reset_laps(source, duration_ns, index);
+        let snap_window_ns = laps::snap_window_ns(
+            laps::channel_period_ns(source, index),
+            laps::channel_period_ns(source, laps::timer_channel(source)),
+        );
+        (counter_laps, crossings, timer_laps, snap_window_ns)
     };
     let mut laps = laps::pick_laps(
         authoritative.as_ref(),
@@ -694,7 +689,6 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
             .sum(),
         duration_ns,
         schema_hash: hash,
-        format_version: None,
         session_key: clock.session_key,
         absolute_clock: clock.clock,
         absolute_start_ns: clock.start_ns,
@@ -758,8 +752,8 @@ pub fn group_sessions(files: &[FileMetadata], max_gap_ns: u64) -> Vec<SessionMet
                         .zip(file.absolute_start_ns)
                         .is_some_and(|(end, start)| start <= end.saturating_add(max_gap_ns))
             });
-        if joins_previous {
-            groups.last_mut().unwrap().push(index);
+        if let Some(group) = groups.last_mut().filter(|_| joins_previous) {
+            group.push(index);
         } else {
             groups.push(vec![index]);
         }
@@ -1097,7 +1091,7 @@ mod tests {
         // Cosworth `Global Time`: Unix seconds at 1 Hz, first sample 5 s into
         // the file. The wall clock at t = 0 is therefore five seconds earlier.
         let first = 1_737_644_480.0; // 2025-01-23T15:01:20Z
-        let values: Vec<f64> = (0..20).map(|i| first + i as f64).collect();
+        let values: Vec<f64> = (0..20).map(|i| first + f64::from(i)).collect();
         let source = NoClock(with_clock_channel("Global Time", values));
         let metadata = read_source_metadata(&source);
         assert_eq!(metadata.absolute_clock.as_deref(), Some("utc"));
@@ -1117,11 +1111,13 @@ mod tests {
     fn a_counter_that_is_not_wall_time_is_not_a_clock() {
         // Plausible magnitude but advancing ten seconds per sample: that is
         // not a clock running alongside the timeline.
-        let values: Vec<f64> = (0..20).map(|i| 1_737_644_480.0 + 10.0 * i as f64).collect();
+        let values: Vec<f64> = (0..20)
+            .map(|i| 1_737_644_480.0 + 10.0 * f64::from(i))
+            .collect();
         let racing = NoClock(with_clock_channel("Global Time", values));
         assert_eq!(read_source_metadata(&racing).absolute_clock, None);
         // Right rate, impossible date.
-        let values: Vec<f64> = (0..20).map(|i| 12_345.0 + i as f64).collect();
+        let values: Vec<f64> = (0..20).map(|i| 12_345.0 + f64::from(i)).collect();
         let early = NoClock(with_clock_channel("Global Time", values));
         assert_eq!(read_source_metadata(&early).absolute_clock, None);
     }
@@ -1389,7 +1385,7 @@ mod tests {
         }
     }
 
-    /// Indianapolis 2026 test, CT3 Run2 (AiM SmartyCam `.MP4.telemetry`):
+    /// Indianapolis 2026 test, CT3 Run2 (`AiM` `SmartyCam` `.MP4.telemetry`):
     /// `Lap_Number` ran 1,2,3,4 then dropped to 0 when the car stopped in
     /// the pit box (t = 264 s), climbed 1..5 in the second stint and dropped
     /// to 0 again at the end; `Current_Lap_Time` reset at every beacon *and*
@@ -1540,7 +1536,6 @@ mod tests {
         let mut speed = Vec::new();
         for t in 0..60u32 {
             lap_number.push(match t {
-                0..=9 => 1.0,
                 10..=19 => 2.0,
                 20..=39 => 3.0,
                 40..=49 => 0.0, // dash reset after the stop

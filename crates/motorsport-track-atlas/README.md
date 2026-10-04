@@ -10,7 +10,7 @@ assert_eq!(matched.track.slug, "road-america");
 assert_eq!(matched.layout.length_m, Some(6514.0));
 ```
 
-Each layout exposes official length, direction, embedded centerline GeoJSON,
+Each layout exposes official length, direction, embedded centerline `GeoJSON`,
 point layers such as corners/start-finish/pit markers, and range layers such as
 timing sectors and complexes. Each facility also carries its IANA timezone
 (`timezone_for_venue("Sebring")` → `America/New_York`).
@@ -23,4 +23,4 @@ python scripts/update_track_atlas.py /path/to/track-atlas
 ```
 
 See the workspace [attribution notice](https://github.com/tobi/motorsport-telemetry-rs/blob/master/ATTRIBUTION.md)
-for ODbL and upstream data attribution.
+for `ODbL` and upstream data attribution.

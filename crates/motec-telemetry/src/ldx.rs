@@ -1,4 +1,4 @@
-//! MoTeC LDX sidecar generation.
+//! `MoTeC` LDX sidecar generation.
 //!
 //! LDX is XML metadata beside an LD recording.  The LD remains self-contained,
 //! but i2 uses the sidecar for beacon/lap markers and session details.
@@ -8,10 +8,11 @@ use crate::{invalid, MotecError};
 use motorsport_telemetry_core::{Diagnostic, LapMetadata, SourceLapMetadata, TelemetrySource};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
+use std::fmt::Write;
 
 const MIN_MARKER_SPACING_NS: u64 = 5_000_000_000;
 
-/// Lap details read from a companion MoTeC LDX file.
+/// Lap details read from a companion `MoTeC` LDX file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LdxMetadata {
     /// Beacon marker times relative to the LD recording.
@@ -117,7 +118,7 @@ fn lap_time_ns(value: &str) -> Option<u64> {
         .checked_add((seconds * 1e9).round() as u64)
 }
 
-/// Parses a MoTeC LDX sidecar without reading the companion LD payload.
+/// Parses a `MoTeC` LDX sidecar without reading the companion LD payload.
 pub fn parse_motec_ldx_bytes(
     path: impl Into<String>,
     data: &[u8],
@@ -341,11 +342,12 @@ fn lap_time(seconds: f64) -> String {
 }
 
 fn detail(out: &mut String, id: &str, value: &str) {
-    out.push_str(&format!(
-        "   <String Id=\"{}\" Value=\"{}\"/>\n",
+    let _ = writeln!(
+        out,
+        "   <String Id=\"{}\" Value=\"{}\"/>",
         xml(id),
         xml(value)
-    ));
+    );
 }
 
 /// Build the companion LDX XML.  Unknown details are left empty rather than
@@ -362,10 +364,10 @@ pub fn write_motec_ldx_bytes(source: &dyn TelemetrySource, metadata: &MotecMetad
         for (index, time_ns) in markers.times_ns.iter().enumerate() {
             // LDX beacon time is expressed in microseconds.
             let time_us = *time_ns as f64 / 1_000.0;
-            out.push_str(&format!(
-                "     <Marker Version=\"100\" ClassName=\"BCN\" Name=\"Manual.{}\" Flags=\"77\" Time=\"{time_us:.17e}\"/>\n",
+            let _ = writeln!(out,
+                "     <Marker Version=\"100\" ClassName=\"BCN\" Name=\"Manual.{}\" Flags=\"77\" Time=\"{time_us:.17e}\"/>",
                 index + 1
-            ));
+            );
         }
         out.push_str("    </MarkerGroup>\n   </MarkerBlock>\n");
     }
@@ -380,11 +382,12 @@ pub fn write_motec_ldx_bytes(source: &dyn TelemetrySource, metadata: &MotecMetad
     detail(&mut out, "Session", &metadata.session);
     detail(&mut out, "Short Comment", &metadata.short_comment);
     detail(&mut out, "Long Comment", &metadata.event_comment);
-    out.push_str(&format!(
-        "   <DateTime Id=\"Log Date\" Value=\"{}\"/>\n   <DateTime Id=\"Log Time\" Value=\"{}\"/>\n",
+    let _ =
+        writeln!(out,
+        "   <DateTime Id=\"Log Date\" Value=\"{}\"/>\n   <DateTime Id=\"Log Time\" Value=\"{}\"/>",
         xml(&metadata.date),
         xml(&metadata.time)
-    ));
+    );
     if let Some(markers) = &markers {
         let (total_laps, fastest) = lap_summary(&markers.times_ns);
         detail(&mut out, "Total Laps", &total_laps.to_string());
@@ -413,7 +416,7 @@ mod tests {
     }
 
     impl TelemetrySource for Source {
-        fn path(&self) -> &str {
+        fn path(&self) -> &'static str {
             "laps.pds"
         }
         fn format(&self) -> &'static str {

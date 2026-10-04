@@ -1,5 +1,18 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::unreadable_literal,
+        clippy::float_cmp,
+        reason = "unit tests: fail loudly, print freely, exact fixture values"
+    )
+)]
 
 #[cfg(not(target_os = "emscripten"))]
 use std::path::Path;
@@ -228,6 +241,10 @@ fn plausible_channel_name(name: &str) -> bool {
 
 /// Share of the definition region that is zero bytes, for the truncated /
 /// unindexed diagnostic. `None` when the region is empty or out of bounds.
+#[allow(
+    clippy::naive_bytecount,
+    reason = "short metadata probe does not justify a separate byte-counting dependency"
+)]
 fn zero_fraction(data: &[u8], start: usize, end: usize) -> Option<f64> {
     let end = end.min(data.len());
     if start >= end {
@@ -258,8 +275,8 @@ fn entry_at(data: &[u8], base: usize) -> Option<DirEntry> {
     if base + 32 > data.len() {
         return None;
     }
-    let lo = u32le(data, base)? as u64;
-    let hi = u32le(data, base + 4)? as u64;
+    let lo = u64::from(u32le(data, base)?);
+    let hi = u64::from(u32le(data, base + 4)?);
     Some(DirEntry {
         offset: lo | hi << 32,
         count: u32le(data, base + 8)?,
@@ -547,8 +564,7 @@ fn marker_defs(data: &[u8], layout: Layout) -> ParsedDefs<'_> {
     let record_size = ((first + 16)..probe_end.saturating_sub(7))
         .step_by(2)
         .find(|&pos| u64le(data, pos) == Some(MARKER))
-        .map(|pos| pos - first)
-        .unwrap_or(304);
+        .map_or(304, |pos| pos - first);
     if record_size < 0xdc {
         return empty;
     }
@@ -852,8 +868,8 @@ fn parse_chunks(data: &[u8], layout: Layout, is_export: bool) -> Vec<RawChunk> {
             let channel_id = u32le(data, pos + 4).unwrap_or(0);
             let duplicate = u32le(data, pos + 8).unwrap_or(u32::MAX);
             let period = u32le(data, pos + 0x18).unwrap_or(0);
-            let count = u32le(data, pos + 0x1c).unwrap_or(0) as u64;
-            let ptr = u32le(data, pos + 0x38).unwrap_or(u32::MAX) as u64;
+            let count = u64::from(u32le(data, pos + 0x1c).unwrap_or(0));
+            let ptr = u64::from(u32le(data, pos + 0x38).unwrap_or(u32::MAX));
             if channel_id == duplicate
                 && (channel_id > 0 || is_export)
                 && period > 0
@@ -884,8 +900,8 @@ fn parse_chunks(data: &[u8], layout: Layout, is_export: bool) -> Vec<RawChunk> {
             break;
         }
         let period = u32le(data, pos + 0x18).unwrap_or(0);
-        let count = u32le(data, pos + 0x1c).unwrap_or(0) as u64;
-        let ptr = u32le(data, pos + 0x38).unwrap_or(0) as u64;
+        let count = u64::from(u32le(data, pos + 0x1c).unwrap_or(0));
+        let ptr = u64::from(u32le(data, pos + 0x38).unwrap_or(0));
         if period > 0 && count > 0 && ptr > 0 && ptr < data.len() as u64 {
             out.push(RawChunk {
                 channel_id: (i % layout.defs_count.max(1)) as u32,
@@ -1090,7 +1106,7 @@ impl CosworthFile {
                 empty_chunks += 1;
                 continue;
             }
-            let period_ns = raw.sample_period_ticks as u64 * TICK_NS;
+            let period_ns = u64::from(raw.sample_period_ticks) * TICK_NS;
             let time_base_ns = if stamped {
                 let placed = (raw.start_ticks - origin_ticks).saturating_mul(TICK_NS);
                 if !channel.chunks.is_empty() && placed > channel.duration_ns {
@@ -1568,13 +1584,13 @@ mod tests {
         );
     }
 
-    /// Indianapolis 2025 test, CT3 Run007B (`250907110047_…_ST_MQ12Di_LMP2
+    /// Indianapolis 2025 test, CT3 `Run007B` (`250907110047_…_ST_MQ12Di_LMP2
     /// #443.pds`, 21.3 MB): the directory at 0x80 is intact and names 1,021
     /// definitions and 2,315 chunks, the sample area holds 20 MB of data, but
     /// the 310 KB definition region is 53 % zero bytes and the rest is int16
     /// sample data (`10 27` = 10000, `33 33` ≈ 13107 runs) while the chunk
     /// table is all zeros — the directory was written but the index blocks
-    /// it points at never were. The sibling Run007A from the same logger 20
+    /// it points at never were. The sibling `Run007A` from the same logger 20
     /// minutes earlier has `72 7c` marker-framed UTF-16 records there, so the
     /// encoding is not in doubt. Read as UTF-16, B's region decodes to runs of
     /// U+2710 and a soup of halfwidth/fullwidth forms, with two records that
@@ -1606,7 +1622,7 @@ mod tests {
                     .chunks_exact_mut(2)
                     .for_each(|b| b.copy_from_slice(&[0x10, 0x27])),
                 2 => record.iter_mut().enumerate().for_each(|(i, b)| {
-                    *b = [0x38, 0xff, 0x64, 0x00, 0xdc, 0xff, 0xd4, 0xfb][i % 8]
+                    *b = [0x38, 0xff, 0x64, 0x00, 0xdc, 0xff, 0xd4, 0xfb][i % 8];
                 }),
                 _ => {}
             }

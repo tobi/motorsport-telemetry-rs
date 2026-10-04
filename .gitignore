@@ -11,6 +11,7 @@ __pycache__/
 *.ldx
 *.vbo
 *.mp4
+!/tests/fixtures/synthetic_aimd_delayed_gps.mp4
 !/tests/fixtures/synthetic_motec_multilap.ld
 !/tests/fixtures/synthetic_motec_multilap.ldx
 

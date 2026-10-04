@@ -5,32 +5,23 @@ channel model. The writer-strict JSON Schema is
 [`telemetry.schema.json`](telemetry.schema.json). The normative JSONL MUST
 rules are [`crates/telemetry-format/JSONL.md`](crates/telemetry-format/JSONL.md).
 
-There are two encodings of the **same** recording model:
+A recording is an MTJ JSONL document. `.telemetry` and
+`.telemetry.jsonl.zstd` contain the same document in one zstd frame; the
+short name is the default destination. Readers detect compression by
+content. MTX sidecars are separate JSONL documents joined with
+`JsonlRecording::attach`.
 
-| Encoding | Name | Role |
-|---|---|---|
-| JSONL | MTJ / MTX | The recording format. A `.telemetry` file **is** an MTJ document in one zstd frame. Sidecars exist only here. |
-| STORE zip + FlatBuffers | legacy `.telemetry` | Earlier native archive. Still read and migrated; written only on request (`convert --native-zip`). |
-
-`.telemetry` and `.telemetry.jsonl.zstd` are the same bytes; the short name
-is the default destination. Readers tell the two `.telemetry` containers
-apart by content: `28 B5 2F FD` (zstd) or `{` is MTJ, `PK 03 04` is the
-legacy zip. Nothing is decided from the file name. An MTX sidecar is never
-a zip member; join it onto an MTJ host with `JsonlRecording::attach`.
-
-Trade-off accepted with the switch: MTJ lays every channel on a single
-`hz`/`t0` lattice (a sample moves at most half a period) and drops
-irregular event streams; the legacy zip kept native integer columns and
-per-sample stamps. Header-only reads of a legacy zip (`metadata.fb`) stay
-O(1); the MTJ header is the first line but the file must be decompressed
-to reach it.
+MTJ aligns samples to each channel's `hz`/`t0` lattice and rounds values.
+Irregular event streams are omitted. Keep the original vendor recording
+when the exact source encoding or irregular samples are needed.
+Header-only reads stream decompression through the header and laps lines;
+they never parse channel values in current recordings.
 
 ## Files
 
 | Kind | Preferred name | First line |
 |---|---|---|
 | Recording (default) | `Name.telemetry` | zstd frame `28 B5 2F FD` wrapping `{"mtj":1,...}` |
-| Legacy native archive | `Name.telemetry` | zip local header `PK 03 04`, first member `metadata.fb` |
 | Recording | `Name.telemetry.jsonl` or `.zstd` | `{"mtj":1,...}` |
 | Sidecar | `Name.telemetry.ext.jsonl` or `.zstd` | `{"mtx":1,...}` |
 
@@ -78,25 +69,17 @@ No per-sample timestamps. Unaligned streams are omitted, not stored as
 
 ## Shared channel model
 
-These capabilities exist in **both** MTJ and `.telemetry` catalog v9:
-
-| Feature | JSONL | Native catalog |
-|---|---|---|
-| Sample channel `n` `hz` `u` `v` `t0` | yes | yes (`v` is a typed column) |
-| Visibility | `vis` | V(26) u8 per channel (v5) |
-| Plot class | `plt` | V(29) u8 (v7) |
-| Display scale | `sc` | V(29) f64le min/max (v7) |
-| Rounding | `rnd` `fmt` | V(29) u8 + string (v7) |
-| Trace comments | `lbl` | V(28) (v6). Trace only. |
-| Spans + string / `timespan_ms` meta | `k:"s"` | V(27) (v5 strings, v8 typed ms) |
-| `utc` + IANA `tz` | header | V(23–25) (v4) |
-| Video linkage (offset, file refs + BLAKE3, frame table) | `vo` `vf` `vpts` | V(20–22) + `video_frames.bin` |
-| Pass provenance + origin | `passes` `src` `srcp` | V(6, 7, 30) (v9) |
-
-Native-only (not in JSONL): integer encodings, scale/bias, event time
-columns, driver-stint lists.
-
-JSONL-only: MTX sidecar files, lattice `q`/`o`, group chrome `r`, attach.
+| Feature | JSONL keys |
+|---|---|
+| Sample channel | `n` `hz` `u` `v` `t0` |
+| Visibility | `vis` |
+| Plot class and display | `plt` `sc` `rnd` `fmt` |
+| Trace comments | `lbl` |
+| Spans and typed metadata | `k:"s"` `p` `m` |
+| UTC placement | `utc` `tz` |
+| Video linkage | `vo` `vf` `vpts` |
+| Pass provenance and origin | `passes` `src` `srcp` |
+| Sidecar groups | `mtx` `n` `vis` `r` |
 
 `fmt` has **no whitespace** and is at most 16 characters: `0.0°C`, `000`,
 `000%`, `0°`. Never `0.0 °C`.
@@ -205,112 +188,12 @@ Validate:
 python3 crates/telemetry-format/scripts/validate-mtx.py PATH.telemetry.ext.jsonl
 ```
 
-## Legacy native `.telemetry` memory layout
-
-Still readable; no longer written by default (`convert --native-zip`).
-A **STORE** zip (compression method 0). CRC-32 of each member. Each
-payload starts on a **64-byte** boundary (padding lives in the extra
-field of the local header). First member **must** be `metadata.fb`.
-
-```
-metadata.fb                 FlatBuffers catalog
-video_frames.bin            optional; u64le presentation times, one per frame
-channels/0000.bin           native samples for channel 0
-channels/0001.bin
-channels/0001.time.bin      only if catalog kind=1 (event / irregular)
-```
-
-### `metadata.fb` root table
-
-Field index `N` is FlatBuffers vtable slot `V(N) = 4 + 2N`.
-
-| N | Type | Content |
-|---|---|---|
-| 0 | u16 | `FORMAT_VERSION` (current **10**) |
-| 1 | table | Identity: V(0..6) driver, vehicle, venue, event, session, date, time |
-| 3 | `[u8]` | Packed laps |
-| 4 | `[u8]` | Packed channel metadata |
-| 6 | string | `source_format` (`pds`, `motec`, …) |
-| 7 | string | `source_path` |
-| 8 | u64 | schema hash |
-| 9 | u64 | `duration_ns` |
-| 10 | u64 | `sample_count` |
-| 11 | u32 | `channel_count` |
-| 12 | u32 | `sampled_channel_count` |
-| 13 | u32 | `valid_laps` |
-| 14 | string | comment |
-| 15 | string | session hint |
-| 16 | `[u8]` | Packed driver stints |
-| 17–19 | string, u64, u64 | optional vendor clock name / start / end |
-| 20 | `[u8]` | Packed video handles |
-| 21–22 | u32, i64 | presentation offset present + ns |
-| 23–24 | u32, u64 | `utc_start_ns` present + value (v4) |
-| 25 | string | IANA `timezone` (v4) |
-| 26 | `[u8]` | per-channel visibility (v5) |
-| 27 | `[u8]` | packed spans (v5) |
-| 28 | `[u8]` | packed labels (v6) |
-| 29 | `[u8]` | packed display (v7) |
-| 30 | `[u8]` | packed pass provenance (v9) |
-
-`pack_string` = `u32le` UTF-8 length + bytes. All multi-byte integers
-little-endian.
-
-**Laps (V(3))** — `u32 count`, then each: `i64 number`, `u64 start`,
-`u64 end`, `u64 duration`, `u8 complete`. If version ≥ 3: `u8` present
-and optional `u64 first_video_frame`.
-
-**Channels (V(4))** — `u32 count`, then each: `u32 id`, name, member,
-time_member, unit_raw, unit_canonical, `u8 unit_source`, `u8 dimension`,
-`u8 sample_type`, `u8 uses_step`, `u8 kind`, `f64 scale`, `f64 bias`,
-`u64 sample_count`, `u64 duration_ns`, `u32 chunk_count`, then each chunk
-`u64 period`, `u64 count`, `u64 sample_base`, `u64 time_base_ns`.
-
-`kind` 0 = regular column, 1 = event (has `.time.bin`). `unit_source` 0
-`unknown, 1 declared, 2 spec default. `sample_type` 0 i8, 1 u8, 2 i16, 3 u16,
-4 i32, 5 u32, 6 f32, 7 f64.
-
-**Stints (V(16))** — `u32 count`, then `i64 driver_id`, `u64 start`,
-`u64 end`.
-
-**Videos (V(20))** — `u32 count`, then filename, `u32 index`, `u8` hashed
-+ optional 32-byte BLAKE3, `u64 frame_count`. If version ≥ 3: `u8` present
-+ optional `i64 presentation_offset_ns`.
-
-**Visibility (V(26))** — one `u8` per channel, 1 = shown.
-
-**Spans (V(27))** — `u32 count`, then name, `u64 s`, `u64 e`, `u8 vis`,
-color, title, subtitle, `u32 meta_count`, then each pair: name,
-`u8 kind` (v8: `0` text + `pack_string`, `1` `timespan_ms` + `u32le` ms).
-v5–v7 stored two strings; a racing-time string is reread as `timespan_ms`.
-
-**Labels (V(28))** — `u32 channel_count`, then per channel `u32 n` and
-`n × (u64 time_ns, pack_string text)`.
-
-**Display (V(29))** — `u32 channel_count`, then per channel: `u8 plot`
-(0 trace, 1 gauge, 2 compass), `u8 flags` (bit0 min, bit1 max, bit2 rnd,
-bit3 fmt), optional `f64` min, `f64` max, `u8` decimals, `pack_string` fmt.
-
-**Passes (V(30))** — `u32 count`, then per applied pass: name, `u32
-version`, `u32 param_count` × (key, value), `u32 input_count` × channel
-name, `u32 output_count` × channel name. Strings are `pack_string`.
-Records which processing passes produced which derived channels; the
-v8 → v9 migration leaves it empty rather than inventing provenance.
-
-**Sample column** — `channels/NNNN.bin` is `sample_count × byte_width`
-native values, chunk after chunk, no per-sample timestamps. Decode
-`raw * scale + bias`. Event channels add `channels/NNNN.time.bin` as
-`u64le` file-relative ns per sample.
-
-`NativeRecording::open` rewrites a writable older catalog in place.
-Header-only reads do not. Migration never invents missing payload.
-
 ## Schema
 
 [`telemetry.schema.json`](telemetry.schema.json) is the single writer-strict
 schema. Every defined object is `additionalProperties: false`. Each `$defs`
 entry has `description`, `examples` of how to write the property, and
-`minLength` / `maxLength` on every string. `$comment` states the JSONL key
-and the FlatBuffers slot / packed layout. Readers still ignore unknown keys
+`minLength` / `maxLength` on every string. `$comment` explains the JSONL key. Readers still ignore unknown keys
 so old v1 JSONL clients can skip `plt` / `lbl` / `utc`.
 
 `$defs.mtj_header` `laps` `channel` `span` `mtx_header` are the line

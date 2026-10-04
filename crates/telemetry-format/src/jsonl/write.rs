@@ -3,7 +3,7 @@
 use super::align::{collect_aligned, gcd, snap_laps, snap_spans, snap_up, AlignedSeries};
 use super::json::invalid;
 use super::{
-    valid_iana_timezone, zstd_err, HeaderChrome, JsonlRecording, SidecarHeader, DEFAULT_QUANTUM_NS,
+    valid_iana_timezone, HeaderChrome, JsonlRecording, SidecarHeader, DEFAULT_QUANTUM_NS,
     JSONL_EXT_VERSION, JSONL_VERSION, JSONL_ZSTD_LEVEL,
 };
 use crate::write::TelemetryFormatError;
@@ -36,17 +36,9 @@ pub fn write_jsonl_from_source_with(
     dest: impl AsRef<Path>,
     compress: bool,
 ) -> Result<(), TelemetryFormatError> {
-    let dest = dest.as_ref();
-    let file = File::create(dest).map_err(TelemetryFormatError::from)?;
-    if compress {
-        let mut encoder =
-            zstd::Encoder::new(BufWriter::new(file), JSONL_ZSTD_LEVEL).map_err(zstd_err)?;
-        write_jsonl_document(source, &mut encoder, false)?;
-        encoder.finish().map_err(zstd_err)?;
-        Ok(())
-    } else {
-        write_jsonl_document(source, BufWriter::new(file), false)
-    }
+    write_file(dest.as_ref(), compress, |writer| {
+        write_jsonl_document(source, writer, false)
+    })
 }
 /// Writes an MTX extension from any [`TelemetrySource`].
 ///
@@ -65,17 +57,9 @@ pub fn write_jsonl_extension_from_source_with(
     dest: impl AsRef<Path>,
     compress: bool,
 ) -> Result<(), TelemetryFormatError> {
-    let dest = dest.as_ref();
-    let file = File::create(dest).map_err(TelemetryFormatError::from)?;
-    if compress {
-        let mut encoder =
-            zstd::Encoder::new(BufWriter::new(file), JSONL_ZSTD_LEVEL).map_err(zstd_err)?;
-        write_jsonl_document(source, &mut encoder, true)?;
-        encoder.finish().map_err(zstd_err)?;
-        Ok(())
-    } else {
-        write_jsonl_document(source, BufWriter::new(file), true)
-    }
+    write_file(dest.as_ref(), compress, |writer| {
+        write_jsonl_document(source, writer, true)
+    })
 }
 /// Writes an MTX sidecar of spans (no sample channels).
 ///
@@ -127,18 +111,28 @@ pub fn write_jsonl_timeline_with(
     if dur % quantum_ns != 0 {
         dur = snap_up(dur, quantum_ns)?;
     }
-    let dest = dest.as_ref();
-    let file = File::create(dest).map_err(TelemetryFormatError::from)?;
-    if compress {
-        let mut encoder =
-            zstd::Encoder::new(BufWriter::new(file), JSONL_ZSTD_LEVEL).map_err(zstd_err)?;
-        write_timeline_document(&mut encoder, header, quantum_ns, dur, &spans)?;
-        encoder.finish().map_err(zstd_err)?;
-        Ok(())
-    } else {
-        write_timeline_document(BufWriter::new(file), header, quantum_ns, dur, &spans)
-    }
+    write_file(dest.as_ref(), compress, |writer| {
+        write_timeline_document(writer, header, quantum_ns, dur, &spans)
+    })
 }
+
+fn write_file(
+    dest: &Path,
+    compress: bool,
+    write_document: impl FnOnce(&mut dyn Write) -> Result<(), TelemetryFormatError>,
+) -> Result<(), TelemetryFormatError> {
+    let mut writer = BufWriter::new(File::create(dest)?);
+    if compress {
+        let mut encoder = zstd::Encoder::new(writer, JSONL_ZSTD_LEVEL)?;
+        write_document(&mut encoder)?;
+        writer = encoder.finish()?;
+    } else {
+        write_document(&mut writer)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 fn write_timeline_document(
     mut writer: impl Write,
     header: &SidecarHeader,
@@ -169,7 +163,7 @@ pub(super) fn write_jsonl_document(
 ) -> Result<(), TelemetryFormatError> {
     let mut metadata = read_source_metadata(source);
     let timezone = motorsport_telemetry_core::placement::resolve_timezone(source);
-    metadata.timezone = timezone.clone();
+    metadata.timezone.clone_from(&timezone);
     metadata.utc_start_ns = source
         .utc_start_ns()
         .or_else(|| motorsport_telemetry_core::placement::utc_from_metadata(&metadata, &timezone));
@@ -459,9 +453,7 @@ fn write_passes(
 }
 /// Writes the optional video-linkage header keys: `vo` (recording-level
 /// presentation offset), `vf` (linked video files), and `vpts` (the
-/// presentation-order frame timestamp table). Uses the same
-/// [`crate::write::linked_videos`] collection as the native catalog so both
-/// formats stamp identical linkage. Sidecar documents never call this: video
+/// presentation-order frame timestamp table). Sidecar documents never call this: video
 /// belongs to the host recording.
 fn write_videos(
     writer: &mut impl Write,
@@ -470,7 +462,7 @@ fn write_videos(
     if let Some(offset) = source.video_presentation_offset_ns() {
         write!(writer, ",\"vo\":{offset}")?;
     }
-    let videos = crate::write::linked_videos(source);
+    let videos = linked_videos(source);
     if videos.is_empty() {
         return Ok(());
     }
@@ -638,6 +630,10 @@ fn write_hz(writer: &mut impl Write, period_ns: u64) -> Result<(), TelemetryForm
     }
     Ok(())
 }
+#[allow(
+    clippy::float_cmp,
+    reason = "exact equality decides whether a shorter numeric encoding preserves the value"
+)]
 pub(super) fn write_number(
     writer: &mut impl Write,
     value: f64,
@@ -658,7 +654,7 @@ pub(super) fn write_number(
         }
     }
     let as_f32 = value as f32;
-    let rendered = if as_f32.is_finite() && as_f32 as f64 == value {
+    let rendered = if as_f32.is_finite() && f64::from(as_f32) == value {
         format!("{as_f32}")
     } else {
         format!("{value}")
@@ -756,7 +752,7 @@ fn write_meta_value(
     match value {
         SpanMetaValue::Text(text) => write_json_string(writer, text),
         SpanMetaValue::TimeMs(ms) => {
-            write!(writer, "{{\"v\":{ms},\"u\":\"{}\"}}", TIMESPAN_MS)?;
+            write!(writer, "{{\"v\":{ms},\"u\":\"{TIMESPAN_MS}\"}}")?;
             Ok(())
         }
     }
@@ -774,7 +770,7 @@ fn sidecar_header_from_source(
     .find(|value| !value.is_empty())
     .cloned()
     .or_else(|| {
-        std::path::Path::new(source.path())
+        Path::new(source.path())
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
     })
@@ -876,8 +872,7 @@ fn write_clock_fields(
 }
 pub(super) fn join_shift_ns(host: &JsonlRecording, ext_utc: u64) -> i128 {
     host.utc_start_ns
-        .map(|host_utc| i128::from(ext_utc) - i128::from(host_utc))
-        .unwrap_or(0)
+        .map_or(0, |host_utc| i128::from(ext_utc) - i128::from(host_utc))
 }
 pub(super) fn shift_channel(
     channel: &Channel,
@@ -937,4 +932,64 @@ fn span_label(span: &Span) -> &str {
     } else {
         "span"
     }
+}
+
+/// Collect video references, hashes, and presentation offsets.
+pub(crate) fn linked_videos(
+    source: &dyn TelemetrySource,
+) -> Vec<motorsport_telemetry_core::VideoFileRef> {
+    let mut videos = hash_videos(source);
+    if let Some(count) = source.video_frame_count() {
+        if let Some(video) = videos.first_mut() {
+            video.frame_count = count;
+        } else if let Some(name) = Path::new(source.path()).file_name() {
+            videos.push(motorsport_telemetry_core::VideoFileRef {
+                filename: name.to_string_lossy().into_owned(),
+                index: 1,
+                blake3: hash_file(Path::new(source.path())),
+                frame_count: count,
+                presentation_offset_ns: source.video_presentation_offset_ns(),
+            });
+        }
+    }
+    let offset = source.video_presentation_offset_ns();
+    for video in &mut videos {
+        if video.presentation_offset_ns.is_none() {
+            video.presentation_offset_ns = offset;
+        }
+    }
+    videos
+}
+
+fn hash_videos(source: &dyn TelemetrySource) -> Vec<motorsport_telemetry_core::VideoFileRef> {
+    let parent = Path::new(source.path()).parent();
+    source
+        .video_files()
+        .iter()
+        .cloned()
+        .map(|mut video| {
+            if video.blake3.is_none() {
+                if let Some(path) = parent.map(|dir| dir.join(&video.filename)) {
+                    if path.is_file() {
+                        video.blake3 = hash_file(&path);
+                    }
+                }
+            }
+            video
+        })
+        .collect()
+}
+
+fn hash_file(path: &Path) -> Option<[u8; 32]> {
+    let mut file = File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Some(*hasher.finalize().as_bytes())
 }

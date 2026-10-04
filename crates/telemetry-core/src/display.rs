@@ -7,7 +7,7 @@ pub enum ChannelPlot {
     /// Comment labels (`lbl`) are allowed only here.
     #[default]
     Trace,
-    /// Temperature, BPM, SpO2, and other scalar foreign signals.
+    /// Temperature, BPM, `SpO2`, and other scalar foreign signals.
     Gauge,
     /// Circular quantities: wind direction, heading. Wraps at 360°.
     Compass,

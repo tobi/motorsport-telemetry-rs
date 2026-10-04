@@ -28,7 +28,7 @@ impl AlignedSeries {
 /// follows the logger's stamps (see `aim_telemetry::period_chunks`), which
 /// means a real recording almost never arrives as one exact lattice. Refusing
 /// such channels — the old behaviour — silently dropped nearly every channel
-/// of an AiM export. Instead every sample is placed in the lattice slot
+/// of an `AiM` export. Instead every sample is placed in the lattice slot
 /// nearest its own timestamp: a sample is never more than half a period from
 /// where the logger put it, a slot nothing landed in is `null`, and when two
 /// samples contend for one slot the earlier one is kept. That is the loss
@@ -100,6 +100,7 @@ fn nearest_slot(time_ns: u64, t0_ns: u64, period_ns: u64) -> Option<u64> {
 /// `100.007870…`. A period that is not close to a millisecond multiple is
 /// kept exactly.
 fn lattice_period_ns(channel: &Channel) -> Option<u64> {
+    const MILLISECOND: u64 = 1_000_000;
     let mut weights: Vec<(u64, u64)> = Vec::new();
     for chunk in &channel.chunks {
         if chunk.sample_period_ns == 0 || chunk.sample_count == 0 {
@@ -116,7 +117,6 @@ fn lattice_period_ns(channel: &Channel) -> Option<u64> {
     let (dominant, _) = weights
         .into_iter()
         .max_by_key(|&(period, weight)| (weight, std::cmp::Reverse(period)))?;
-    const MILLISECOND: u64 = 1_000_000;
     if dominant >= MILLISECOND {
         let rounded = ((dominant + MILLISECOND / 2) / MILLISECOND) * MILLISECOND;
         if rounded > 0 && rounded.abs_diff(dominant) * 50 <= dominant {

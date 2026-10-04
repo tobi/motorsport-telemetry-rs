@@ -1,25 +1,25 @@
 # motorsport-telemetry
 
-Unified facade over AiM MP4, Cosworth PDS, MoTeC LD, Racelogic VBO, and native `.telemetry`.
+Unified facade over `AiM` MP4, Cosworth PDS, `MoTeC` LD, Racelogic VBO, and telemetry JSONL.
 
 It exposes format detection, source-exact channels, normalized signal roles,
-laps, driver stints, multi-file sessions, video references, WGS84 GPS, track
-matching, and invariant lap progress.
+laps, driver stints, multi-file sessions, video references, WGS84 GPS, and
+track-facility lookup.
 
 | Extension | Parser |
 |---:|---|
-| `.mp4` | AiM `aimd` telemetry track |
+| `.mp4` | `AiM` `aimd` telemetry track |
 | `.pds` | Pi/Cosworth PDS |
-| `.ld` | MoTeC LD |
+| `.ld` | `MoTeC` LD |
 | `.vbo` | Racelogic VBOX |
-| `.telemetry` | Native aligned STORE zip |
+| `.telemetry` | Zstd-compressed MTJ JSONL |
 | `.telemetry.jsonl` / `.jsonl` / `.mtj` | Time-aligned MTJ interchange ([JSONL.md](../telemetry-format/JSONL.md)) |
 | `.telemetry.jsonl.zstd` / `.zst` | Same document, one zstd frame |
 
 Selection is case-insensitive and based on the extension. A recognized
 extension with invalid contents returns the underlying parser error.
 
-The crate also installs a fast, mmap-backed metadata command. It reads lap and
+The crate also installs a CLI inspection command. It reads lap and
 driver metadata, event date, video linkage, vehicle identity, GPS, and the
 offline track match without decoding video payloads:
 
@@ -62,7 +62,10 @@ for time_ns in [0, 100_000_000, 200_000_000] {
 
 Normalization is explicit and conservative: unsupported units or unavailable
 signals remain `None`; they are never guessed. The reusable normalizer resolves
-roles and track context once and caches lazily derived lap boundaries.
+roles once and caches lazily derived lap boundaries. `lap_progress` only
+normalizes a source-reported percentage or ratio; missing progress stays
+`None`. Track-progress estimation and cross-lap alignment belong in clients
+such as Omatrack, not this library.
 
 ## Multi-file sessions
 

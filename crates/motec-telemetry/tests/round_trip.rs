@@ -1,6 +1,19 @@
-//! Round-trip fidelity tests: source -> MoTeC LD -> source.
+//! Round-trip fidelity tests: source -> `MoTeC` LD -> source.
 //!
 //! These assert bit-exact recovery of every sample, not approximate equality.
+
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
 
 use motec_telemetry::{
     motec_sidecar_path, write_motec, write_motec_bytes, MotecFile, MotecMetadata, MotecWriteError,
@@ -14,7 +27,7 @@ struct Synthetic {
 }
 
 impl TelemetrySource for Synthetic {
-    fn path(&self) -> &str {
+    fn path(&self) -> &'static str {
         "synthetic"
     }
     fn format(&self) -> &'static str {
@@ -213,7 +226,7 @@ fn every_sample_type_round_trips_at_full_precision() {
             "g",
             SampleType::F32,
             200,
-            vec![0.5, -0.25, 1.0e10, f32::MAX as f64],
+            vec![0.5, -0.25, 1.0e10, f64::from(f32::MAX)],
         ),
         single_chunk(
             7,
@@ -402,7 +415,7 @@ fn refuses_shapes_ld_cannot_represent() {
         channels: vec![Channel {
             id: 1,
             name: "Mixed".into(),
-            unit: "".into(),
+            unit: String::new(),
             unit_source: UnitSource::Unknown,
             sample_type: SampleType::F64,
             chunks: vec![
@@ -436,7 +449,7 @@ fn refuses_shapes_ld_cannot_represent() {
         channels: vec![Channel {
             id: 1,
             name: "Gapped".into(),
-            unit: "".into(),
+            unit: String::new(),
             unit_source: UnitSource::Unknown,
             sample_type: SampleType::F64,
             chunks: vec![
@@ -470,7 +483,7 @@ fn refuses_shapes_ld_cannot_represent() {
         channels: vec![Channel {
             id: 1,
             name: "Odd".into(),
-            unit: "".into(),
+            unit: String::new(),
             unit_source: UnitSource::Unknown,
             sample_type: SampleType::F64,
             chunks: vec![Chunk {
@@ -497,7 +510,7 @@ fn empty_sources_are_rejected() {
         channels: vec![Channel {
             id: 1,
             name: "Nothing".into(),
-            unit: "".into(),
+            unit: String::new(),
             unit_source: UnitSource::Unknown,
             sample_type: SampleType::F64,
             chunks: Vec::new(),

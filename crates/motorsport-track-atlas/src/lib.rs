@@ -1,5 +1,18 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::unreadable_literal,
+        clippy::float_cmp,
+        reason = "unit tests: fail loudly, print freely, exact fixture values"
+    )
+)]
 
 /// One racing layout at a facility.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -14,7 +27,7 @@ pub struct Layout {
     pub direction: Option<&'static str>,
     /// Original compact centerline representation from track-atlas.
     pub centerline: &'static str,
-    /// Centerline as an embedded GeoJSON feature collection.
+    /// Centerline as an embedded `GeoJSON` feature collection.
     pub centerline_geojson: &'static str,
     /// JSON array containing point layers such as corners and start/finish.
     pub point_layers_json: &'static str,

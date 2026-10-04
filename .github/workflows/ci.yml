@@ -19,6 +19,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # validate-mtx.py runs under `uv run --with jsonschema` from a unit test.
+      - uses: astral-sh/setup-uv@v6
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Include example tests (the audit probe has NaN/unit regressions),

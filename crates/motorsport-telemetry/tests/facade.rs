@@ -1,9 +1,22 @@
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use motorsport_telemetry::{
     motorsport_telemetry_core::TelemetrySource, open, open_metadata, open_sessions,
     read_lap_metadata, SourceExt, TelemetryNormalizer,
 };
 use std::path::PathBuf;
-use telemetry_format::{write_from_source, write_jsonl_from_source, write_jsonl_from_source_with};
+use telemetry_format::{write_jsonl_from_source, write_jsonl_from_source_with, write_telemetry};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,6 +41,63 @@ fn detects_every_supported_format_and_normalizes_roles() {
 }
 
 #[test]
+fn delayed_aim_gps_recovers_existing_coordinates_through_jsonl_conversion() {
+    const SECOND_NS: u64 = 1_000_000_000;
+    let source = open(fixture("synthetic_aimd_delayed_gps.mp4")).unwrap();
+    let anchor = source.normalizer().sample(183 * SECOND_NS);
+    assert!((anchor.latitude_deg.unwrap() - 43.8).abs() < 1e-6);
+    assert_eq!(
+        source.normalizer().sample(0).latitude_deg,
+        anchor.latitude_deg
+    );
+    let (passed, _) = telemetry_passes::apply_registry(&source).unwrap();
+    assert_eq!(passed.channels().len(), source.channels().len() + 6);
+    assert_eq!(passed.applied_passes().len(), 3);
+    assert_eq!(passed.applied_passes()[1].version, 2);
+    let normalizer = passed.normalizer();
+    for second in [0, 60, 179, 180, 182, 183, 209] {
+        let sample = normalizer.sample(second * SECOND_NS);
+        assert_eq!(sample.latitude_deg, anchor.latitude_deg);
+        assert_eq!(sample.longitude_deg, anchor.longitude_deg);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("delayed.telemetry");
+    write_telemetry(&passed, &path).unwrap();
+    let recording = open(&path).unwrap();
+    let normalizer = recording.normalizer();
+    for second in [0, 60, 179, 180, 182, 183, 209] {
+        assert_eq!(
+            normalizer.sample(second * SECOND_NS).latitude_deg,
+            anchor.latitude_deg
+        );
+    }
+    assert!(
+        normalizer.sample(220 * SECOND_NS).latitude_deg.unwrap() > anchor.latitude_deg.unwrap()
+    );
+    for second in 230..235 {
+        assert_eq!(normalizer.sample(second * SECOND_NS).latitude_deg, None);
+    }
+    assert!(normalizer.sample(235 * SECOND_NS).latitude_deg.is_some());
+    let fix = recording
+        .channels()
+        .iter()
+        .position(|channel| channel.name == "GPS Fix Type")
+        .unwrap();
+    assert_eq!(recording.sample_at(fix, 0, false), None);
+    assert_eq!(recording.sample_at(fix, 180 * SECOND_NS, false), Some(0.0));
+    assert_eq!(recording.sample_at(fix, 183 * SECOND_NS, false), Some(3.0));
+    // The inferred lead-in must not change the GPS channel's rate in MTJ.
+    let latitude = recording.signal_roles().latitude.unwrap();
+    assert_eq!(recording.channels()[latitude].sample_count, 300);
+    let stripped = dir.path().join("stripped.telemetry");
+    telemetry_format::write_telemetry_stripped(&recording, &stripped).unwrap();
+    let raw = open(stripped).unwrap();
+    assert_eq!(raw.channels().len(), source.channels().len());
+    assert_eq!(raw.normalizer().sample(0).latitude_deg, anchor.latitude_deg);
+    assert!(raw.applied_passes().is_empty());
+}
+
+#[test]
 fn joins_aim_files_and_resolves_video_frame() {
     let sessions = open_sessions(
         [
@@ -46,17 +116,24 @@ fn joins_aim_files_and_resolves_video_frame() {
 }
 
 #[test]
-fn matches_track_and_computes_gps_progress() {
+fn matches_track_without_inventing_gps_progress() {
     let file = open(fixture("synthetic_aimd.mp4")).unwrap();
-    let normalizer = file.normalizer();
     assert_eq!(
-        normalizer.track().unwrap().matched.track.slug,
+        file.match_track().unwrap().matched.track.slug,
         "road-america"
     );
-    let sample = normalizer.sample(0);
-    assert!(sample.latitude_deg.is_some());
-    assert!(sample.longitude_deg.is_some());
-    assert!(sample.lap_progress.is_some());
+    for sample in [
+        file.normalizer().sample(0),
+        telemetry_passes::apply_registry(&file)
+            .unwrap()
+            .0
+            .normalizer()
+            .sample(0),
+    ] {
+        assert!(sample.latitude_deg.is_some());
+        assert!(sample.longitude_deg.is_some());
+        assert_eq!(sample.lap_progress, None);
+    }
 }
 
 #[test]
@@ -68,21 +145,48 @@ fn vbo_sample_exposes_time_of_day() {
 }
 
 #[test]
-fn reusable_normalizer_uses_lap_metadata_fallback() {
+fn lap_distance_and_elapsed_time_do_not_invent_progress() {
     let file = open(fixture("synthetic_cosworth.pds")).unwrap();
-    let normalizer = TelemetryNormalizer::new(&file, file.signal_roles(), None);
+    let mut roles = file.signal_roles();
+    let distance = roles.lap_distance.unwrap();
+    assert_eq!(file.channels()[distance].unit, "m");
+    // Force lap-time fallback to metadata, not the source timer.
+    roles.lap_time = None;
+    let normalizer = TelemetryNormalizer::new(&file, roles);
     let flying = file
         .metadata()
         .laps
         .into_iter()
-        .find(|lap| lap.number == 2 && lap.complete)
-        .expect("flying lap 2");
-    let quarter = flying.start_ns + flying.duration_ns / 4;
-    let half = flying.start_ns + flying.duration_ns / 2;
-    let q = normalizer.sample(quarter).lap_progress.unwrap();
-    let h = normalizer.sample(half).lap_progress.unwrap();
-    assert!((q - 0.25).abs() < 0.03, "quarter={q}");
-    assert!((h - 0.5).abs() < 0.03, "half={h}");
+        .find(|lap| lap.kind.is_flying())
+        .expect("flying lap");
+    for elapsed in [flying.duration_ns / 4, flying.duration_ns / 2] {
+        let time_ns = flying.start_ns + elapsed;
+        assert!(file.sample_at(distance, time_ns, true).is_some());
+        let sample = normalizer.sample(time_ns);
+        assert_eq!(sample.lap_number, Some(flying.number));
+        assert_eq!(sample.lap_time_s, Some(elapsed as f64 / 1e9));
+        assert_eq!(sample.lap_progress, None);
+    }
+}
+
+#[test]
+fn source_reported_progress_survives_conversion() {
+    let source = open(fixture("synthetic_motec_multilap.ld")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("progress.telemetry");
+    write_telemetry(&source, &dest).unwrap();
+    let recording = open(&dest).unwrap();
+    for file in [&source, &recording] {
+        let normalizer = file.normalizer();
+        let channel = normalizer.roles().lap_distance.unwrap();
+        assert_eq!(file.channels()[channel].name, "Lap Progression");
+        assert_eq!(file.channels()[channel].unit, "%");
+        for time_ns in [0, 2_000_000_000, 12_000_000_000] {
+            let raw = file.sample_at(channel, time_ns, true).unwrap();
+            let progress = normalizer.sample(time_ns).lap_progress.unwrap();
+            assert!((progress - raw / 100.0).abs() < 1e-12);
+        }
+    }
 }
 
 #[test]
@@ -108,15 +212,10 @@ fn telemetry_round_trip_preserves_aimd_video_timeline() {
     let source = open(fixture("synthetic_aimd.mp4")).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("synthetic_aimd.telemetry");
-    write_from_source(&source, &dest).unwrap();
+    write_telemetry(&source, &dest).unwrap();
     let opened = open(&dest).unwrap();
 
     assert_eq!(opened.format(), "aimd");
-    assert_eq!(
-        opened.metadata().format_version,
-        Some(motorsport_telemetry::FORMAT_VERSION)
-    );
-    assert!(!motorsport_telemetry::telemetry_needs_update(&dest).unwrap());
     assert_eq!(opened.video_frame_count(), source.video_frame_count());
     assert_eq!(
         opened.video_presentation_offset_ns(),
@@ -346,118 +445,68 @@ fn jsonl_and_zstd_match_on_real_motec_when_present() {
     );
 }
 
-/// Both `.telemetry` containers, side by side in one process: the committed
-/// legacy zip fixture (`PK\x03\x04`, FlatBuffers catalog, written by
-/// `convert --native-zip`) and the committed zstd-MTJ fixture
-/// (`28 B5 2F FD`) of the same synthetic Cosworth recording. Same name
-/// extension, different first bytes, identical content once opened.
+/// Compressed and plain JSONL use the same reader regardless of the suffix.
 #[test]
-fn legacy_zip_and_zstd_mtj_telemetry_files_open_side_by_side() {
-    use telemetry_format::{sniff_container, Container, TelemetryRecording};
-
-    let legacy_path = fixture("synthetic_cosworth.legacy.telemetry");
-    let modern_path = fixture("synthetic_cosworth.telemetry");
-    assert_eq!(&std::fs::read(&legacy_path).unwrap()[..4], b"PK\x03\x04");
-    assert_eq!(
-        &std::fs::read(&modern_path).unwrap()[..4],
-        &[0x28, 0xB5, 0x2F, 0xFD]
-    );
-    assert_eq!(sniff_container(&legacy_path).unwrap(), Container::NativeZip);
-    assert_eq!(sniff_container(&modern_path).unwrap(), Container::JsonlZstd);
-
-    // Same generic entry point for both; the container is decided by content.
-    let legacy = open(&legacy_path).unwrap();
-    let modern = open(&modern_path).unwrap();
-    let vendor = open(fixture("synthetic_cosworth.pds")).unwrap();
-    for (name, file) in [("legacy", &legacy), ("modern", &modern)] {
-        assert_eq!(file.format(), "pds", "{name} keeps the vendor format");
-        assert_eq!(
-            file.channels().len(),
-            vendor.channels().len(),
-            "{name} channel count"
-        );
-    }
-
-    // Identical laps, including the stint model, for both and the source.
-    let strip = |laps: Vec<motorsport_telemetry::motorsport_telemetry_core::LapMetadata>| {
-        laps.into_iter()
-            .map(|lap| {
+fn telemetry_opens_plain_and_compressed_jsonl_by_content() {
+    let source = open(fixture("synthetic_cosworth.pds")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.telemetry");
+    let compressed = dir.path().join("compressed.telemetry.jsonl");
+    write_jsonl_from_source_with(&source, &plain, false).unwrap();
+    write_telemetry(&source, &compressed).unwrap();
+    let plain_file = open(&plain).unwrap();
+    let compressed_file = open(&compressed).unwrap();
+    assert_eq!(plain_file.metadata().laps, compressed_file.metadata().laps);
+    let directory = |file: &motorsport_telemetry::TelemetryFile| {
+        file.channels()
+            .iter()
+            .map(|channel| {
                 (
-                    lap.number,
-                    lap.stint,
-                    lap.stint_lap,
-                    lap.kind,
-                    lap.label(),
-                    lap.complete,
-                    lap.start_ns / 1_000_000,
-                    lap.end_ns / 1_000_000,
+                    channel.name.clone(),
+                    channel.unit.clone(),
+                    channel.sample_count,
                 )
             })
             .collect::<Vec<_>>()
     };
-    let legacy_laps = strip(read_lap_metadata(&legacy_path).unwrap());
-    let modern_laps = strip(read_lap_metadata(&modern_path).unwrap());
-    let vendor_laps = strip(vendor.metadata().laps);
-    assert_eq!(legacy_laps, vendor_laps);
-    assert_eq!(modern_laps, vendor_laps);
-    assert_eq!(legacy_laps.len(), 5);
+    assert_eq!(directory(&plain_file), directory(&compressed_file));
     assert_eq!(
-        legacy_laps
-            .iter()
-            .map(|lap| lap.4.as_str())
-            .collect::<Vec<_>>(),
-        ["S1 out", "S1 L2", "S1 L3", "S1 L4", "S1 in"]
+        read_lap_metadata(&plain).unwrap(),
+        plain_file.metadata().laps
     );
-
-    // Identical normalized samples at the same instants.
-    let legacy_n = legacy.normalizer();
-    let modern_n = modern.normalizer();
-    let vendor_n = vendor.normalizer();
-    for time_ns in [5_000_000_000u64, 60_000_000_000, 200_000_000_000] {
-        let (l, m, v) = (
-            legacy_n.sample(time_ns),
-            modern_n.sample(time_ns),
-            vendor_n.sample(time_ns),
-        );
-        assert_eq!(l.speed_mps, v.speed_mps, "legacy speed at {time_ns}");
-        assert!(
-            (m.speed_mps.unwrap() - v.speed_mps.unwrap()).abs() < 1e-9,
-            "modern speed at {time_ns}"
-        );
-        assert_eq!(l.lap_number, v.lap_number);
-        assert_eq!(m.lap_number, v.lap_number);
-        assert_eq!(l.lap_label, m.lap_label);
+    assert_eq!(
+        motorsport_telemetry::read_metadata(&compressed)
+            .unwrap()
+            .laps,
+        compressed_file.metadata().laps
+    );
+    let plain_report = motorsport_telemetry::verify(&plain).unwrap();
+    let compressed_report = motorsport_telemetry::verify(&compressed).unwrap();
+    assert_eq!(plain_report.kind, motorsport_telemetry::VerifyKind::Mtj);
+    assert!(!plain_report.compressed);
+    assert!(compressed_report.compressed);
+    for time_ns in [5_000_000_000, 60_000_000_000, 200_000_000_000] {
+        let a = plain_file.normalizer().sample(time_ns);
+        let b = compressed_file.normalizer().sample(time_ns);
+        assert_eq!(a.speed_mps, b.speed_mps);
+        assert_eq!(a.lap_label, b.lap_label);
     }
-
-    // The typed entry point reports which container it found, and header-only
-    // helpers work for both.
-    assert!(matches!(
-        TelemetryRecording::open_unchanged(&legacy_path).unwrap(),
-        TelemetryRecording::Native(_)
-    ));
-    assert!(matches!(
-        TelemetryRecording::open_unchanged(&modern_path).unwrap(),
-        TelemetryRecording::Jsonl(_)
-    ));
-    assert_eq!(
-        motorsport_telemetry::read_valid_laps(&legacy_path).unwrap(),
-        motorsport_telemetry::read_valid_laps(&modern_path).unwrap()
-    );
-    assert!(!motorsport_telemetry::telemetry_needs_update(&legacy_path).unwrap());
-    assert!(!motorsport_telemetry::telemetry_needs_update(&modern_path).unwrap());
-    assert!(motorsport_telemetry::read_format_version(&legacy_path).is_ok());
-    assert!(motorsport_telemetry::read_format_version(&modern_path).is_err());
-
-    // verify() accepts both and names the container it saw.
-    let legacy_report = motorsport_telemetry::verify(&legacy_path).unwrap();
-    let modern_report = motorsport_telemetry::verify(&modern_path).unwrap();
-    assert_eq!(legacy_report.kind, motorsport_telemetry::VerifyKind::Native);
-    assert_eq!(modern_report.kind, motorsport_telemetry::VerifyKind::Mtj);
-    assert!(modern_report.compressed);
-    assert_eq!(legacy_report.laps, modern_report.laps);
 }
 
-/// A source whose channels declare no unit (AiM CAN echoes, VBOX CAN columns)
+#[test]
+fn legacy_zip_is_rejected_without_modifying_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.telemetry");
+    let bytes = b"PK\x03\x04obsolete archive";
+    std::fs::write(&path, bytes).unwrap();
+    assert!(open(&path).is_err());
+    assert!(motorsport_telemetry::verify(&path).is_err());
+    assert!(motorsport_telemetry::read_metadata(&path).is_err());
+    assert!(telemetry_format::read_channels(&path).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+/// A source whose channels declare no unit (`AiM` CAN echoes, VBOX CAN columns)
 /// plus a Cosworth-style pedal-as-angle channel. The normalizer must read the
 /// pedal, steering, rpm and lap time by their proven ranges, keep the pressure
 /// unresolved, and fall back to the classified laps for the running lap time
@@ -470,7 +519,7 @@ fn unitless_channels_are_read_by_range_and_laps_fill_the_gaps() {
         values: Vec<Vec<f64>>,
     }
     impl TelemetrySource for Synthetic {
-        fn path(&self) -> &str {
+        fn path(&self) -> &'static str {
             "unitless"
         }
         fn format(&self) -> &'static str {

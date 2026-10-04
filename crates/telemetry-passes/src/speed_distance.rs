@@ -32,13 +32,13 @@ const GAP_UNCERTAINTY: f64 = 0.5;
 /// gap uncertainty, meters).
 ///
 /// The odometer is monotone by construction — negative speeds clamp to
-/// zero — which makes it the backbone for lap progress between GPS
-/// anchors, and the only positioning signal for no-GPS sources.
+/// zero. It measures estimated distance traveled, not position on a track
+/// or the fraction of a lap completed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpeedDistance;
 
 impl SpeedDistance {
-    fn speed_channel(&self, source: &dyn TelemetrySource) -> Result<usize, String> {
+    fn speed_channel(source: &dyn TelemetrySource) -> Result<usize, String> {
         let channels = source.channels();
         let Some(index) = names::find(channels, SPEED) else {
             return Err("no speed channel present (looked for ground, reference, \
@@ -86,7 +86,7 @@ impl TelemetryPass for SpeedDistance {
     }
 
     fn check(&self, source: &dyn TelemetrySource) -> Applicability {
-        let speed_index = match self.speed_channel(source) {
+        let speed_index = match Self::speed_channel(source) {
             Ok(index) => index,
             Err(reason) => return Applicability::Skipped { reason },
         };
@@ -97,9 +97,8 @@ impl TelemetryPass for SpeedDistance {
     }
 
     fn derive(&self, source: &dyn TelemetrySource) -> Result<PassOutput, PassError> {
-        let speed_index = self
-            .speed_channel(source)
-            .map_err(|reason| PassError::Precondition {
+        let speed_index =
+            Self::speed_channel(source).map_err(|reason| PassError::Precondition {
                 pass: self.label(),
                 reason,
             })?;

@@ -3,15 +3,15 @@
 Interchange format for a time-aligned motorsport recording.
 
 This document is the standard. A file is an MTJ document if and only if it
-satisfies every MUST below. The native `.telemetry` zip remains the lossless
-archive; MTJ is the compact, line-oriented, inspectable form.
+satisfies every MUST below. `.telemetry` stores this document in one zstd
+frame; plain JSONL is the same line-oriented, inspectable format.
 
 | | |
 |---|---|
 | Identifier | `mtj` |
 | Current version | `1` |
 | Media type | `application/vnd.motorsport-telemetry+jsonl` |
-| Preferred names | `.telemetry.jsonl`, `.telemetry.jsonl.zstd` |
+| Preferred names | `.telemetry` (zstd), `.telemetry.jsonl`, `.telemetry.jsonl.zstd` |
 | Extension names | `.telemetry.ext.jsonl`, `.telemetry.ext.jsonl.zstd` |
 | Also accepted | `.jsonl`, `.mtj`, `.ext.jsonl`, `.mtx.jsonl`, and those names with `.zstd` / `.zst` |
 | Encoding | UTF-8, no BOM. A zstd frame (`28 B5 2F FD`) MAY wrap the UTF-8 document. |
@@ -181,7 +181,7 @@ Line 1 is a JSON object. Writers SHOULD emit keys in the order listed.
 | `clk` | string | no | Source clock name, e.g. `gps` or `utc`. Not a timezone. |
 | `abs` | integer | no | Source-clock reading at file `t = 0`. |
 | `abe` | integer | no | Source-clock reading at file `dur`. |
-| `hint` | string | no | Session-hint component used by the native catalog. |
+| `hint` | string | no | Session-hint component used to group related recordings. |
 | `vo` | integer | no | Recording-level video presentation offset, nanoseconds: `player_ns = t + vo`. See 4.2. |
 | `vf` | array | no | Linked video files, in index order. See 4.2. |
 | `vpts` | array | no | Presentation-order video frame timestamps, nanoseconds on the movie timeline. Requires `vf`. See 4.2. |
@@ -253,8 +253,8 @@ time `t` (file-relative nanoseconds) and the player's presentation timeline.
 | `po` | integer | no | Per-file presentation offset: `video_presentation_ns = file_relative_ns + po`. |
 
 - `vpts` — the presentation-order frame timestamp table: one integer per
-  frame, nanoseconds on the movie timeline, non-decreasing. Byte-for-byte
-  the same values as the native `video_frames.bin` member. `vpts` without
+  frame, nanoseconds on the movie timeline, non-decreasing. These timestamps
+  preserve the source video timeline exactly. `vpts` without
   `vf` is invalid.
 
 The frame shown at telemetry time `t` is the last index whose `vpts` entry
@@ -388,8 +388,7 @@ of the trace view. Labels are not samples and do not use `v`.
 
 ## 7. What this format does not contain
 
-These are deliberate omissions. Recover them from the original vendor file or
-from a `.telemetry` zip.
+These are deliberate omissions. Recover them from the original vendor file.
 
 - Per-sample timestamps
 - Native integer encodings, scale, and bias
@@ -399,14 +398,13 @@ from a `.telemetry` zip.
 - Driver-stint lists (derive from a driver-id channel when present)
 - Irregular / event streams that cannot sit on the lattice
 
-Spans (`k:"s"`) and per-channel `vis` **are** stored in a `.telemetry`
-catalog (v5). Converting MTJ ↔ native keeps them. An MTX sidecar file
-itself is still JSONL-only.
+Spans (`k:"s"`) and per-channel `vis` are stored in recording documents
+and MTX sidecars.
 
 ## 8. Compression
 
-The preferred on-disk names are `.telemetry.jsonl` (plain) and
-`.telemetry.jsonl.zstd` (one zstd frame wrapping the UTF-8 document).
+The default name is `.telemetry` (one zstd frame wrapping the UTF-8 document).
+Explicit names are `.telemetry.jsonl` (plain) and `.telemetry.jsonl.zstd` (zstd).
 `.zst` is an accepted alias for `.zstd`.
 
 This crate's writer compresses by default (zstd level 11). A reader MUST
@@ -435,8 +433,7 @@ A **writer** is conforming when it:
 
 ## 10. Versioning
 
-`mtj` is the recording-document version, independent of the `.telemetry`
-catalog `FORMAT_VERSION`. `mtx` is the extension-document version and is
+`mtj` is the recording-document version. `mtx` is the extension-document version and is
 versioned independently. A new version is required when the section layout,
 the lattice rule, or the meaning of a defined key changes. Adding an optional
 key is not a new version; v1 readers ignore unknown keys.
@@ -444,8 +441,7 @@ key is not a new version; v1 readers ignore unknown keys.
 ## 11. Extensions (MTX)
 
 An extension is extra channels for a recording that already exists. It is
-JSONL-only (plain or zstd). It is not a `.telemetry` zip member and it does
-not carry laps, identity, or video.
+a separate JSONL document (plain or zstd), without laps, identity, or video.
 
 The point is to load it into a host MTJ document and have the new channels
 line up on **time**. Time is the primary key. The sidecar MAY cover a slice of
@@ -571,7 +567,6 @@ computed timestamps are still the same instant (§3.2).
 - Not a second recording. It has no laps and no identity.
 - Not a patch that edits host channels.
 - Not a way to smuggle event streams. Channels MUST be lattice-aligned.
-- Not defined for `.telemetry` zip files.
 
 ## 12. Spans
 

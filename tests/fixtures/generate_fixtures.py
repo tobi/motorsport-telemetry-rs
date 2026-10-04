@@ -156,6 +156,71 @@ def make_aimd(itow_ms: int = 573_634_560, driver_id: float = 3.0, lap_number: fl
     return ftyp + mdat + moov
 
 
+def make_aimd_delayed_gps() -> bytes:
+    """Five minutes: GPS absent until 180 s, valid at 183 s, driving at 210 s."""
+    schema = packet_header(b"amv0s1")
+    for record_id, name, width in ((42, "Speed_Wspd_App", 4), (55, "GPS0", 56)):
+        definition = channel_definition(record_id, name, width)
+        schema.extend(b"<hCHS\x00" + struct.pack("<I", len(definition)) + b"\x01>" + definition)
+    struct.pack_into(">H", schema, 0, len(schema) - 2)
+    packets = [bytes(schema)]
+    for tick in range(3000):
+        second = tick / 10
+        timestamp_ms = tick * 100
+        speed_mps = 0.0 if second < 210 else 25.0
+        packet = packet_header(b"amv0")
+        packet.extend(b"(S" + struct.pack("<IHf", timestamp_ms, 42, speed_mps * 3.6) + b")")
+        # No GPS records at all initially; later acquisition includes three
+        # invalid fixes and another five-second receiver outage while driving.
+        if tick % 10 == 0 and second >= 180 and not 230 <= second < 235:
+            gps = bytearray(56)
+            struct.pack_into("<II", gps, 0, timestamp_ms, 573_000_000 + timestamp_ms)
+            struct.pack_into("<H", gps, 12, 2429)
+            if second >= 183:
+                latitude = math.radians(43.8 + max(0, second - 210) * 25.0 / 6_371_000.0 * 180.0 / math.pi)
+                longitude = math.radians(-88.0)
+                radius = 6_378_137.0 / math.sqrt(1.0 - 6.69437999014e-3 * math.sin(latitude) ** 2)
+                xyz = (
+                    (radius + 300.0) * math.cos(latitude) * math.cos(longitude),
+                    (radius + 300.0) * math.cos(latitude) * math.sin(longitude),
+                    (radius * (1.0 - 6.69437999014e-3) + 300.0) * math.sin(latitude),
+                )
+                struct.pack_into("<3i", gps, 16, *(round(value * 100.0) for value in xyz))
+                velocity = (
+                    -math.sin(latitude) * math.cos(longitude) * speed_mps,
+                    -math.sin(latitude) * math.sin(longitude) * speed_mps,
+                    math.cos(latitude) * speed_mps,
+                )
+                struct.pack_into("<3i", gps, 32, *(round(value * 100.0) for value in velocity))
+                gps[14], gps[15], gps[51] = 3, 1, 9
+                struct.pack_into("<I", gps, 28, 100)
+                struct.pack_into("<I", gps, 44, 10)
+                struct.pack_into("<H", gps, 48, 100)
+            else:
+                struct.pack_into("<I", gps, 28, 0xFFFFFFFF)
+            packet.extend(b"<hGPS\x00" + struct.pack("<I", len(gps)) + b"\x01>" + gps)
+        struct.pack_into(">H", packet, 0, len(packet) - 2)
+        packets.append(bytes(packet))
+
+    ftyp = mp4_box(b"ftyp", b"isom\x00\x00\x00\x00isom")
+    mdat = mp4_box(b"mdat", b"".join(packets))
+    mdhd = bytearray(24)
+    struct.pack_into(">II", mdhd, 12, 1000, 300_000)
+    hdlr = bytearray(24)
+    hdlr[8:12] = b"meta"
+    stsd = b"\x00" * 4 + struct.pack(">II4s", 1, 8, b"aimd")
+    stts = b"\x00" * 4 + struct.pack(">III", 1, len(packets), 100)
+    stsc = b"\x00" * 4 + struct.pack(">IIII", 1, 1, len(packets), 1)
+    stsz = b"\x00" * 8 + struct.pack(">I", len(packets))
+    stsz += b"".join(struct.pack(">I", len(packet)) for packet in packets)
+    stco = b"\x00" * 4 + struct.pack(">II", 1, len(ftyp) + 8)
+    stbl = mp4_box(b"stbl", b"".join(mp4_box(kind, payload) for kind, payload in (
+        (b"stsd", stsd), (b"stts", stts), (b"stsc", stsc), (b"stsz", stsz), (b"stco", stco),
+    )))
+    mdia = mp4_box(b"mdia", mp4_box(b"mdhd", mdhd) + mp4_box(b"hdlr", hdlr) + mp4_box(b"minf", stbl))
+    return ftyp + mdat + mp4_box(b"moov", mp4_box(b"trak", mdia))
+
+
 ATLAS = Path(__file__).resolve().parents[2] / "crates/motorsport-track-atlas/data/tracks.jsonl"
 PDS_HZ = 5
 PDS_TICKS = 2_000_000  # 5 Hz: 2e6 ticks × 100 ns
@@ -609,6 +674,7 @@ def main() -> None:
     files = {
         "synthetic_aimd.mp4": make_aimd(),
         "synthetic_aimd_part2.mp4": make_aimd(573_634_760, 3.0, 1.0),
+        "synthetic_aimd_delayed_gps.mp4": make_aimd_delayed_gps(),
         "synthetic_cosworth.pds": make_pds(),
         "synthetic_motec.ld": make_motec(),
         "synthetic_motec_multilap.ld": make_motec_multilap(),

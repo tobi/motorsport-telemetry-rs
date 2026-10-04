@@ -83,7 +83,7 @@ impl JsonlRecording {
         let mut file = File::open(path)?;
         let display = path.to_string_lossy().into_owned();
         if starts_with_zstd(&mut file)? {
-            let decoder = zstd::Decoder::new(file).map_err(zstd_err)?;
+            let decoder = zstd::Decoder::new(file)?;
             Self::from_reader(display, BufReader::new(decoder))
         } else {
             Self::from_reader(display, BufReader::new(file))
@@ -105,7 +105,7 @@ impl JsonlRecording {
         let display = path.to_string_lossy().into_owned();
         let mut file = File::open(path)?;
         if starts_with_zstd(&mut file)? {
-            let decoder = zstd::Decoder::new(file).map_err(zstd_err)?;
+            let decoder = zstd::Decoder::new(file)?;
             Self::header_metadata_from_reader(display, BufReader::new(decoder))
         } else {
             Self::header_metadata_from_reader(display, BufReader::new(file))
@@ -121,7 +121,7 @@ impl JsonlRecording {
         let path = path.as_ref();
         let mut file = File::open(path)?;
         let header_line = if starts_with_zstd(&mut file)? {
-            let decoder = zstd::Decoder::new(file).map_err(zstd_err)?;
+            let decoder = zstd::Decoder::new(file)?;
             json::next_record(&mut BufReader::new(decoder).lines(), "header")?
         } else {
             json::next_record(&mut BufReader::new(file).lines(), "header")?
@@ -135,7 +135,7 @@ impl JsonlRecording {
         bytes: &[u8],
     ) -> Result<Option<FileMetadata>, TelemetryFormatError> {
         if bytes.starts_with(&ZSTD_MAGIC) {
-            let decoder = zstd::Decoder::new(bytes).map_err(zstd_err)?;
+            let decoder = zstd::Decoder::new(bytes)?;
             Self::header_metadata_from_reader(path.into(), BufReader::new(decoder))
         } else {
             Self::header_metadata_from_reader(path.into(), BufReader::new(bytes))
@@ -144,7 +144,7 @@ impl JsonlRecording {
 
     fn header_metadata_from_reader(
         path: String,
-        reader: impl std::io::BufRead,
+        reader: impl BufRead,
     ) -> Result<Option<FileMetadata>, TelemetryFormatError> {
         let mut lines = reader.lines();
         let header_line = json::next_record(&mut lines, "header")?;
@@ -216,7 +216,6 @@ impl JsonlRecording {
             sample_count,
             duration_ns: header.duration_ns,
             schema_hash,
-            format_version: None,
             session_key,
             absolute_clock: header.clock.as_ref().map(|clock| clock.clock.clone()),
             absolute_start_ns: header.clock.as_ref().map(|clock| clock.start_ns),
@@ -242,7 +241,7 @@ impl JsonlRecording {
     /// Parses an owned MTJ buffer, decompressing a zstd frame when present.
     pub fn from_bytes(path: impl Into<String>, bytes: &[u8]) -> Result<Self, TelemetryFormatError> {
         if bytes.starts_with(&ZSTD_MAGIC) {
-            let decoder = zstd::Decoder::new(bytes).map_err(zstd_err)?;
+            let decoder = zstd::Decoder::new(bytes)?;
             Self::from_reader(path.into(), BufReader::new(decoder))
         } else {
             Self::from_reader(path.into(), BufReader::new(bytes))
@@ -263,7 +262,7 @@ impl JsonlRecording {
             metadata.schema_hash = hash;
         }
         metadata.utc_start_ns = self.utc_start_ns;
-        metadata.timezone = self.timezone.clone();
+        metadata.timezone.clone_from(&self.timezone);
         metadata
     }
 
@@ -463,7 +462,6 @@ enum JsonlSuffix {
     ExtZstd,
 }
 fn jsonl_suffix(path: &Path) -> Option<JsonlSuffix> {
-    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
     // Strict suffix table, checked longest-first so a more-specific extension
     // wins over a shorter suffix it ends with (e.g. `.telemetry.ext.jsonl.zstd`
     // before `.ext.jsonl.zstd`). No substring matching: a name must actually
@@ -491,6 +489,7 @@ fn jsonl_suffix(path: &Path) -> Option<JsonlSuffix> {
         ".mtj.zst",
     ];
     const PLAIN: &[&str] = &[".telemetry.jsonl", ".jsonl", ".mtj"];
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
     if EXT_ZSTD.iter().any(|suffix| name.ends_with(suffix)) {
         Some(JsonlSuffix::ExtZstd)
     } else if EXT.iter().any(|suffix| name.ends_with(suffix)) {
@@ -508,9 +507,6 @@ fn starts_with_zstd(file: &mut File) -> Result<bool, TelemetryFormatError> {
     let read = file.read(&mut magic)?;
     file.seek(SeekFrom::Start(0))?;
     Ok(read == 4 && magic == ZSTD_MAGIC)
-}
-pub(super) fn zstd_err(err: std::io::Error) -> TelemetryFormatError {
-    TelemetryFormatError::Invalid(format!("zstd: {err}"))
 }
 /// True when `timezone` is a real IANA zone, validated through core placement
 /// (which owns the `jiff` dependency) rather than this crate.

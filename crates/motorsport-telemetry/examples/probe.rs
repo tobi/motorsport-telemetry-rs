@@ -4,8 +4,21 @@
 //! Add `--preview` for a bounded trace suitable for plotting. Use
 //! `--files-from LIST` for a newline-delimited manifest to avoid another
 //! recursive NAS walk. Flags are review candidates, not proof of reader bugs.
-//! Existing native `.telemetry` files are excluded from directory walks because
-//! opening an older native catalog can migrate it in place.
+//! Opening a recording does not modify it.
+
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use motorsport_telemetry::{
     motorsport_telemetry_core::{can_convert, convert, motion::summarize_motion, TelemetrySource},
     open, SourceExt,
@@ -21,17 +34,19 @@ const SAMPLE_BUDGET: u64 = 200_000;
 fn walk(path: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     if path.is_dir() {
         let mut entries = std::fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             if !entry.file_type()?.is_symlink() {
                 walk(&entry.path(), out)?;
             }
         }
-    } else if path.extension().is_some_and(|s| {
-        ["pds", "ld", "vbo", "mp4"]
-            .iter()
-            .any(|e| s.eq_ignore_ascii_case(e))
-    }) {
+    } else if telemetry_format::is_jsonl_path(path)
+        || path.extension().is_some_and(|s| {
+            ["pds", "ld", "vbo", "mp4", "telemetry"]
+                .iter()
+                .any(|e| s.eq_ignore_ascii_case(e))
+        })
+    {
         out.push(path.to_path_buf());
     }
     Ok(())
@@ -335,31 +350,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if files.is_empty() {
-        return Err("no vendor recordings selected".into());
+        return Err("no recordings selected".into());
     }
     files.sort();
     files.dedup();
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for path in files {
-        // Refuse native paths even from a manifest: an audit must not migrate
-        // the collection. The native writer has separate round-trip tests.
-        let value = if path
-            .extension()
-            .is_some_and(|s| s.eq_ignore_ascii_case("telemetry"))
-        {
-            json!({"file":path, "error":"native migration excluded from read-only vendor audit"})
-        } else {
-            match open(&path) {
-                Ok(source) => {
-                    let mut value = report(source.as_ref());
-                    if include_preview {
-                        value["preview"] = preview(source.as_ref());
-                    }
-                    value
+        let value = match open(&path) {
+            Ok(source) => {
+                let mut value = report(source.as_ref());
+                if include_preview {
+                    value["preview"] = preview(source.as_ref());
                 }
-                Err(error) => json!({"file":path,"error":error.to_string()}),
+                value
             }
+            Err(error) => json!({"file":path,"error":error.to_string()}),
         };
         if let Err(error) = writeln!(out, "{value}") {
             if error.kind() == io::ErrorKind::BrokenPipe {

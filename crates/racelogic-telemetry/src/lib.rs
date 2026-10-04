@@ -1,5 +1,18 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::unreadable_literal,
+        clippy::float_cmp,
+        reason = "unit tests: fail loudly, print freely, exact fixture values"
+    )
+)]
 
 use motorsport_telemetry_core::{
     names, Channel, Chunk, Diagnostic, LapMetadata, SampleTimes, SampleType, SourceLapMetadata,
@@ -17,6 +30,10 @@ pub fn read_metadata(
 }
 
 /// Derives format-neutral metadata from an owned VBO byte buffer.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "owned-buffer metadata entry point matches the other format readers"
+)]
 pub fn read_metadata_from_bytes(
     path: impl Into<String>,
     data: Vec<u8>,
@@ -132,8 +149,8 @@ fn sections(text: &str) -> Sections<'_> {
                 .split_once(" at ")
                 .or_else(|| created.split_once(" @ "))
             {
-                result.created_date = date.trim().to_owned();
-                result.created_time = time.trim().to_owned();
+                date.trim().clone_into(&mut result.created_date);
+                time.trim().clone_into(&mut result.created_time);
             }
         }
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
@@ -269,6 +286,10 @@ impl RacelogicFile {
     }
 
     /// Parses VBO telemetry from an owned byte buffer.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "owned-buffer entry point matches the other format readers; from_slice accepts borrowed input"
+    )]
     pub fn from_bytes(path: impl Into<String>, bytes: Vec<u8>) -> Result<Self, RacelogicError> {
         Self::from_slice_mode(path.into(), &bytes, false)
     }
@@ -292,15 +313,14 @@ impl RacelogicFile {
         // Borrow when the file is UTF-8 (the overwhelmingly common case) and
         // only allocate for the latin-1 fallback.
         let fallback;
-        let text: &str = match std::str::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => {
-                fallback = bytes
-                    .iter()
-                    .map(|&byte| char::from(byte))
-                    .collect::<String>();
-                &fallback
-            }
+        let text: &str = if let Ok(text) = std::str::from_utf8(bytes) {
+            text
+        } else {
+            fallback = bytes
+                .iter()
+                .map(|&byte| char::from(byte))
+                .collect::<String>();
+            &fallback
         };
         let parsed = sections(text);
         let mut diagnostics = Vec::new();
@@ -358,12 +378,11 @@ impl RacelogicFile {
                     continue;
                 }
                 let token = tokens.next();
-                match token.and_then(|t| t.parse::<f64>().ok()) {
-                    Some(value) => output.push(value),
-                    None => {
-                        output.push(f64::NAN);
-                        unparsable_counts[column] += 1;
-                    }
+                if let Some(value) = token.and_then(|t| t.parse::<f64>().ok()) {
+                    output.push(value);
+                } else {
+                    output.push(f64::NAN);
+                    unparsable_counts[column] += 1;
                 }
             }
         }
@@ -439,8 +458,7 @@ impl RacelogicFile {
             .map(|pair| pair[1].saturating_sub(pair[0]))
             .find(|delta| *delta > 0);
         let sample_period = match (tsample_period, delta_period) {
-            (Some(period), _) => period,
-            (None, Some(period)) => period,
+            (Some(period), _) | (None, Some(period)) => period,
             (None, None) => {
                 diagnostics.push(Diagnostic::warning(
                     "vbo.sample_period_defaulted",
@@ -779,13 +797,11 @@ fn gate_laps(
         }
         previous = Some((row, point));
     }
-    if crossings.is_empty() {
-        return None;
-    }
+    let last_crossing = *crossings.last()?;
     let mut boundaries = Vec::with_capacity(crossings.len() + 2);
     boundaries.push(0);
     boundaries.extend(crossings.iter().copied());
-    boundaries.push(duration_ns.max(*crossings.last().unwrap()));
+    boundaries.push(duration_ns.max(last_crossing));
     let count = boundaries.len() - 1;
     let laps = boundaries
         .windows(2)
@@ -1015,22 +1031,23 @@ mod tests {
         // Gate at lat 1751.26125', long 4864.3685' (Daytona), direction of
         // travel marked 0.001' further north along the same longitude, so the
         // gate itself runs east-west.
+        use std::fmt::Write;
         let mut data = String::new();
         for (row, lap) in lap_numbers.iter().enumerate() {
             let time = 120_000.0 + row as f64;
             if row == 20 {
-                data.push_str(&format!(
-                    "0 {time:.1} 0.0 0.0 0.0 0.0 0.0 0.0 1.0 0 0 0 {lap}\n"
-                ));
+                writeln!(data, "0 {time:.1} 0.0 0.0 0.0 0.0 0.0 0.0 1.0 0 0 0 {lap}").unwrap();
                 continue;
             }
             // 20 rows per pass: lat climbs 0.0005'/row (~0.9 m) from 0.005'
             // south of the gate to 0.005' north of it.
             let pass_row = if row < 20 { row } else { row - 21 };
             let lat = 1751.26125 - 0.005 + pass_row as f64 * 0.000_5;
-            data.push_str(&format!(
-                "8 {time:.1} {lat:.6} 4864.368500 100.0 0.0 10.0 0.0 1.0 1 0 0 {lap}\n"
-            ));
+            writeln!(
+                data,
+                "8 {time:.1} {lat:.6} 4864.368500 100.0 0.0 10.0 0.0 1.0 1 0 0 {lap}"
+            )
+            .unwrap();
         }
         let builtin = BUILTIN_SHORT.join(" ");
         let builtin_header = BUILTIN_NAMES.join("\n");

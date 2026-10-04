@@ -1,5 +1,18 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::unreadable_literal,
+        clippy::float_cmp,
+        reason = "unit tests: fail loudly, print freely, exact fixture values"
+    )
+)]
 
 use motorsport_telemetry_core::{
     chunk_bytes as core_chunk_bytes, sample_bytes as core_sample_bytes, Channel, Chunk, Diagnostic,
@@ -51,7 +64,7 @@ pub fn read_metadata_from_bytes_with_ldx(
         .map(|file| motorsport_telemetry_core::read_source_metadata(&file))
 }
 
-/// Errors returned while opening or parsing MoTeC LD telemetry.
+/// Errors returned while opening or parsing `MoTeC` LD telemetry.
 #[derive(Debug, Error)]
 pub enum MotecError {
     /// The LD file could not be opened or memory-mapped.
@@ -80,7 +93,7 @@ struct Encoding {
     offset: f64,
 }
 
-/// An opened MoTeC LD telemetry source and its embedded session identity.
+/// An opened `MoTeC` LD telemetry source and its embedded session identity.
 #[derive(Debug)]
 pub struct MotecFile {
     /// Source path or caller-supplied name.
@@ -177,7 +190,7 @@ fn parse_datetime_ns(date: &str, time: &str) -> Option<u64> {
 
 impl MotecFile {
     #[cfg(not(target_os = "emscripten"))]
-    /// Memory-maps and parses a local MoTeC LD file.
+    /// Memory-maps and parses a local `MoTeC` LD file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MotecError> {
         let path = path.as_ref();
         let display = path.to_string_lossy().into_owned();
@@ -217,7 +230,7 @@ impl MotecFile {
         Ok(parsed)
     }
 
-    /// Parses MoTeC telemetry from an owned LD byte buffer.
+    /// Parses `MoTeC` telemetry from an owned LD byte buffer.
     pub fn from_bytes(path: impl Into<String>, data: Vec<u8>) -> Result<Self, MotecError> {
         Self::parse(path.into(), Storage::from_vec(data))
     }
@@ -258,11 +271,11 @@ impl MotecFile {
             && channels.len() < MAX_CHANNELS
         {
             let next = u32le(&data, address + 0x04).unwrap_or(0) as usize;
-            let data_ptr = u32le(&data, address + 0x08).unwrap_or(0) as u64;
-            let requested_count = u32le(&data, address + 0x0c).unwrap_or(0) as u64;
+            let data_ptr = u64::from(u32le(&data, address + 0x08).unwrap_or(0));
+            let requested_count = u64::from(u32le(&data, address + 0x0c).unwrap_or(0));
             let datatype_a = u16le(&data, address + 0x12).unwrap_or(0);
             let width = u16le(&data, address + 0x14).unwrap_or(0) as usize;
-            let frequency = u16le(&data, address + 0x16).unwrap_or(0) as u64;
+            let frequency = u64::from(u16le(&data, address + 0x16).unwrap_or(0));
             let shift = i16le(&data, address + 0x18).unwrap_or(0);
             let mul = i16le(&data, address + 0x1a).unwrap_or(0);
             let scale = i16le(&data, address + 0x1c).unwrap_or(0);
@@ -308,11 +321,10 @@ impl MotecFile {
             };
             let sample_type = match (datatype_a, width) {
                 // 0x08/8 is MoTeC's little-endian f64 (seen on GPS channels).
-                (0x08, 8) => SampleType::F64,
-                (0x07, 8) => SampleType::F64,
-                (0x07, _) => SampleType::F32,
-                (_, 2) => SampleType::I16,
-                (_, 4) => SampleType::I32,
+                (0x08 | 0x07, 8) => SampleType::F64,
+                // 0x07 is floating-point regardless of the declared width.
+                (kind, 2) if kind != 0x07 => SampleType::I16,
+                (kind, 4) if kind != 0x07 => SampleType::I32,
                 _ => SampleType::F32,
             };
             let valid_width = matches!(width, 2 | 4 | 8);
@@ -397,7 +409,7 @@ impl MotecFile {
                     );
                 }
             }
-            if !matches!((datatype_a, width), (0x08, 8) | (0x07, _) | (_, 2) | (_, 4)) {
+            if !matches!((datatype_a, width), (0x08, 8) | (0x07, _) | (_, 2 | 4)) {
                 diagnostics.push(
                     Diagnostic::warning(
                         "ld.unknown_datatype_width",

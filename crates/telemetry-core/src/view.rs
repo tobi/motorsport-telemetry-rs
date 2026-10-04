@@ -105,7 +105,11 @@ impl<'a> ViewSource<'a> {
     ///
     /// `keep` receives the **pre-view inner index** (equal to the view index
     /// before any append) and the channel. Only valid before the first
-    /// [`Self::append`]; calling it after appends panics.
+    /// [`Self::append`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if any channel has already been appended.
     pub fn retain(&mut self, keep: impl FnMut(usize, &Channel) -> bool) {
         assert!(
             self.appended_len() == 0,
@@ -406,7 +410,7 @@ mod tests {
     }
 
     impl TelemetrySource for GridInner {
-        fn path(&self) -> &str {
+        fn path(&self) -> &'static str {
             "grid"
         }
         fn format(&self) -> &'static str {
@@ -449,7 +453,7 @@ mod tests {
         let data: Vec<u8> = [1.0_f32, 2.0, 3.0, 4.0]
             .iter()
             .flat_map(|v| {
-                let n = SampleType::F32.encode_le(*v as f64, &mut buf);
+                let n = SampleType::F32.encode_le(f64::from(*v), &mut buf);
                 buf[..n].to_vec()
             })
             .collect();
@@ -509,7 +513,7 @@ mod tests {
     }
 
     impl TelemetrySource for ExplicitInner {
-        fn path(&self) -> &str {
+        fn path(&self) -> &'static str {
             "explicit"
         }
         fn format(&self) -> &'static str {

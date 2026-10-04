@@ -194,6 +194,11 @@ impl Diagnostics {
         &self.items
     }
 
+    /// Iterates over the retained diagnostics in emission order.
+    pub fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {
+        self.items.iter()
+    }
+
     /// Returns how many diagnostics were dropped at [`Self::CAP`].
     pub fn suppressed(&self) -> usize {
         self.suppressed
@@ -252,7 +257,7 @@ impl<'a> IntoIterator for &'a Diagnostics {
     type Item = &'a Diagnostic;
     type IntoIter = std::slice::Iter<'a, Diagnostic>;
     fn into_iter(self) -> Self::IntoIter {
-        self.items.iter()
+        self.iter()
     }
 }
 

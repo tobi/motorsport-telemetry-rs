@@ -1,9 +1,8 @@
 use super::align::{collect_aligned, snap_laps, snap_spans, snap_up};
 use super::write::{write_jsonl_document, write_number};
 use super::*;
-use crate::NativeRecording;
 use motorsport_telemetry_core::{
-    Channel, ChannelPlot, Chunk, LapKind, LapMetadata, SampleType, SourceIdentity,
+    Channel, ChannelPlot, Chunk, LapKind, LapMetadata, SampleTimes, SampleType, SourceIdentity,
     SourceLapMetadata, Span, SpanMetaValue, SpanPrimary, TelemetrySource, UnitSource, VideoFileRef,
 };
 
@@ -22,7 +21,7 @@ struct TinySource {
 }
 
 impl TelemetrySource for TinySource {
-    fn path(&self) -> &str {
+    fn path(&self) -> &'static str {
         "tiny"
     }
     fn format(&self) -> &'static str {
@@ -35,17 +34,11 @@ impl TelemetrySource for TinySource {
         let base = self.channels[channel_index].chunks[chunk_index].sample_base;
         self.values[channel_index][(base + local_index) as usize]
     }
-    fn sample_time_ns(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> u64 {
-        let chunk = &self.channels[channel_index].chunks[chunk_index];
-        let index = (chunk.sample_base + local_index) as usize;
-        if let Some(&time) = self
-            .sample_times
-            .get(channel_index)
-            .and_then(|times| times.get(index))
-        {
-            return time;
+    fn sample_times(&self, channel_index: usize) -> SampleTimes<'_> {
+        match self.sample_times.get(channel_index) {
+            Some(times) if !times.is_empty() => SampleTimes::Explicit(times),
+            _ => SampleTimes::Grid,
         }
-        chunk.time_base_ns + local_index * chunk.sample_period_ns
     }
     fn identity(&self) -> SourceIdentity {
         self.identity.clone()
@@ -298,24 +291,24 @@ fn video_linkage_round_trips() {
     );
     assert_eq!(opened.video_presentation_offset_ns(), Some(101_333_333));
     assert_eq!(opened.video_frame_count(), Some(4));
-    // Same binary-search semantics as the native reader.
+    // Frame lookup uses the same presentation timestamps.
     assert_eq!(opened.video_frame_at(0), Some(0));
     assert_eq!(opened.video_frame_at(40_000_000), Some(1));
     assert_eq!(opened.video_frame_at(u64::MAX / 2), Some(3));
     assert_eq!(opened.metadata().video_frame_count, Some(4));
 
-    // The native hop keeps the linkage bit for bit.
+    // A compressed write keeps the linkage bit for bit.
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("tiny.telemetry");
-    crate::write_from_source(&opened, &dest).unwrap();
-    let native = NativeRecording::open(&dest).unwrap();
-    assert_eq!(native.video_files(), source.videos.as_slice());
+    crate::write_telemetry(&opened, &dest).unwrap();
+    let compressed = JsonlRecording::open(&dest).unwrap();
+    assert_eq!(compressed.video_files(), source.videos.as_slice());
     assert_eq!(
-        native.video_presentation_times_ns().unwrap(),
+        compressed.video_presentation_times_ns().unwrap(),
         source.video_times.as_slice()
     );
-    assert_eq!(native.video_presentation_offset_ns(), Some(101_333_333));
-    assert_eq!(native.video_frame_at(40_000_000), Some(1));
+    assert_eq!(compressed.video_presentation_offset_ns(), Some(101_333_333));
+    assert_eq!(compressed.video_frame_at(40_000_000), Some(1));
 }
 
 #[test]
@@ -479,7 +472,7 @@ fn jsonl_and_zstd_decompress_to_identical_bytes_and_payload() {
 
     let plain_bytes = std::fs::read(&plain).unwrap();
     let mut decoded = Vec::new();
-    zstd::Decoder::new(std::fs::File::open(&zstd).unwrap())
+    zstd::Decoder::new(File::open(&zstd).unwrap())
         .unwrap()
         .read_to_end(&mut decoded)
         .unwrap();
@@ -1310,6 +1303,16 @@ fn header_only_metadata_and_channels_need_only_the_first_two_lines() {
         .unwrap();
     assert_eq!(from_cut.laps, expected.laps);
     assert_eq!(from_cut.channel_count, expected.channel_count);
+    assert_eq!(
+        crate::read_metadata(&path).unwrap().sample_count,
+        expected.sample_count
+    );
+    assert_eq!(crate::read_laps(&path).unwrap(), expected.laps);
+    assert_eq!(crate::read_valid_laps(&path).unwrap(), expected.valid_laps);
+    assert_eq!(
+        crate::read_channels(&path).unwrap().len(),
+        full.channels().len()
+    );
     let channels = JsonlRecording::read_header_channels(&path)
         .unwrap()
         .unwrap();
@@ -1349,4 +1352,16 @@ fn header_only_metadata_and_channels_need_only_the_first_two_lines() {
             .laps,
         expected.laps
     );
+}
+
+#[test]
+fn finite_extreme_values_survive_jsonl_round_trip() {
+    let mut source = tiny();
+    source.values[0] = vec![f64::MAX, -f64::MAX, 0.0, 1.0];
+    let mut bytes = Vec::new();
+    write_jsonl_to(&source, &mut bytes).unwrap();
+    let opened = JsonlRecording::from_bytes("extreme.telemetry.jsonl", &bytes).unwrap();
+    for (index, value) in source.values[0].iter().enumerate() {
+        assert_eq!(opened.decode(0, 0, index as u64), *value);
+    }
 }

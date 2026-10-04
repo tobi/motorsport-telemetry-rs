@@ -1,9 +1,22 @@
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use motorsport_telemetry::motorsport_telemetry_core::{
     Channel, Chunk, SampleType, SourceIdentity, TelemetrySource, UnitSource,
 };
 use std::path::PathBuf;
 use std::process::Command;
-use telemetry_format::write_from_source;
+use telemetry_format::write_telemetry;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -21,7 +34,7 @@ fn reports_requested_metadata() {
         .args(["inspect", fixture("synthetic_aimd.mp4").to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("driver_id: 3\n"));
     assert!(stdout.contains("event_date: 2026-08-01\n"));
@@ -46,7 +59,7 @@ fn emits_machine_readable_json() {
         ])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["driver_id"], 3);
     assert_eq!(report["event_date"], "2026-08-01");
@@ -66,7 +79,7 @@ fn recognizes_decimal_degree_vbox_exports() {
         .args(["inspect", fixture("synthetic_vbo.vbo").to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("track_name: Road America\n"));
     assert!(stdout.contains("layout: Full Course\n"));
@@ -77,35 +90,34 @@ fn recognizes_decimal_degree_vbox_exports() {
 fn convert_defaults_to_zstd_mtj_and_verify_accepts_all_encodings() {
     let dir = tempfile::tempdir().unwrap();
     let input = fixture("synthetic_cosworth.pds");
-    let native = dir.path().join("run.telemetry");
+    let recording = dir.path().join("run.telemetry");
     let jsonl = dir.path().join("run.telemetry.jsonl");
     let zstd = dir.path().join("run.telemetry.jsonl.zstd");
 
-    for dest in [native.as_path(), jsonl.as_path(), zstd.as_path()] {
+    for dest in [recording.as_path(), jsonl.as_path(), zstd.as_path()] {
         let out = cli()
             .args(["convert", input.to_str().unwrap(), dest.to_str().unwrap()])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{dest:?} {:?}", out);
+        assert!(out.status.success(), "{dest:?} {out:?}");
     }
 
     let verified = cli()
         .args([
             "verify",
-            native.to_str().unwrap(),
+            recording.to_str().unwrap(),
             jsonl.to_str().unwrap(),
             zstd.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(verified.status.success(), "{:?}", verified);
+    assert!(verified.status.success(), "{verified:?}");
     let stdout = String::from_utf8(verified.stdout).unwrap();
     // `.telemetry` is a zstd MTJ frame now; verify tells that from content.
-    assert!(!stdout.contains("native v"), "{stdout}");
     assert_eq!(stdout.matches("mtj:1").count(), 3, "{stdout}");
     assert_eq!(stdout.matches("mtj:1  zstd").count(), 2, "{stdout}");
     assert!(!stdout.contains("FAIL"), "{stdout}");
-    let head = std::fs::read(&native).unwrap();
+    let head = std::fs::read(&recording).unwrap();
     assert_eq!(&head[..4], &[0x28, 0xB5, 0x2F, 0xFD], "zstd magic");
 
     let rejected = cli()
@@ -127,7 +139,7 @@ fn inspect_pds_reports_flying_laps() {
         ])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["format"], "pds");
     assert_eq!(report["driver_id"], 7);
@@ -160,7 +172,7 @@ fn command_help_is_specific() {
     let verify =
         String::from_utf8(cli().args(["verify", "--help"]).output().unwrap().stdout).unwrap();
     assert!(verify.contains("zstd"));
-    assert!(verify.contains("without rewriting"));
+    assert!(verify.contains("MTJ recording or MTX sidecar"));
 }
 
 #[test]
@@ -172,120 +184,75 @@ fn convert_without_output_writes_next_to_the_input() {
         .args(["convert", input.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     let dest = String::from_utf8(output.stdout).unwrap();
     assert!(dest.contains("run.pds.telemetry"), "{dest}");
     let dest = dest.trim();
     assert!(std::path::Path::new(dest).is_file());
 
     let verified = cli().args(["verify", dest]).output().unwrap();
-    assert!(verified.status.success(), "{:?}", verified);
+    assert!(verified.status.success(), "{verified:?}");
     let report = String::from_utf8(verified.stdout).unwrap();
     assert!(report.contains("mtj:1  zstd"), "{report}");
     assert!(report.contains("ok"), "{report}");
 }
 
 #[test]
-fn native_zip_flag_writes_legacy_container_and_both_open_by_content() {
+fn native_zip_option_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let input = fixture("synthetic_cosworth.pds");
-    let legacy = dir.path().join("legacy.telemetry");
-    let modern = dir.path().join("modern.telemetry");
+    let dest = dir.path().join("run.telemetry");
     let out = cli()
         .args([
             "convert",
             "--native-zip",
-            input.to_str().unwrap(),
-            legacy.to_str().unwrap(),
+            fixture("synthetic_cosworth.pds").to_str().unwrap(),
+            dest.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{out:?}");
-    let out = cli()
-        .args(["convert", input.to_str().unwrap(), modern.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{out:?}");
-
-    assert_eq!(&std::fs::read(&legacy).unwrap()[..2], b"PK");
-    assert_eq!(
-        &std::fs::read(&modern).unwrap()[..4],
-        &[0x28, 0xB5, 0x2F, 0xFD]
-    );
-
-    let verified = cli()
-        .args(["verify", legacy.to_str().unwrap(), modern.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(verified.status.success(), "{verified:?}");
-    let stdout = String::from_utf8(verified.stdout).unwrap();
-    assert!(
-        stdout.contains("legacy.telemetry: ok  native v"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("modern.telemetry: ok  mtj:1  zstd"),
-        "{stdout}"
-    );
-
-    // Both containers expose the same laps through the facade.
-    let legacy_laps = motorsport_telemetry::read_lap_metadata(&legacy).unwrap();
-    let modern_laps = motorsport_telemetry::read_lap_metadata(&modern).unwrap();
-    assert_eq!(legacy_laps.len(), modern_laps.len());
-    assert_eq!(legacy_laps.len(), 5);
-    assert!(!motorsport_telemetry::telemetry_needs_update(&modern).unwrap());
-    assert!(motorsport_telemetry::read_format_version(&modern).is_err());
-
-    // --native-zip is a .telemetry-only switch.
-    let rejected = cli()
-        .args([
-            "convert",
-            "--native-zip",
-            input.to_str().unwrap(),
-            dir.path().join("x.telemetry.jsonl").to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8(out.stderr)
+        .unwrap()
+        .contains("unknown option --native-zip"));
+    assert!(!dest.exists());
 }
 
 #[test]
-fn strip_passes_works_on_the_zstd_container() {
+fn strip_passes_recovers_raw_bytes_in_all_recording_encodings() {
     let dir = tempfile::tempdir().unwrap();
     let input = fixture("synthetic_cosworth.pds");
-    let passed = dir.path().join("passed.telemetry");
-    let raw = dir.path().join("raw.telemetry");
-    let stripped = dir.path().join("stripped.telemetry");
-    for (args, dest) in [
-        (vec!["convert"], &passed),
-        (vec!["convert", "--no-passes"], &raw),
-    ] {
-        let mut full: Vec<&str> = args;
-        full.push(input.to_str().unwrap());
-        full.push(dest.to_str().unwrap());
-        let out = cli().args(&full).output().unwrap();
-        assert!(out.status.success(), "{out:?}");
+    for suffix in ["telemetry", "telemetry.jsonl", "telemetry.jsonl.zstd"] {
+        let passed = dir.path().join(format!("passed.{suffix}"));
+        let raw = dir.path().join(format!("raw.{suffix}"));
+        let stripped = dir.path().join(format!("stripped.{suffix}"));
+        for (args, dest) in [
+            (vec!["convert"], &passed),
+            (vec!["convert", "--no-passes"], &raw),
+        ] {
+            let out = cli().args(args).arg(&input).arg(dest).output().unwrap();
+            assert!(out.status.success(), "{suffix}: {out:?}");
+        }
+        let raw_bytes = std::fs::read(&raw).unwrap();
+        assert!(!motorsport_telemetry::open(&passed)
+            .unwrap()
+            .applied_passes()
+            .is_empty());
+        // Both separate output and an in-place rewrite use the requested encoding.
+        for dest in [&stripped, &passed] {
+            let out = cli()
+                .args(["convert", "--strip-passes"])
+                .arg(&passed)
+                .arg(dest)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{suffix}: {out:?}");
+            assert!(motorsport_telemetry::open(dest)
+                .unwrap()
+                .applied_passes()
+                .is_empty());
+            assert_eq!(std::fs::read(dest).unwrap(), raw_bytes, "{suffix}");
+        }
     }
-    let out = cli()
-        .args([
-            "convert",
-            "--strip-passes",
-            passed.to_str().unwrap(),
-            stripped.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{out:?}");
-    let raw_file = motorsport_telemetry::open(&raw).unwrap();
-    let stripped_file = motorsport_telemetry::open(&stripped).unwrap();
-    let passed_file = motorsport_telemetry::open(&passed).unwrap();
-    assert!(passed_file.channels().len() >= raw_file.channels().len());
-    assert_eq!(stripped_file.channels().len(), raw_file.channels().len());
-    assert!(stripped_file.applied_passes().is_empty());
-    assert_eq!(
-        &std::fs::read(&stripped).unwrap()[..4],
-        &[0x28, 0xB5, 0x2F, 0xFD]
-    );
 }
 
 #[test]
@@ -339,7 +306,7 @@ fn inspect_folder_honors_mask() {
         ])
         .output()
         .unwrap();
-    assert!(masked.status.success(), "{:?}", masked);
+    assert!(masked.status.success(), "{masked:?}");
     let report: serde_json::Value = serde_json::from_slice(&masked.stdout).unwrap();
     assert_eq!(report["ok"], 1);
     assert_eq!(report["failed"], 0);
@@ -360,7 +327,7 @@ fn inspect_prints_diagnostics_none_for_a_clean_fixture() {
         .args(["inspect", fixture("synthetic_aimd.mp4").to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
         stdout.contains("diagnostics: none\n"),
@@ -378,7 +345,7 @@ fn json_inspect_carries_a_diagnostics_array() {
         ])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(
         report["diagnostics"].is_array(),
@@ -397,7 +364,7 @@ struct ImplausibleSource {
 }
 
 impl TelemetrySource for ImplausibleSource {
-    fn path(&self) -> &str {
+    fn path(&self) -> &'static str {
         "implausible"
     }
     fn format(&self) -> &'static str {
@@ -456,13 +423,13 @@ fn verify_fails_on_widespread_absurd_values() {
             .collect(),
         packed: (0..5).map(|_| packed_channel()).collect(),
     };
-    write_from_source(&source, &dest).unwrap();
+    write_telemetry(&source, &dest).unwrap();
 
     let output = cli()
         .args(["verify", dest.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(!output.status.success(), "verify must fail: {:?}", output);
+    assert!(!output.status.success(), "verify must fail: {output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("FAIL"), "{stderr}");
     assert!(stderr.contains("decode fault"), "{stderr}");

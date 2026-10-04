@@ -91,7 +91,7 @@ assert!((convert(1.0, "bar", "psi")? - 14.503_773_773_020_923).abs() < 1e-9);
 # Ok::<(), motorsport_telemetry_core::ConvertError>(())
 ```
 
-`timespan_ms` is integer milliseconds (`u32`, max 100 hours = 360_000_000).
+`timespan_ms` is integer milliseconds (`u32`, max 100 hours = `360_000_000`).
 It converts with `s` / `ms` and renders as `M:SS.FFF`:
 
 ```rust

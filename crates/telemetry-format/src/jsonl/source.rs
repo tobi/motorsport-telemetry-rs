@@ -64,7 +64,6 @@ impl TelemetrySource for JsonlRecording {
             "motec" => "motec",
             "vbo" => "vbo",
             "telemetry" => "telemetry",
-            "jsonl" => "jsonl",
             _ => "jsonl",
         }
     }
@@ -137,8 +136,7 @@ impl TelemetrySource for JsonlRecording {
     fn channel_labels(&self, channel_index: usize) -> &[ChannelLabel] {
         self.channel_labels
             .get(channel_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[], Vec::as_slice)
     }
 
     fn channel_display(&self, channel_index: usize) -> ChannelDisplay {

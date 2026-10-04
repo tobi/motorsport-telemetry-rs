@@ -1,12 +1,25 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::unreadable_literal,
+        clippy::float_cmp,
+        reason = "unit tests: fail loudly, print freely, exact fixture values"
+    )
+)]
 
-//! AiM Sports `aimd` telemetry embedded in ISO Base Media (MP4) files.
+//! `AiM` Sports `aimd` telemetry embedded in ISO Base Media (MP4) files.
 //!
 //! Local MP4 files are memory-mapped; `from_bytes` owns its input buffer.
 //! Only samples belonging to the `aimd` track are inspected. Video and audio
 //! payloads are never copied or decoded.
-//! AiM channel definitions are read from the stream's `CHS` records; channel
+//! `AiM` channel definitions are read from the stream's `CHS` records; channel
 //! order, offsets and names are not fixed in this reader.
 
 use motorsport_telemetry_core::{
@@ -39,7 +52,7 @@ const AIMD: &[u8; 4] = b"aimd";
 const RECORD_START: &[u8; 2] = b"(S";
 const INDEX_PACKET_SAMPLES: usize = 19;
 
-/// Errors returned while opening or parsing AiM MP4 telemetry.
+/// Errors returned while opening or parsing `AiM` MP4 telemetry.
 #[derive(Debug, Error)]
 pub enum AimError {
     /// The MP4 could not be opened or memory-mapped.
@@ -108,7 +121,7 @@ fn boxes(data: &[u8], start: usize, end: usize) -> impl Iterator<Item = BoxRef> 
             return None;
         }
         let base = at;
-        let size32 = be32(data, base)? as u64;
+        let size32 = u64::from(be32(data, base)?);
         let kind: [u8; 4] = data.get(base + 4..base + 8)?.try_into().ok()?;
         let (header, size) = match size32 {
             0 => (8usize, (end - base) as u64),
@@ -133,8 +146,8 @@ fn boxes(data: &[u8], start: usize, end: usize) -> impl Iterator<Item = BoxRef> 
     })
 }
 
-fn child(data: &[u8], parent: BoxRef, kind: &[u8; 4]) -> Option<BoxRef> {
-    boxes(data, parent.payload, parent.end).find(|item| &item.kind == kind)
+fn child(data: &[u8], parent: BoxRef, kind: [u8; 4]) -> Option<BoxRef> {
+    boxes(data, parent.payload, parent.end).find(|item| item.kind == kind)
 }
 
 #[derive(Debug)]
@@ -155,7 +168,7 @@ fn box_timescale(data: &[u8], header: BoxRef) -> Option<u32> {
 }
 
 fn movie_timescale(data: &[u8], moov: BoxRef, path: &str) -> Result<Option<u32>, AimError> {
-    let Some(mvhd) = child(data, moov, b"mvhd") else {
+    let Some(mvhd) = child(data, moov, *b"mvhd") else {
         return Ok(None);
     };
     box_timescale(data, mvhd)
@@ -173,10 +186,10 @@ fn presentation_offset_ns(
     let Some(movie_timescale) = movie_timescale else {
         return Ok(None);
     };
-    let Some(edts) = child(data, trak, b"edts") else {
+    let Some(edts) = child(data, trak, *b"edts") else {
         return Ok(Some(0));
     };
-    let elst = child(data, edts, b"elst").ok_or_else(|| invalid(path, "edts has no elst"))?;
+    let elst = child(data, edts, *b"elst").ok_or_else(|| invalid(path, "edts has no elst"))?;
     let version = *data
         .get(elst.payload)
         .ok_or_else(|| invalid(path, "truncated elst"))?;
@@ -225,23 +238,27 @@ fn parse_track(
     movie_timescale: Option<u32>,
     path: &str,
 ) -> Result<Option<TrackSamples>, AimError> {
-    let Some(mdia) = child(data, trak, b"mdia") else {
+    let Some(mdia) = child(data, trak, *b"mdia") else {
         return Ok(None);
     };
-    let mdhd = child(data, mdia, b"mdhd").ok_or_else(|| invalid(path, "aimd track has no mdhd"))?;
+    let mdhd =
+        child(data, mdia, *b"mdhd").ok_or_else(|| invalid(path, "aimd track has no mdhd"))?;
     let timescale =
         box_timescale(data, mdhd).ok_or_else(|| invalid(path, "invalid aimd timescale"))?;
-    let minf = child(data, mdia, b"minf").ok_or_else(|| invalid(path, "aimd track has no minf"))?;
-    let stbl = child(data, minf, b"stbl").ok_or_else(|| invalid(path, "aimd track has no stbl"))?;
+    let minf =
+        child(data, mdia, *b"minf").ok_or_else(|| invalid(path, "aimd track has no minf"))?;
+    let stbl =
+        child(data, minf, *b"stbl").ok_or_else(|| invalid(path, "aimd track has no stbl"))?;
 
-    let stsd = child(data, stbl, b"stsd").ok_or_else(|| invalid(path, "track has no stsd"))?;
+    let stsd = child(data, stbl, *b"stsd").ok_or_else(|| invalid(path, "track has no stsd"))?;
     // AiM uses the standard `meta` handler and identifies telemetry by the
     // sample-entry FourCC. Do not rely on a localized handler name.
     if data.get(stsd.payload + 12..stsd.payload + 16) != Some(AIMD) {
         return Ok(None);
     }
 
-    let stsz = child(data, stbl, b"stsz").ok_or_else(|| invalid(path, "aimd track has no stsz"))?;
+    let stsz =
+        child(data, stbl, *b"stsz").ok_or_else(|| invalid(path, "aimd track has no stsz"))?;
     let default_size =
         be32(data, stsz.payload + 4).ok_or_else(|| invalid(path, "truncated stsz"))?;
     let count =
@@ -268,13 +285,13 @@ fn parse_track(
         }
     };
 
-    let offsets = if let Some(stco) = child(data, stbl, b"stco") {
+    let offsets = if let Some(stco) = child(data, stbl, *b"stco") {
         let n =
             be32(data, stco.payload + 4).ok_or_else(|| invalid(path, "truncated stco"))? as usize;
         (0..n)
             .map(|i| be32(data, stco.payload + 8 + i * 4).map(u64::from))
             .collect::<Option<Vec<_>>>()
-    } else if let Some(co64) = child(data, stbl, b"co64") {
+    } else if let Some(co64) = child(data, stbl, *b"co64") {
         let n =
             be32(data, co64.payload + 4).ok_or_else(|| invalid(path, "truncated co64"))? as usize;
         (0..n)
@@ -286,7 +303,7 @@ fn parse_track(
     .ok_or_else(|| invalid(path, "aimd track has no chunk offsets"))?;
 
     let stsc_box =
-        child(data, stbl, b"stsc").ok_or_else(|| invalid(path, "aimd track has no stsc"))?;
+        child(data, stbl, *b"stsc").ok_or_else(|| invalid(path, "aimd track has no stsc"))?;
     let stsc_count =
         be32(data, stsc_box.payload + 4).ok_or_else(|| invalid(path, "truncated stsc"))? as usize;
     // Validate the declared entry count fits inside the stsc box before
@@ -317,7 +334,8 @@ fn parse_track(
         return Err(invalid(path, "invalid stsc first chunk"));
     }
 
-    let stts = child(data, stbl, b"stts").ok_or_else(|| invalid(path, "aimd track has no stts"))?;
+    let stts =
+        child(data, stbl, *b"stts").ok_or_else(|| invalid(path, "aimd track has no stts"))?;
     let stts_count =
         be32(data, stts.payload + 4).ok_or_else(|| invalid(path, "truncated stts"))? as usize;
     let mut timestamp_count = 0usize;
@@ -339,7 +357,7 @@ fn parse_track(
             .iter()
             .rev()
             .find(|entry| entry.first_chunk <= chunk_number)
-            .unwrap();
+            .ok_or_else(|| invalid(path, "stsc has no entry for chunk"))?;
         let mut offset = chunk_offset;
         for _ in 0..entry.samples_per_chunk {
             if sample >= count {
@@ -348,13 +366,13 @@ fn parse_track(
             let size =
                 sample_size(sample).ok_or_else(|| invalid(path, "truncated stsz entries"))?;
             if offset
-                .checked_add(size as u64)
+                .checked_add(u64::from(size))
                 .is_none_or(|end| end > data.len() as u64)
             {
                 return Err(invalid(path, "aimd sample points outside the MP4"));
             }
             locations.push((offset, size));
-            offset += size as u64;
+            offset += u64::from(size);
             sample += 1;
         }
     }
@@ -392,27 +410,27 @@ fn video_frame_times_ns(data: &[u8], path: &str) -> Result<Vec<u64>, AimError> {
     };
     let movie_timescale = movie_timescale(data, moov, path)?;
     for trak in boxes(data, moov.payload, moov.end).filter(|item| &item.kind == b"trak") {
-        let Some(mdia) = child(data, trak, b"mdia") else {
+        let Some(mdia) = child(data, trak, *b"mdia") else {
             continue;
         };
-        let Some(hdlr) = child(data, mdia, b"hdlr") else {
+        let Some(hdlr) = child(data, mdia, *b"hdlr") else {
             continue;
         };
         if data.get(hdlr.payload + 8..hdlr.payload + 12) != Some(b"vide") {
             continue;
         }
         let mdhd =
-            child(data, mdia, b"mdhd").ok_or_else(|| invalid(path, "video track has no mdhd"))?;
+            child(data, mdia, *b"mdhd").ok_or_else(|| invalid(path, "video track has no mdhd"))?;
         let timescale =
             box_timescale(data, mdhd).ok_or_else(|| invalid(path, "invalid video timescale"))?;
         let presentation_offset =
             presentation_offset_ns(data, trak, timescale, movie_timescale, path)?.unwrap_or(0);
         let minf =
-            child(data, mdia, b"minf").ok_or_else(|| invalid(path, "video track has no minf"))?;
+            child(data, mdia, *b"minf").ok_or_else(|| invalid(path, "video track has no minf"))?;
         let stbl =
-            child(data, minf, b"stbl").ok_or_else(|| invalid(path, "video track has no stbl"))?;
+            child(data, minf, *b"stbl").ok_or_else(|| invalid(path, "video track has no stbl"))?;
         let stts =
-            child(data, stbl, b"stts").ok_or_else(|| invalid(path, "video track has no stts"))?;
+            child(data, stbl, *b"stts").ok_or_else(|| invalid(path, "video track has no stts"))?;
         let count = be32(data, stts.payload + 4)
             .ok_or_else(|| invalid(path, "truncated video stts"))? as usize;
         let mut decode_times = Vec::new();
@@ -441,7 +459,7 @@ fn video_frame_times_ns(data: &[u8], path: &str) -> Result<Vec<u64>, AimError> {
             }
         }
         let mut composition_offsets = vec![0i64; decode_times.len()];
-        if let Some(ctts) = child(data, stbl, b"ctts") {
+        if let Some(ctts) = child(data, stbl, *b"ctts") {
             let version = *data
                 .get(ctts.payload)
                 .ok_or_else(|| invalid(path, "truncated video ctts"))?;
@@ -555,8 +573,7 @@ impl RecordDispatch {
             Self::Sparse(indexes) => indexes
                 .binary_search_by_key(&record_id, |entry| entry.0)
                 .ok()
-                .map(|index| indexes[index].1)
-                .unwrap_or(0),
+                .map_or(0, |index| indexes[index].1),
         };
         encoded.checked_sub(1).map(usize::from)
     }
@@ -602,19 +619,28 @@ impl Representation {
     fn is_gps(self) -> bool {
         !matches!(self, Self::U8 | Self::I32 | Self::U32 | Self::F32)
     }
+
+    fn is_position(self) -> bool {
+        matches!(
+            self,
+            Self::GpsLatitude | Self::GpsLongitude | Self::GpsAltitude
+        )
+    }
 }
 
-/// An AiM telemetry stream embedded in an MP4 recording.
+/// An `AiM` telemetry stream embedded in an MP4 recording.
 #[derive(Debug)]
 pub struct AimFile {
     /// Source path or caller-supplied name.
     pub path: String,
-    /// Source-exact telemetry channel metadata.
+    /// Telemetry channel metadata, including any diagnosed position recovery.
     pub channels: Vec<Channel>,
     data: Storage,
     aim_channels: Vec<AimChannel>,
     gps_samples: Vec<SampleRef>,
     gps_times: Vec<u64>,
+    gps_position_samples: Vec<SampleRef>,
+    gps_position_times: Vec<u64>,
     video_frame_times_ns: Vec<u64>,
     presentation_offset_ns: Option<i128>,
     videos: Vec<motorsport_telemetry_core::VideoFileRef>,
@@ -688,7 +714,11 @@ fn gps_channel(
 }
 
 fn gps_channels(first_id: u32) -> Vec<(Channel, AimChannel)> {
-    use Representation::*;
+    use Representation::{
+        GpsAltitude, GpsDop, GpsFixFlags, GpsFixType, GpsHeading, GpsItow, GpsLatitude,
+        GpsLongitude, GpsPositionAccuracy, GpsSatellites, GpsSpeed, GpsSpeedAccuracy, GpsVelocityX,
+        GpsVelocityY, GpsVelocityZ, GpsWeek,
+    };
     [
         ("GPS Latitude", "deg", SampleType::F64, GpsLatitude),
         ("GPS Longitude", "deg", SampleType::F64, GpsLongitude),
@@ -756,7 +786,7 @@ fn schema(
             gps_record = Some(record_id);
             continue;
         }
-        if record_id > u16::MAX as u32 || name.is_empty() || !matches!(width, 1 | 4) {
+        if record_id > u32::from(u16::MAX) || name.is_empty() || !matches!(width, 1 | 4) {
             chs_skipped += 1;
             continue;
         }
@@ -862,8 +892,7 @@ fn period_chunks(samples: &[SampleRef]) -> Vec<Chunk> {
     let modal = counts
         .into_iter()
         .max_by_key(|&(delta, count)| (count, std::cmp::Reverse(delta)))
-        .map(|(delta, _)| delta)
-        .unwrap_or(1);
+        .map_or(1, |(delta, _)| delta);
     // A chunk models its samples as `time_base + i * period`, and the
     // logger's own millisecond stamps are the clock that model must honour.
     // Each gap-free run is fitted with its own period (the run's mean
@@ -1053,7 +1082,7 @@ fn ingest_packet(
         }
         aim_channels[index].samples.push(SampleRef {
             value_offset: offset + value as u64,
-            time_ns: timestamp as u64 * 1_000_000,
+            time_ns: u64::from(timestamp) * 1_000_000,
         });
         at = value + width + 1;
     }
@@ -1071,7 +1100,7 @@ fn ingest_packet(
                 if has_gps {
                     gps_samples.push(SampleRef {
                         value_offset: offset + payload as u64,
-                        time_ns: timestamp as u64 * 1_000_000,
+                        time_ns: u64::from(timestamp) * 1_000_000,
                     });
                 }
             } else {
@@ -1125,7 +1154,7 @@ fn index_packet_indexes(available_samples: usize) -> Vec<usize> {
 
 impl AimFile {
     #[cfg(not(target_os = "emscripten"))]
-    /// Memory-maps and parses an MP4 containing an AiM `aimd` track.
+    /// Memory-maps and parses an MP4 containing an `AiM` `aimd` track.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AimError> {
         let path_ref = path.as_ref();
         let display = path_ref.to_string_lossy().into_owned();
@@ -1137,7 +1166,7 @@ impl AimFile {
     }
 
     #[cfg(not(target_os = "emscripten"))]
-    /// Opens a bounded, index-only view of an AiM MP4.
+    /// Opens a bounded, index-only view of an `AiM` MP4.
     ///
     /// This reads the channel schema, all samples belonging to lap counters or
     /// timers, and at most 19 evenly distributed packets for other channel
@@ -1153,7 +1182,7 @@ impl AimFile {
         })?;
         Self::parse(display, data, ParseMode::Index)
     }
-    /// Parses AiM telemetry from an owned MP4 byte buffer.
+    /// Parses `AiM` telemetry from an owned MP4 byte buffer.
     pub fn from_bytes(path: impl Into<String>, data: Vec<u8>) -> Result<Self, AimError> {
         Self::parse(path.into(), Storage::from_vec(data), ParseMode::Full)
     }
@@ -1339,12 +1368,11 @@ impl AimFile {
             } else {
                 period_chunks(samples)
             };
-            channel.duration_ns = samples
-                .last()
-                .map(|sample| sample.time_ns + channel.first_period_ns().unwrap_or(1))
-                .unwrap_or(0);
+            channel.duration_ns = samples.last().map_or(0, |sample| {
+                sample.time_ns + channel.first_period_ns().unwrap_or(1)
+            });
         }
-        let videos = std::path::Path::new(&display)
+        let videos = Path::new(&display)
             .file_name()
             .map(|name| {
                 vec![motorsport_telemetry_core::VideoFileRef {
@@ -1356,27 +1384,116 @@ impl AimFile {
                 }]
             })
             .unwrap_or_default();
-        Ok(Self {
+        let mut file = Self {
             path: display,
             channels,
             data,
             aim_channels,
             gps_samples,
             gps_times,
+            gps_position_samples: Vec::new(),
+            gps_position_times: Vec::new(),
             video_frame_times_ns,
             presentation_offset_ns: track.presentation_offset_ns,
             videos,
             diagnostics,
-        })
+        };
+        file.backfill_gps_start();
+        Ok(file)
+    }
+
+    fn backfill_gps_start(&mut self) {
+        let Some(anchor) = self
+            .gps_samples
+            .iter()
+            .find(|sample| {
+                let Some(bytes) = usize::try_from(sample.value_offset)
+                    .ok()
+                    .and_then(|offset| self.data.get(offset..offset.checked_add(56)?))
+                else {
+                    return false;
+                };
+                let (lat, lon, altitude) = ecef_position(bytes);
+                lat.is_finite()
+                    && lon.is_finite()
+                    && altitude.is_finite()
+                    && !(lat.abs() < 1e-7 && lon.abs() < 1e-7)
+                    && gps_u32(bytes, 28) < 4_000_000.0 * 100.0
+            })
+            .copied()
+        else {
+            return;
+        };
+        let Some((speed, start_ns)) =
+            motorsport_telemetry_core::motion::stationary_lead_in(self, anchor.time_ns)
+        else {
+            return;
+        };
+        let mut positions: Vec<_> = self
+            .gps_samples
+            .iter()
+            .take_while(|sample| sample.time_ns < start_ns)
+            .copied()
+            .collect();
+        // Keep the GPS cadence even if wheel speed is recorded much faster;
+        // otherwise JSONL's dominant lattice would make later fixes sparse.
+        // A lone GPS packet has no measured cadence; GPS0 normally runs at 25 Hz.
+        let period_ns = self
+            .channels
+            .iter()
+            .zip(&self.aim_channels)
+            .find(|(_, raw)| raw.representation.is_position())
+            .and_then(|(channel, _)| {
+                channel
+                    .chunks
+                    .iter()
+                    .filter(|chunk| chunk.sample_count > 1 && chunk.sample_period_ns >= 1_000_000)
+                    .max_by_key(|chunk| chunk.sample_count)
+            })
+            .map_or(40_000_000, |chunk| chunk.sample_period_ns);
+        let mut time_ns = start_ns;
+        let mut recovered = 0;
+        while time_ns < anchor.time_ns {
+            positions.push(SampleRef { time_ns, ..anchor });
+            recovered += 1;
+            time_ns = time_ns.saturating_add(period_ns);
+        }
+        positions.extend(
+            self.gps_samples
+                .iter()
+                .filter(|sample| sample.time_ns >= anchor.time_ns)
+                .copied(),
+        );
+        let chunks = period_chunks(&positions);
+        for (channel, raw) in self.channels.iter_mut().zip(&self.aim_channels) {
+            if raw.representation.is_position() {
+                channel.sample_count = positions.len() as u64;
+                channel.chunks.clone_from(&chunks);
+                channel.duration_ns = positions.last().map_or(0, |sample| {
+                    sample.time_ns + channel.first_period_ns().unwrap_or(1)
+                });
+            }
+        }
+        self.gps_position_times = positions.iter().map(|sample| sample.time_ns).collect();
+        self.gps_position_samples = positions;
+        self.diagnostics.push(Diagnostic::warning("aim.gps_start_backfilled", format!(
+            "GPS position from the first valid fix at {} ns was carried back to {} ns \
+             for {recovered} samples using exactly zero {:?} car speed; receiver fix status is unchanged",
+            anchor.time_ns, start_ns, self.channels[speed].name,
+        )));
     }
 }
 
-fn gps_i32(data: &[u8], offset: usize) -> i32 {
-    i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+fn gps_i32(data: &[u8], offset: usize) -> f64 {
+    data.get(offset..)
+        .and_then(|bytes| SampleType::I32.decode_le(bytes))
+        .unwrap_or(f64::NAN)
 }
 
-fn gps_u32(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+fn gps_u32(data: &[u8], offset: usize) -> f64 {
+    data.get(offset..)
+        .and_then(|bytes| SampleType::U32.decode_le(bytes))
+        .unwrap_or(f64::NAN)
 }
 
 fn gps_fix_valid(data: &[u8]) -> bool {
@@ -1384,16 +1501,16 @@ fn gps_fix_valid(data: &[u8]) -> bool {
     // Position is available for 2D, 3D, and GPS+dead-reckoning solutions. The
     // observed AiM firmware leaves NAV-SOL's GPSfixOK bit clear even while
     // reporting a stable 3D solution, so gpsFix is the authoritative quality.
-    matches!(data[14], 2..=4)
+    data.get(14).is_some_and(|&fix| matches!(fix, 2..=4))
 }
 
 fn ecef_position(data: &[u8]) -> (f64, f64, f64) {
     if !gps_fix_valid(data) {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
-    let x = gps_i32(data, 16) as f64 / 100.0;
-    let y = gps_i32(data, 20) as f64 / 100.0;
-    let z = gps_i32(data, 24) as f64 / 100.0;
+    let x = gps_i32(data, 16) / 100.0;
+    let y = gps_i32(data, 20) / 100.0;
+    let z = gps_i32(data, 24) / 100.0;
     let a = 6_378_137.0_f64;
     let e2 = 6.694_379_990_14e-3_f64;
     let longitude = y.atan2(x);
@@ -1413,9 +1530,9 @@ fn gps_velocity(data: &[u8]) -> (f64, f64, f64) {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
     (
-        gps_i32(data, 32) as f64 / 100.0,
-        gps_i32(data, 36) as f64 / 100.0,
-        gps_i32(data, 40) as f64 / 100.0,
+        gps_i32(data, 32) / 100.0,
+        gps_i32(data, 36) / 100.0,
+        gps_i32(data, 40) / 100.0,
     )
 }
 
@@ -1446,7 +1563,9 @@ impl TelemetrySource for AimFile {
     }
     fn sample_times(&self, channel_index: usize) -> SampleTimes<'_> {
         let raw = &self.aim_channels[channel_index];
-        if raw.representation.is_gps() {
+        if raw.representation.is_position() && !self.gps_position_samples.is_empty() {
+            SampleTimes::Explicit(&self.gps_position_times)
+        } else if raw.representation.is_gps() {
             SampleTimes::Explicit(&self.gps_times)
         } else {
             SampleTimes::Explicit(&raw.times)
@@ -1456,7 +1575,9 @@ impl TelemetrySource for AimFile {
     fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
         let chunk = &self.channels[channel_index].chunks[chunk_index];
         let raw = &self.aim_channels[channel_index];
-        let samples = if raw.representation.is_gps() {
+        let samples = if raw.representation.is_position() && !self.gps_position_samples.is_empty() {
+            &self.gps_position_samples
+        } else if raw.representation.is_gps() {
             &self.gps_samples
         } else {
             &raw.samples
@@ -1498,88 +1619,63 @@ impl TelemetrySource for AimFile {
             Representation::GpsLatitude => self
                 .data
                 .get(at..at + 56)
-                .map(|p| ecef_position(p).0)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| ecef_position(p).0),
             Representation::GpsLongitude => self
                 .data
                 .get(at..at + 56)
-                .map(|p| ecef_position(p).1)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| ecef_position(p).1),
             Representation::GpsAltitude => self
                 .data
                 .get(at..at + 56)
-                .map(|p| ecef_position(p).2)
-                .unwrap_or(f64::NAN),
-            Representation::GpsSpeed => self
-                .data
-                .get(at..at + 56)
-                .map(|p| {
-                    let (x, y, z) = gps_velocity(p);
-                    x.hypot(y).hypot(z)
-                })
-                .unwrap_or(f64::NAN),
-            Representation::GpsHeading => self
-                .data
-                .get(at..at + 56)
-                .map(gps_heading)
-                .unwrap_or(f64::NAN),
-            Representation::GpsSatellites => self
-                .data
-                .get(at + 51)
-                .map(|&b| b as f64)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| ecef_position(p).2),
+            Representation::GpsSpeed => self.data.get(at..at + 56).map_or(f64::NAN, |p| {
+                let (x, y, z) = gps_velocity(p);
+                x.hypot(y).hypot(z)
+            }),
+            Representation::GpsHeading => self.data.get(at..at + 56).map_or(f64::NAN, gps_heading),
+            Representation::GpsSatellites => {
+                self.data.get(at + 51).map_or(f64::NAN, |&b| f64::from(b))
+            }
             Representation::GpsPositionAccuracy => self
                 .data
                 .get(at..at + 56)
-                .map(|p| gps_u32(p, 28) as f64 / 100.0)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| gps_u32(p, 28) / 100.0),
             Representation::GpsSpeedAccuracy => self
                 .data
                 .get(at..at + 56)
-                .map(|p| gps_u32(p, 44) as f64 / 100.0)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| gps_u32(p, 44) / 100.0),
             Representation::GpsVelocityX => self
                 .data
                 .get(at..at + 56)
-                .map(|p| gps_velocity(p).0)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| gps_velocity(p).0),
             Representation::GpsVelocityY => self
                 .data
                 .get(at..at + 56)
-                .map(|p| gps_velocity(p).1)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| gps_velocity(p).1),
             Representation::GpsVelocityZ => self
                 .data
                 .get(at..at + 56)
-                .map(|p| gps_velocity(p).2)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| gps_velocity(p).2),
             Representation::GpsItow => self
                 .data
                 .get(at..at + 56)
-                .map(|p| gps_u32(p, 4) as f64)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |p| gps_u32(p, 4)),
             Representation::GpsWeek => self
                 .data
                 .get(at..at + 56)
                 .and_then(|p| le16(p, 12))
-                .map(|v| v as f64)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, f64::from),
             Representation::GpsDop => self
                 .data
                 .get(at..at + 56)
                 .and_then(|p| le16(p, 48))
-                .map(|v| v as f64 / 100.0)
-                .unwrap_or(f64::NAN),
-            Representation::GpsFixType => self
-                .data
-                .get(at + 14)
-                .map(|&b| b as f64)
-                .unwrap_or(f64::NAN),
-            Representation::GpsFixFlags => self
-                .data
-                .get(at + 15)
-                .map(|&b| b as f64)
-                .unwrap_or(f64::NAN),
+                .map_or(f64::NAN, |v| f64::from(v) / 100.0),
+            Representation::GpsFixType => {
+                self.data.get(at + 14).map_or(f64::NAN, |&b| f64::from(b))
+            }
+            Representation::GpsFixFlags => {
+                self.data.get(at + 15).map_or(f64::NAN, |&b| f64::from(b))
+            }
         }
     }
 
@@ -1618,6 +1714,100 @@ impl TelemetrySource for AimFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DELAYED_GPS: &[u8] =
+        include_bytes!("../../../tests/fixtures/synthetic_aimd_delayed_gps.mp4");
+
+    #[test]
+    fn delayed_gps_recovers_existing_positions_without_inventing_receiver_status() {
+        let file = AimFile::from_bytes("delayed.mp4", DELAYED_GPS.to_vec()).unwrap();
+        assert_eq!(file.channels.len(), 17);
+        let latitude = names::find(file.channels(), &["gpslatitude"]).unwrap();
+        let longitude = names::find(file.channels(), &["gpslongitude"]).unwrap();
+        let altitude = names::find(file.channels(), &["gpsaltitude"]).unwrap();
+        let fix = names::find(file.channels(), &["gpsfixtype"]).unwrap();
+        let anchor = file.sample_at(latitude, 183_000_000_000, false).unwrap();
+        assert!((anchor - 43.8).abs() < 1e-6);
+        for at in [
+            0,
+            60_000_000_000,
+            179_000_000_000,
+            180_000_000_000,
+            182_000_000_000,
+        ] {
+            assert_eq!(file.sample_at(latitude, at, false), Some(anchor));
+            assert!((file.sample_at(longitude, at, false).unwrap() + 88.0).abs() < 1e-6);
+            assert!((file.sample_at(altitude, at, false).unwrap() - 300.0).abs() < 0.1);
+        }
+        assert_eq!(file.sample_at(fix, 0, false), None);
+        assert_eq!(file.sample_at(fix, 180_000_000_000, false), Some(0.0));
+        assert_eq!(file.sample_at(fix, 183_000_000_000, false), Some(3.0));
+        assert!(file
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "aim.gps_start_backfilled"));
+        assert!(file.sample_at(latitude, 220_000_000_000, false).unwrap() > anchor);
+    }
+
+    #[test]
+    fn movement_or_unknown_speed_limits_position_recovery() {
+        let source = AimFile::from_bytes("delayed.mp4", DELAYED_GPS.to_vec()).unwrap();
+        let speed = names::find(source.channels(), &["speedwspdapp"]).unwrap();
+        let offset = source.aim_channels[speed].samples[1000].value_offset as usize;
+        for value in [0.1_f32, 90.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut bytes = DELAYED_GPS.to_vec();
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            let file = AimFile::from_bytes("changed.mp4", bytes).unwrap();
+            let latitude = names::find(file.channels(), &["gpslatitude"]).unwrap();
+            assert_eq!(file.sample_at(latitude, 0, false), None);
+            assert_eq!(file.sample_at(latitude, 100_000_000_000, false), None);
+            assert!(file
+                .sample_at(latitude, 101_000_000_000, false)
+                .unwrap()
+                .is_finite());
+        }
+    }
+
+    #[test]
+    fn a_speed_acquisition_gap_limits_position_recovery() {
+        let source = AimFile::from_bytes("delayed.mp4", DELAYED_GPS.to_vec()).unwrap();
+        let speed = names::find(source.channels(), &["speedwspdapp"]).unwrap();
+        let mut bytes = DELAYED_GPS.to_vec();
+        // Remove two native samples, leaving a gap longer than two periods.
+        for index in [1000, 1001] {
+            let value = source.aim_channels[speed].samples[index].value_offset as usize;
+            bytes[value - 6..value - 2].copy_from_slice(&99_900u32.to_le_bytes());
+        }
+        let file = AimFile::from_bytes("gap.mp4", bytes).unwrap();
+        let latitude = names::find(file.channels(), &["gpslatitude"]).unwrap();
+        assert_eq!(file.sample_at(latitude, 0, false), None);
+        assert!(file
+            .sample_at(latitude, 101_000_000_000, false)
+            .unwrap()
+            .is_finite());
+    }
+
+    #[test]
+    fn moving_at_first_fix_or_never_acquiring_does_not_backfill() {
+        let source = AimFile::from_bytes("delayed.mp4", DELAYED_GPS.to_vec()).unwrap();
+        let speed = names::find(source.channels(), &["speedwspdapp"]).unwrap();
+        let offset = source.aim_channels[speed].samples[1830].value_offset as usize;
+        let mut moving = DELAYED_GPS.to_vec();
+        moving[offset..offset + 4].copy_from_slice(&90.0_f32.to_le_bytes());
+        let mut no_fix = DELAYED_GPS.to_vec();
+        for sample in &source.gps_samples {
+            no_fix[sample.value_offset as usize + 14] = 0;
+        }
+        for bytes in [moving, no_fix] {
+            let file = AimFile::from_bytes("unrecoverable.mp4", bytes).unwrap();
+            let latitude = names::find(file.channels(), &["gpslatitude"]).unwrap();
+            assert_eq!(file.sample_at(latitude, 0, false), None);
+            assert!(!file
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "aim.gps_start_backfilled"));
+        }
+    }
 
     fn samples_at(times_ns: &[u64]) -> Vec<SampleRef> {
         times_ns
@@ -1799,10 +1989,32 @@ mod tests {
         assert!(gps_velocity(&gps).0.is_nan());
     }
 
-    fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    #[test]
+    fn truncated_gps_fields_return_nan_without_panicking() {
+        for length in 0..4 {
+            let data = &i32::MIN.to_le_bytes()[..length];
+            assert!(gps_i32(data, 0).is_nan());
+            assert!(gps_u32(data, 0).is_nan());
+        }
+        assert!(gps_i32(&[], usize::MAX).is_nan());
+        assert!(gps_u32(&[], usize::MAX).is_nan());
+        assert_eq!(gps_i32(&i32::MIN.to_le_bytes(), 0), f64::from(i32::MIN));
+        assert_eq!(gps_u32(&u32::MAX.to_le_bytes(), 0), f64::from(u32::MAX));
+
+        let mut gps = [0; 15];
+        assert!(!gps_fix_valid(&gps[..14]));
+        gps[14] = 3;
+        let (latitude, longitude, altitude) = ecef_position(&gps);
+        assert!(latitude.is_nan() && longitude.is_nan() && altitude.is_nan());
+        let (x, y, z) = gps_velocity(&gps);
+        assert!(x.is_nan() && y.is_nan() && z.is_nan());
+        assert!(gps_heading(&gps).is_nan());
+    }
+
+    fn mp4_box(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(payload.len() + 8);
         out.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
-        out.extend_from_slice(kind);
+        out.extend_from_slice(&kind);
         out.extend_from_slice(payload);
         out
     }
@@ -1864,65 +2076,65 @@ mod tests {
     }
 
     fn fixture_mp4(with_aimd: bool) -> Vec<u8> {
-        let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+        let ftyp = mp4_box(*b"ftyp", b"isom\0\0\0\0isom");
         let (schema, values) = fixture_samples();
         let mut media = Vec::new();
         media.extend_from_slice(&schema);
         media.extend_from_slice(&values);
-        let mdat = mp4_box(b"mdat", &media);
+        let mdat = mp4_box(*b"mdat", &media);
         let chunk_offset = (ftyp.len() + 8) as u32;
 
         let mut mdhd = vec![0; 24];
         mdhd[12..16].copy_from_slice(&1000u32.to_be_bytes());
-        let mdhd = mp4_box(b"mdhd", &mdhd);
+        let mdhd = mp4_box(*b"mdhd", &mdhd);
         let mut hdlr = vec![0; 24];
         hdlr[8..12].copy_from_slice(b"meta");
-        let hdlr = mp4_box(b"hdlr", &hdlr);
+        let hdlr = mp4_box(*b"hdlr", &hdlr);
         let sample_type = if with_aimd { AIMD } else { b"text" };
         let mut stsd = vec![0; 16];
         stsd[7] = 1;
         stsd[8..12].copy_from_slice(&8u32.to_be_bytes());
         stsd[12..16].copy_from_slice(sample_type);
-        let stsd = mp4_box(b"stsd", &stsd);
+        let stsd = mp4_box(*b"stsd", &stsd);
         let mut stts = vec![0; 16];
         stts[7] = 1;
         stts[8..12].copy_from_slice(&2u32.to_be_bytes());
         stts[12..16].copy_from_slice(&100u32.to_be_bytes());
-        let stts = mp4_box(b"stts", &stts);
+        let stts = mp4_box(*b"stts", &stts);
         let mut stsc = vec![0; 20];
         stsc[7] = 1;
         stsc[8..12].copy_from_slice(&1u32.to_be_bytes());
         stsc[12..16].copy_from_slice(&2u32.to_be_bytes());
         stsc[16..20].copy_from_slice(&1u32.to_be_bytes());
-        let stsc = mp4_box(b"stsc", &stsc);
+        let stsc = mp4_box(*b"stsc", &stsc);
         let mut stsz = vec![0; 20];
         stsz[8..12].copy_from_slice(&2u32.to_be_bytes());
         stsz[12..16].copy_from_slice(&(schema.len() as u32).to_be_bytes());
         stsz[16..20].copy_from_slice(&(values.len() as u32).to_be_bytes());
-        let stsz = mp4_box(b"stsz", &stsz);
+        let stsz = mp4_box(*b"stsz", &stsz);
         let mut stco = vec![0; 12];
         stco[7] = 1;
         stco[8..12].copy_from_slice(&chunk_offset.to_be_bytes());
-        let stco = mp4_box(b"stco", &stco);
+        let stco = mp4_box(*b"stco", &stco);
         let mut stbl_payload = Vec::new();
         for item in [stsd, stts, stsc, stsz, stco] {
             stbl_payload.extend(item);
         }
-        let stbl = mp4_box(b"stbl", &stbl_payload);
-        let minf = mp4_box(b"minf", &stbl);
+        let stbl = mp4_box(*b"stbl", &stbl_payload);
+        let minf = mp4_box(*b"minf", &stbl);
         let mut mdia_payload = Vec::new();
         mdia_payload.extend(mdhd);
         mdia_payload.extend(hdlr);
         mdia_payload.extend(minf);
-        let mdia = mp4_box(b"mdia", &mdia_payload);
-        let trak = mp4_box(b"trak", &mdia);
-        let moov = mp4_box(b"moov", &trak);
+        let mdia = mp4_box(*b"mdia", &mdia_payload);
+        let trak = mp4_box(*b"trak", &mdia);
+        let moov = mp4_box(*b"moov", &trak);
         [ftyp, mdat, moov].concat()
     }
 
     fn multilap_fixture_mp4(packet_count: usize) -> Vec<u8> {
         assert!(packet_count > INDEX_PACKET_SAMPLES + 2);
-        let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+        let ftyp = mp4_box(*b"ftyp", b"isom\0\0\0\0isom");
         let (schema, template) = fixture_samples();
         let lap_definition = channel_definition(44, "Lap_Number", 4);
         let mut schema = schema;
@@ -1956,28 +2168,28 @@ mod tests {
         for packet in &packets {
             media.extend_from_slice(packet);
         }
-        let mdat = mp4_box(b"mdat", &media);
+        let mdat = mp4_box(*b"mdat", &media);
         let chunk_offset = (ftyp.len() + 8) as u32;
         let mut mdhd = vec![0; 24];
         mdhd[12..16].copy_from_slice(&1000u32.to_be_bytes());
-        let mdhd = mp4_box(b"mdhd", &mdhd);
+        let mdhd = mp4_box(*b"mdhd", &mdhd);
         let mut stsd = vec![0; 16];
         stsd[7] = 1;
         stsd[8..12].copy_from_slice(&8u32.to_be_bytes());
         stsd[12..16].copy_from_slice(AIMD);
-        let stsd = mp4_box(b"stsd", &stsd);
+        let stsd = mp4_box(*b"stsd", &stsd);
         let sample_count = packets.len() + 1;
         let mut stts = vec![0; 16];
         stts[7] = 1;
         stts[8..12].copy_from_slice(&(sample_count as u32).to_be_bytes());
         stts[12..16].copy_from_slice(&100u32.to_be_bytes());
-        let stts = mp4_box(b"stts", &stts);
+        let stts = mp4_box(*b"stts", &stts);
         let mut stsc = vec![0; 20];
         stsc[7] = 1;
         stsc[8..12].copy_from_slice(&1u32.to_be_bytes());
         stsc[12..16].copy_from_slice(&(sample_count as u32).to_be_bytes());
         stsc[16..20].copy_from_slice(&1u32.to_be_bytes());
-        let stsc = mp4_box(b"stsc", &stsc);
+        let stsc = mp4_box(*b"stsc", &stsc);
         let mut stsz = vec![0; 12 + sample_count * 4];
         stsz[8..12].copy_from_slice(&(sample_count as u32).to_be_bytes());
         for (index, size) in std::iter::once(schema.len())
@@ -1986,16 +2198,16 @@ mod tests {
         {
             stsz[12 + index * 4..16 + index * 4].copy_from_slice(&(size as u32).to_be_bytes());
         }
-        let stsz = mp4_box(b"stsz", &stsz);
+        let stsz = mp4_box(*b"stsz", &stsz);
         let mut stco = vec![0; 12];
         stco[7] = 1;
         stco[8..12].copy_from_slice(&chunk_offset.to_be_bytes());
-        let stco = mp4_box(b"stco", &stco);
-        let stbl = mp4_box(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
-        let minf = mp4_box(b"minf", &stbl);
-        let mdia = mp4_box(b"mdia", &[mdhd, minf].concat());
-        let trak = mp4_box(b"trak", &mdia);
-        let moov = mp4_box(b"moov", &trak);
+        let stco = mp4_box(*b"stco", &stco);
+        let stbl = mp4_box(*b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+        let minf = mp4_box(*b"minf", &stbl);
+        let mdia = mp4_box(*b"mdia", &[mdhd, minf].concat());
+        let trak = mp4_box(*b"trak", &mdia);
+        let moov = mp4_box(*b"moov", &trak);
         [ftyp, mdat, moov].concat()
     }
 
@@ -2039,7 +2251,7 @@ mod tests {
     fn edit_list_maps_telemetry_to_movie_presentation_time() {
         let mut mvhd = vec![0; 24];
         mvhd[12..16].copy_from_slice(&1000u32.to_be_bytes());
-        let mvhd = mp4_box(b"mvhd", &mvhd);
+        let mvhd = mp4_box(*b"mvhd", &mvhd);
         let mut elst = vec![0; 32];
         elst[7] = 2;
         elst[8..12].copy_from_slice(&104u32.to_be_bytes());
@@ -2048,8 +2260,8 @@ mod tests {
         elst[20..24].copy_from_slice(&200u32.to_be_bytes());
         elst[24..28].copy_from_slice(&0i32.to_be_bytes());
         elst[28..32].copy_from_slice(&0x0001_0000u32.to_be_bytes());
-        let trak = mp4_box(b"trak", &mp4_box(b"edts", &mp4_box(b"elst", &elst)));
-        let moov = mp4_box(b"moov", &[mvhd, trak].concat());
+        let trak = mp4_box(*b"trak", &mp4_box(*b"edts", &mp4_box(*b"elst", &elst)));
+        let moov = mp4_box(*b"moov", &[mvhd, trak].concat());
         let moov_ref = boxes(&moov, 0, moov.len()).next().unwrap();
         let trak_ref = boxes(&moov, moov_ref.payload, moov_ref.end)
             .find(|item| &item.kind == b"trak")
@@ -2241,7 +2453,7 @@ mod tests {
             .any(|d| d.code == "aim.unknown_record_id"));
     }
 
-    /// Indianapolis 2026 CT1 Run2 (AiM SmartyCam, 10,906 aimd packets over
+    /// Indianapolis 2026 CT1 Run2 (`AiM` `SmartyCam`, 10,906 aimd packets over
     /// 18 minutes): one packet's length word disagreed with the MP4 sample
     /// table and the whole file was rejected, losing ten flying laps. A
     /// damaged packet is skipped and counted; the rest of the recording

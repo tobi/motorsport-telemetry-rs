@@ -95,7 +95,7 @@ pub(super) fn parse_header_line(header_line: &str) -> Result<ParsedHeader, Telem
         (name, Some(start_ns), end_ns) if !name.is_empty() => Some(AbsoluteTimeRange {
             clock: name,
             start_ns,
-            end_ns: end_ns.unwrap_or(start_ns.saturating_add(duration_ns)),
+            end_ns: end_ns.unwrap_or_else(|| start_ns.saturating_add(duration_ns)),
             session_hint,
         }),
         _ => None,
@@ -326,8 +326,9 @@ impl JsonlRecording {
             }
             let (record_origin_ns, record_quantum_ns, record_duration_ns) = current_group
                 .as_ref()
-                .map(|group| (group.origin_ns, group.quantum_ns, group.duration_ns))
-                .unwrap_or((origin_ns, quantum_ns, duration_ns));
+                .map_or((origin_ns, quantum_ns, duration_ns), |group| {
+                    (group.origin_ns, group.quantum_ns, group.duration_ns)
+                });
             match record_kind(object)? {
                 RecordKind::Channel => {
                     let parsed = parse_channel(
@@ -378,12 +379,12 @@ impl JsonlRecording {
             duration_ns,
             schema_hash,
             extension,
-            passes,
             sidecar_groups,
             channel_visible,
             channel_labels,
             channel_display,
             spans,
+            passes,
             videos,
             video_times,
             video_offset_ns,
@@ -916,7 +917,7 @@ type ParsedVideos = (Vec<VideoFileRef>, Vec<u64>, Option<i128>);
 /// the frame timestamp table, and the recording-level presentation offset.
 ///
 /// Sidecar (`mtx`) documents reject all three keys, `vpts` requires `vf`
-/// (otherwise a native rewrite would have to invent a file reference), and
+/// (frame timestamps require a linked video file), and
 /// the timestamp table must be non-decreasing because readers binary-search
 /// it in presentation order.
 fn parse_videos(
@@ -1026,9 +1027,7 @@ fn decode_blake3_hex(hex: &str) -> Result<[u8; 32], TelemetryFormatError> {
     Ok(digest)
 }
 /// Parses the optional `passes` header key back into provenance records.
-fn parse_passes(
-    header: &serde_json::Map<String, Value>,
-) -> Result<Vec<AppliedPass>, TelemetryFormatError> {
+fn parse_passes(header: &Map<String, Value>) -> Result<Vec<AppliedPass>, TelemetryFormatError> {
     let Some(value) = header.get("passes") else {
         return Ok(Vec::new());
     };

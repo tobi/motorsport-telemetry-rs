@@ -1,9 +1,22 @@
-//! Compare a converted `.telemetry` file against its original AiM MP4.
+//! Compare video sync in a converted `.telemetry` file with its original `AiM` MP4.
+
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
 
 use motorsport_telemetry::motorsport_telemetry_core::TelemetrySource;
 use motorsport_telemetry::open;
 use std::path::{Path, PathBuf};
-use telemetry_format::write_from_source;
+use telemetry_format::write_telemetry;
 
 fn main() {
     let src = PathBuf::from(
@@ -11,15 +24,15 @@ fn main() {
             .nth(1)
             .expect("usage: compare_aim MP4 [TELEMETRY]"),
     );
-    let dest = std::env::args()
-        .nth(2)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let dest = std::env::args().nth(2).map_or_else(
+        || {
             PathBuf::from("/tmp").join(format!(
                 "{}.telemetry",
                 src.file_stem().and_then(|s| s.to_str()).unwrap_or("aim")
             ))
-        });
+        },
+        PathBuf::from,
+    );
     let report = compare(&src, &dest).unwrap_or_else(|err| {
         eprintln!("{err}");
         std::process::exit(1);
@@ -33,15 +46,15 @@ fn main() {
 fn compare(src: &Path, dest: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let mut out = String::new();
     let original = open(src)?;
-    if !dest.exists() {
+    if dest.exists() {
+        out.push_str(&format!("reusing {}\n", dest.display()));
+    } else {
         out.push_str(&format!(
             "converting {} -> {}\n",
             src.display(),
             dest.display()
         ));
-        write_from_source(&original, dest)?;
-    } else {
-        out.push_str(&format!("reusing {}\n", dest.display()));
+        write_telemetry(&original, dest)?;
     }
     let converted = open(dest)?;
 
@@ -186,82 +199,11 @@ fn compare(src: &Path, dest: &Path) -> Result<String, Box<dyn std::error::Error>
         ));
     }
 
-    let mut channel_mismatches = 0usize;
-    let mut first_channel = None;
-    let src_channels = original.channels();
-    let dst_channels = converted.channels();
     out.push_str(&format!(
-        "channels src={} dst={} {}\n",
-        src_channels.len(),
-        dst_channels.len(),
-        ok(src_channels.len() == dst_channels.len())
+        "channels src={} dst={} (JSONL keeps aligned channels)\n",
+        original.channels().len(),
+        converted.channels().len()
     ));
-    for (index, src_ch) in src_channels.iter().enumerate() {
-        let Some(dst_ch) = dst_channels.get(index) else {
-            channel_mismatches += 1;
-            first_channel
-                .get_or_insert(format!("missing converted channel {index} {}", src_ch.name));
-            continue;
-        };
-        if src_ch.name != dst_ch.name
-            || src_ch.sample_count != dst_ch.sample_count
-            || src_ch.unit != dst_ch.unit
-        {
-            channel_mismatches += 1;
-            first_channel.get_or_insert(format!(
-                "channel[{index}] meta src=({},{},{}) dst=({},{},{})",
-                src_ch.name,
-                src_ch.sample_count,
-                src_ch.unit,
-                dst_ch.name,
-                dst_ch.sample_count,
-                dst_ch.unit
-            ));
-            continue;
-        }
-        if src_ch.sample_count == 0 || src_ch.chunks.is_empty() {
-            continue;
-        }
-        let last = src_ch.sample_count.saturating_sub(1);
-        let mut locals = vec![0u64, last];
-        if src_ch.sample_count > 2 {
-            locals.push(src_ch.sample_count / 2);
-        }
-        let stride = (src_ch.sample_count / 256).max(1);
-        let mut local = 0u64;
-        while local <= last {
-            locals.push(local);
-            local = local.saturating_add(stride);
-            if local == 0 {
-                break;
-            }
-        }
-        locals.sort_unstable();
-        locals.dedup();
-        for local in locals {
-            let src_t = original.sample_time_ns(index, 0, local);
-            let dst_t = converted.sample_time_ns(index, 0, local);
-            let src_v = original.decode(index, 0, local);
-            let dst_v = converted.decode(index, 0, local);
-            let value_ok = src_v == dst_v || (src_v.is_nan() && dst_v.is_nan());
-            if src_t != dst_t || !value_ok {
-                channel_mismatches += 1;
-                first_channel.get_or_insert(format!(
-                    "channel[{index}] {} local={local} t_src={src_t} t_dst={dst_t} v_src={src_v} v_dst={dst_v}",
-                    src_ch.name
-                ));
-                break;
-            }
-        }
-    }
-    out.push_str(&format!(
-        "channel_sample_mismatches={} {}\n",
-        channel_mismatches,
-        ok(channel_mismatches == 0)
-    ));
-    if let Some(detail) = first_channel {
-        out.push_str(&format!("MISMATCH first channel {detail}\n"));
-    }
 
     for &time in &[0u64, 1_000_000, 1_000_000_000, duration / 2] {
         if time > duration && time != 0 {

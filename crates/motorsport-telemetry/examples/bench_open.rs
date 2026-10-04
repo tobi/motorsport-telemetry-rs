@@ -1,3 +1,16 @@
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use aim_telemetry::AimFile;
 use cosworth_telemetry::CosworthFile;
 use motec_telemetry::MotecFile;
@@ -13,27 +26,35 @@ struct CountingAllocator;
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+// SAFETY: forwards allocations and their layouts unchanged to System. Counting
+// uses only atomics, which neither allocate nor unwind inside allocator calls.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        System.alloc(layout)
+        // SAFETY: the caller supplies a valid allocation layout, passed unchanged.
+        unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        System.alloc_zeroed(layout)
+        // SAFETY: the caller supplies a valid allocation layout, passed unchanged.
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+        // SAFETY: ptr came from System via this allocator; the caller supplies
+        // its original layout and guarantees the allocation is still live.
+        unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         ALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
-        System.realloc(ptr, layout, new_size)
+        // SAFETY: the caller supplies a live System allocation, its original
+        // layout, and a valid new size; all are forwarded unchanged.
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 
@@ -52,6 +73,8 @@ fn median(mut values: Vec<u64>) -> u64 {
 }
 
 fn main() {
+    const BATCHES: usize = 9;
+    const ITERATIONS: u64 = 2_000;
     let pds = fixture("synthetic_cosworth.pds");
     let mp4 = fixture("synthetic_aimd.mp4");
 
@@ -60,8 +83,6 @@ fn main() {
         black_box(AimFile::open(&mp4).unwrap());
     }
 
-    const BATCHES: usize = 9;
-    const ITERATIONS: u64 = 2_000;
     let mut pds_times = Vec::with_capacity(BATCHES);
     let mut mp4_times = Vec::with_capacity(BATCHES);
     for _ in 0..BATCHES {

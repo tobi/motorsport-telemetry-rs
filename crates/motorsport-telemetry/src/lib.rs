@@ -1,5 +1,18 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::unreadable_literal,
+        clippy::float_cmp,
+        reason = "unit tests: fail loudly, print freely, exact fixture values"
+    )
+)]
 
 use aim_telemetry::AimFile;
 use cosworth_telemetry::CosworthFile;
@@ -15,15 +28,11 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use telemetry_format::{
-    is_jsonl_path, is_jsonl_zstd_path, sniff_container, Container, JsonlRecording, NativeRecording,
-};
+use telemetry_format::{is_jsonl_path, JsonlRecording};
 use thiserror::Error;
 
 pub use motorsport_telemetry_core;
 pub use motorsport_track_atlas;
-/// Current `.telemetry` catalog version written by this crate.
-pub use telemetry_format::FORMAT_VERSION;
 /// Current Motorsport Telemetry JSONL (MTJ) document version.
 pub use telemetry_format::JSONL_VERSION;
 /// Default zstd level for compressed MTJ documents.
@@ -42,19 +51,19 @@ pub enum TelemetryError {
     /// The path does not have a supported telemetry extension.
     #[error("unsupported telemetry file {0}")]
     Unsupported(String),
-    /// The AiM MP4 parser rejected the input.
+    /// The `AiM` MP4 parser rejected the input.
     #[error(transparent)]
     Aim(#[from] aim_telemetry::AimError),
     /// The Pi/Cosworth PDS parser rejected the input.
     #[error(transparent)]
     Cosworth(#[from] cosworth_telemetry::CosworthError),
-    /// The MoTeC LD parser rejected the input.
+    /// The `MoTeC` LD parser rejected the input.
     #[error(transparent)]
     Motec(#[from] motec_telemetry::MotecError),
     /// The Racelogic VBOX parser rejected the input.
     #[error(transparent)]
     Racelogic(#[from] racelogic_telemetry::RacelogicError),
-    /// The native `.telemetry` parser rejected the input.
+    /// The telemetry JSONL parser rejected the input.
     #[error(transparent)]
     Telemetry(#[from] telemetry_format::TelemetryFormatError),
 }
@@ -65,9 +74,8 @@ pub enum TelemetryError {
 /// `.telemetry.jsonl`, `.jsonl`, `.mtj`, `.telemetry.ext.jsonl`, and those
 /// names with a `.zstd` or `.zst` suffix.
 /// This function selects a parser by extension; the selected parser still
-/// validates the file contents. A `.telemetry` file is dispatched by its
-/// container (zstd MTJ, or the legacy native zip); a writable legacy zip
-/// older than [`FORMAT_VERSION`] is rewritten in place.
+/// validates the file contents. JSONL compression is detected by content.
+/// Opening a recording does not modify it.
 pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
     let path = path.as_ref();
     if is_jsonl_path(path) {
@@ -78,7 +86,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryError> {
         "pds" => Ok(Box::new(CosworthFile::open(path)?)),
         "ld" => Ok(Box::new(MotecFile::open(path)?)),
         "vbo" => Ok(Box::new(RacelogicFile::open(path)?)),
-        "telemetry" => Ok(telemetry_format::open_telemetry(path)?),
+        "telemetry" => Ok(Box::new(JsonlRecording::open(path)?)),
         _ => Err(TelemetryError::Unsupported(path.display().to_string())),
     }
 }
@@ -99,7 +107,7 @@ pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryE
         "pds" => Ok(Box::new(CosworthFile::open(path)?)),
         "ld" => Ok(Box::new(MotecFile::open(path)?)),
         "vbo" => Ok(Box::new(RacelogicFile::open_metadata(path)?)),
-        "telemetry" => Ok(telemetry_format::open_telemetry(path)?),
+        "telemetry" => Ok(Box::new(JsonlRecording::open(path)?)),
         _ => Err(TelemetryError::Unsupported(path.display().to_string())),
     }
 }
@@ -113,12 +121,7 @@ pub fn open_metadata(path: impl AsRef<Path>) -> Result<TelemetryFile, TelemetryE
 pub fn read_lap_metadata(
     path: impl AsRef<Path>,
 ) -> Result<Vec<motorsport_telemetry_core::LapMetadata>, TelemetryError> {
-    if is_telemetry(path.as_ref()) {
-        // O(header): MTJ reads its first two lines; a legacy zip maps the
-        // catalog and probes speed for classification.
-        return Ok(telemetry_format::read_laps(path)?);
-    }
-    if is_jsonl_path(path.as_ref()) {
+    if is_telemetry(path.as_ref()) || is_jsonl_path(path.as_ref()) {
         return Ok(telemetry_format::read_laps(path)?);
     }
     Ok(open_metadata(path)?.metadata().laps)
@@ -128,10 +131,7 @@ pub fn read_lap_metadata(
 ///
 /// For a `.telemetry` this is an O(header) read (see [`read_metadata`]).
 pub fn read_valid_laps(path: impl AsRef<Path>) -> Result<u32, TelemetryError> {
-    if is_telemetry(path.as_ref()) {
-        return Ok(telemetry_format::read_valid_laps(path)?);
-    }
-    if is_jsonl_path(path.as_ref()) {
+    if is_telemetry(path.as_ref()) || is_jsonl_path(path.as_ref()) {
         return Ok(telemetry_format::read_valid_laps(path)?);
     }
     Ok(open_metadata(path)?.metadata().valid_laps)
@@ -140,40 +140,12 @@ pub fn read_valid_laps(path: impl AsRef<Path>) -> Result<u32, TelemetryError> {
 /// Format-neutral file summary with the stint model resolved.
 ///
 /// For a `.telemetry` this is O(header): a zstd-MTJ document is decoded only
-/// through its header and laps lines; a legacy zip maps the catalog and probes
-/// the speed channel for classification. Vendor files are opened.
-pub fn read_metadata(
-    path: impl AsRef<Path>,
-) -> Result<motorsport_telemetry_core::FileMetadata, TelemetryError> {
-    if is_telemetry(path.as_ref()) {
-        return Ok(telemetry_format::read_metadata(path)?);
-    }
-    if is_jsonl_path(path.as_ref()) {
+/// through its header and laps lines. Vendor files are opened.
+pub fn read_metadata(path: impl AsRef<Path>) -> Result<FileMetadata, TelemetryError> {
+    if is_telemetry(path.as_ref()) || is_jsonl_path(path.as_ref()) {
         return Ok(telemetry_format::read_metadata(path)?);
     }
     Ok(open_metadata(path)?.metadata())
-}
-
-/// Catalog format version from `metadata.fb` of a **legacy zip** `.telemetry`.
-/// Header-only. A zstd-MTJ `.telemetry` has no catalog version and errors.
-pub fn read_format_version(path: impl AsRef<Path>) -> Result<u16, TelemetryError> {
-    if !is_telemetry(path.as_ref()) {
-        return Err(TelemetryError::Unsupported(
-            path.as_ref().display().to_string(),
-        ));
-    }
-    Ok(telemetry_format::read_format_version(path)?)
-}
-
-/// True when a legacy-zip `.telemetry` is older than [`FORMAT_VERSION`] and
-/// should be rewritten. Always `false` for the zstd-MTJ container.
-pub fn telemetry_needs_update(path: impl AsRef<Path>) -> Result<bool, TelemetryError> {
-    if !is_telemetry(path.as_ref()) {
-        return Err(TelemetryError::Unsupported(
-            path.as_ref().display().to_string(),
-        ));
-    }
-    Ok(telemetry_format::file_needs_update(path)?)
 }
 
 fn extension(path: &Path) -> String {
@@ -192,41 +164,35 @@ fn is_telemetry(path: &Path) -> bool {
 /// Kind of file verified by [`verify`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyKind {
-    /// Legacy native `.telemetry` STORE zip.
-    Native,
     /// MTJ JSONL recording.
     Mtj,
     /// MTX JSONL sidecar.
     Mtx,
 }
 
-/// Structured outcome of verifying a native or JSONL telemetry file.
+/// Structured outcome of verifying an MTJ recording or MTX sidecar.
 ///
 /// Returned by [`verify`]; the CLI formats it into its one-line report.
 #[derive(Debug)]
 pub struct VerifyReport {
     /// Container kind that was verified.
     pub kind: VerifyKind,
-    /// JSONL document version (MTJ/MTX only).
-    pub jsonl_version: Option<u16>,
-    /// Native catalog format version (`.telemetry` only).
-    pub format_version: Option<u16>,
+    /// JSONL document version.
+    pub jsonl_version: u16,
     /// True when the document was zstd-compressed on disk.
     pub compressed: bool,
     /// Decoded channel count.
     pub channels: usize,
-    /// Lap count (native catalog or MTJ recording).
+    /// Lap count (MTJ recording; zero for sidecars).
     pub laps: usize,
-    /// Span count (JSONL only; 0 for native).
+    /// Span count.
     pub spans: usize,
     /// Unix-epoch nanoseconds at `t = 0`, when stamped.
     pub utc_start_ns: Option<u64>,
-    /// JSONL lattice quantum in ns (0 for native).
+    /// JSONL lattice quantum in ns.
     pub quantum_ns: u64,
     /// MTX sidecar group count (0 outside MTX).
     pub sidecar_groups: usize,
-    /// True when a native catalog is older than [`FORMAT_VERSION`].
-    pub needs_update: bool,
     /// Reader diagnostics plus plausibility findings.
     pub diagnostics: Diagnostics,
 }
@@ -245,58 +211,19 @@ pub enum VerifyError {
     DecodeFault(Diagnostics),
 }
 
-/// Verifies a `.telemetry` (either container) or MTJ/MTX JSONL document.
+/// Verifies an MTJ recording or MTX sidecar, compressed or plain.
 ///
-/// A `.telemetry` path is dispatched by content: a zstd frame or `{` is an
-/// MTJ document, `PK` is the legacy native zip.
-/// Opens the file without rewriting an older catalog, decodes one sample from
-/// every channel, and runs the reader diagnostics plus the format-neutral
-/// plausibility validator. A proven decode-layout fault returns
-/// [`VerifyError::DecodeFault`]; ordinary warnings stay inside
-/// [`VerifyReport::diagnostics`]. Vendor source files (`.pds`, `.ld`, `.mp4`,
-/// `.vbo`) are rejected with [`VerifyError::Unsupported`].
+/// Parses the document and runs reader diagnostics and format-neutral
+/// plausibility checks. A proven decode-layout fault returns
+/// [`VerifyError::DecodeFault`]; ordinary warnings remain in the report.
+/// Vendor source files are rejected with [`VerifyError::Unsupported`].
 pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport, VerifyError> {
     let path = path.as_ref();
-    if is_jsonl_path(path) {
+    if is_jsonl_path(path) || is_telemetry(path) {
         verify_jsonl(path)
-    } else if is_telemetry(path) {
-        match sniff_container(path)? {
-            Container::NativeZip => verify_native(path),
-            Container::JsonlZstd | Container::Jsonl => verify_jsonl(path),
-            Container::Unknown => Err(VerifyError::Format(
-                telemetry_format::TelemetryFormatError::Invalid(format!(
-                    "{}: not a .telemetry file (neither a zstd MTJ frame nor a native zip)",
-                    path.display()
-                )),
-            )),
-        }
     } else {
         Err(VerifyError::Unsupported)
     }
-}
-
-fn verify_native(path: &Path) -> Result<VerifyReport, VerifyError> {
-    let opened = NativeRecording::open_unchanged(path)?;
-    let metadata = opened.metadata();
-    probe_samples(&opened);
-    let diagnostics = combine_diagnostics(&opened, fs::metadata(path).ok().map(|meta| meta.len()));
-    if implies_decode_fault(&diagnostics) {
-        return Err(VerifyError::DecodeFault(diagnostics));
-    }
-    Ok(VerifyReport {
-        kind: VerifyKind::Native,
-        format_version: metadata.format_version,
-        jsonl_version: None,
-        compressed: false,
-        channels: metadata.channel_count,
-        laps: metadata.laps.len(),
-        spans: opened.spans().len(),
-        utc_start_ns: metadata.utc_start_ns,
-        quantum_ns: 0,
-        sidecar_groups: 0,
-        needs_update: telemetry_format::needs_update(metadata.format_version.unwrap_or(0)),
-        diagnostics,
-    })
 }
 
 fn verify_jsonl(path: &Path) -> Result<VerifyReport, VerifyError> {
@@ -305,7 +232,7 @@ fn verify_jsonl(path: &Path) -> Result<VerifyReport, VerifyError> {
     // JSONL is text: a sample is many bytes of text, not `byte_width`, so the
     // file length bears no relation to the decoded footprint and the footprint
     // check is skipped.
-    let diagnostics = combine_diagnostics(&opened, None);
+    let diagnostics = combine_diagnostics(&opened);
     if implies_decode_fault(&diagnostics) {
         return Err(VerifyError::DecodeFault(diagnostics));
     }
@@ -316,20 +243,18 @@ fn verify_jsonl(path: &Path) -> Result<VerifyReport, VerifyError> {
         } else {
             VerifyKind::Mtj
         },
-        format_version: None,
-        jsonl_version: Some(if extension {
+        jsonl_version: if extension {
             telemetry_format::JSONL_EXT_VERSION
         } else {
-            telemetry_format::JSONL_VERSION
-        }),
-        compressed: is_jsonl_zstd_path(path) || starts_with_zstd(path),
+            JSONL_VERSION
+        },
+        compressed: starts_with_zstd(path),
         channels: opened.channels().len(),
         laps: opened.metadata().laps.len(),
         spans: opened.spans().len(),
         utc_start_ns: opened.utc_start_ns(),
         quantum_ns: opened.quantum_ns(),
         sidecar_groups: opened.sidecar_groups().len(),
-        needs_update: false,
         diagnostics,
     })
 }
@@ -345,22 +270,12 @@ fn probe_samples(source: &dyn TelemetrySource) {
     }
 }
 
-/// Combines a source's reader diagnostics with the plausibility validator's
-/// findings.
-///
-/// `file_len` is the backing file's byte length for binary formats whose
-/// decoded samples correspond one-to-one to packed file bytes (native
-/// `.telemetry`); `None` for text formats such as JSONL, where the file
-/// length bears no relation to the decoded footprint and the footprint
-/// check would falsely fire on compact text.
-fn combine_diagnostics(source: &dyn TelemetrySource, file_len: Option<u64>) -> Diagnostics {
+/// Combines reader diagnostics with plausibility checks. JSONL file sizes
+/// cannot be compared with the decoded packed sample footprint.
+fn combine_diagnostics(source: &dyn TelemetrySource) -> Diagnostics {
     let mut combined = Diagnostics::new();
     combined.extend(source.diagnostics().iter().cloned());
-    let options = ValidateOptions {
-        file_len,
-        ..ValidateOptions::default()
-    };
-    combined.append(validate_source_with(source, options));
+    combined.append(validate_source_with(source, ValidateOptions::default()));
     combined
 }
 
@@ -389,14 +304,14 @@ pub trait SourceExt: TelemetrySource {
 
     /// Builds a reusable normalization context.
     ///
-    /// Signal roles and track matching are resolved once. Lap metadata remains
-    /// lazy and, if needed as a fallback, is computed once for the lifetime of
-    /// the context rather than once per sample.
+    /// Signal roles are resolved once. Lap metadata remains lazy and, if
+    /// needed, is computed once for the lifetime of the context rather than
+    /// once per sample. Normalization does not require a track match.
     fn normalizer(&self) -> TelemetryNormalizer<'_>
     where
         Self: Sized,
     {
-        TelemetryNormalizer::new(self, self.resolved_roles(), self.match_track())
+        TelemetryNormalizer::new(self, self.resolved_roles())
     }
 
     /// [`Self::signal_roles`] with the speed role settled the way the
@@ -404,7 +319,7 @@ pub trait SourceExt: TelemetrySource {
     /// is declared **or provable from its value range** (see [`RoleUnits`]).
     ///
     /// Name-only inference prefers any channel with a declared unit, which on
-    /// an AiM dash picks the 25 Hz `GPS Speed` (m/s, with dropouts) over the
+    /// an `AiM` dash picks the 25 Hz `GPS Speed` (m/s, with dropouts) over the
     /// dash's own unitless wheel speed. Once the range proves that channel is
     /// km/h it is the better source and outranks GPS by priority.
     fn resolved_roles(&self) -> SignalRoles
@@ -437,8 +352,9 @@ pub trait SourceExt: TelemetrySource {
     /// Matches sampled GPS positions to the nearest track within 50 km.
     ///
     /// Returns `None` when suitable GPS channels or valid units are absent, no
-    /// sample produces a finite non-origin fix, no track is close enough, or
-    /// the matched centerline cannot be decoded.
+    /// sample produces a finite non-origin fix, or no track is close enough.
+    /// This is a facility lookup, not track-progress estimation; the layout
+    /// returned is the facility's default, not an inferred configuration.
     fn match_track(&self) -> Option<TrackContext> {
         let roles = self.signal_roles();
         let (lat_index, lon_index) = roles.latitude.zip(roles.longitude)?;
@@ -496,9 +412,10 @@ pub trait SourceExt: TelemetrySource {
         }
         for (latitude, longitude) in candidates {
             if let Some(matched) = match_track(latitude, longitude, 50_000.0) {
-                if let Ok(context) = TrackContext::new(matched, (latitude, longitude)) {
-                    return Some(context);
-                }
+                return Some(TrackContext {
+                    matched,
+                    gps: (latitude, longitude),
+                });
             }
         }
         None
@@ -516,9 +433,9 @@ pub trait SourceExt: TelemetrySource {
     /// That footprint check compares the sum of every channel's claimed
     /// sample bytes to the file length, so it is only meaningful for binary
     /// formats where decoded samples correspond one-to-one to packed file
-    /// bytes: Pi/Cosworth PDS, MoTeC LD, and native `.telemetry`. VBO and
+    /// bytes: Pi/Cosworth PDS, `MoTeC` LD, and native `.telemetry`. VBO and
     /// JSONL are text (a sample is many bytes of text, not `byte_width`), and
-    /// AiM `aimd` expands one GPS packet into many channels, so their file
+    /// `AiM` `aimd` expands one GPS packet into many channels, so their file
     /// length bears no relation to the decoded footprint. For those formats
     /// `file_len` is left `None` and the footprint check is skipped, as if
     /// [`validate_source`](motorsport_telemetry_core::validate::validate_source)
@@ -560,7 +477,8 @@ pub struct SignalRoles {
     pub gear: Option<usize>,
     /// Engine speed channel.
     pub rpm: Option<usize>,
-    /// Distance or progress within the current lap.
+    /// Source-reported progress (preferred) or distance within the current
+    /// lap. Only ratio/percentage units populate `NormalizedSample::lap_progress`.
     pub lap_distance: Option<usize>,
     /// Current lap counter.
     pub lap_number: Option<usize>,
@@ -615,7 +533,9 @@ pub struct NormalizedSample {
     pub lap_kind: Option<LapKind>,
     /// Human label of the containing lap: `S1 out`, `S2 L3`, `S1 pit L5`.
     pub lap_label: Option<String>,
-    /// Progress through the current lap in the range `0.0..=1.0`.
+    /// Source-reported lap progress, converted from a ratio or percentage to
+    /// `0.0..=1.0`. No GPS, distance-in-metres, or elapsed-time fallback;
+    /// track-progress estimation belongs in the consuming application.
     pub lap_progress: Option<f64>,
     /// Current lap time in seconds.
     pub lap_time_s: Option<f64>,
@@ -633,7 +553,6 @@ pub struct NormalizedSample {
 pub struct TelemetryNormalizer<'a> {
     source: &'a dyn TelemetrySource,
     roles: SignalRoles,
-    track: Option<TrackContext>,
     laps: OnceLock<Vec<motorsport_telemetry_core::LapMetadata>>,
     clock: OnceLock<Option<(i128, String)>>,
     units: OnceLock<RoleUnits>,
@@ -643,14 +562,14 @@ pub struct TelemetryNormalizer<'a> {
 /// channel that declares none — the unit its value range proves.
 ///
 /// Declared units always win. Inference runs only on unitless channels
-/// (AiM `aimd` CAN echoes, VBOX CAN columns, stripped exports) and only where
+/// (`AiM` `aimd` CAN echoes, VBOX CAN columns, stripped exports) and only where
 /// the physical range leaves one reading: a pedal that reaches 99 is percent,
 /// a steering trace spanning 300 is degrees not radians, an engine speed
 /// topping 7981 is rpm not rad/s, a lap timer counting to 331460 is
 /// milliseconds. Where the range is ambiguous the role stays unresolved and
 /// the sample field is `None`. Ranges come from at most 4096 probes per
 /// channel, taken once per normalizer.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleUnits {
     /// Unit `speed_mps` converts from.
     pub speed: Option<String>,
@@ -676,22 +595,16 @@ impl std::fmt::Debug for TelemetryNormalizer<'_> {
         f.debug_struct("TelemetryNormalizer")
             .field("source", &self.source.path())
             .field("roles", &self.roles)
-            .field("track", &self.track)
             .finish_non_exhaustive()
     }
 }
 
 impl<'a> TelemetryNormalizer<'a> {
-    /// Creates a normalizer with caller-selected signal roles and track.
-    pub fn new(
-        source: &'a dyn TelemetrySource,
-        roles: SignalRoles,
-        track: Option<TrackContext>,
-    ) -> Self {
+    /// Creates a normalizer with caller-selected signal roles.
+    pub fn new(source: &'a dyn TelemetrySource, roles: SignalRoles) -> Self {
         Self {
             source,
             roles,
-            track,
             laps: OnceLock::new(),
             clock: OnceLock::new(),
             units: OnceLock::new(),
@@ -709,22 +622,14 @@ impl<'a> TelemetryNormalizer<'a> {
         &self.roles
     }
 
-    /// Returns the matched track context, when available.
-    pub fn track(&self) -> Option<&TrackContext> {
-        self.track.as_ref()
-    }
-
     /// Returns the normalized values at a file-relative timestamp.
     pub fn sample(&self, time_ns: u64) -> NormalizedSample {
         normalize_sample(
             self.source,
             time_ns,
             &self.roles,
-            self.track.as_ref(),
             || {
-                let laps = self
-                    .laps
-                    .get_or_init(|| self.source.metadata().laps.clone());
+                let laps = self.laps.get_or_init(|| self.source.metadata().laps);
                 lap_at(laps, time_ns)
             },
             self.clock.get_or_init(|| file_clock(self.source)).as_ref(),
@@ -812,7 +717,6 @@ fn normalize_sample(
     source: &dyn TelemetrySource,
     time_ns: u64,
     roles: &SignalRoles,
-    track: Option<&TrackContext>,
     lap_lookup: impl FnOnce() -> Option<motorsport_telemetry_core::LapMetadata>,
     clock: Option<&(i128, String)>,
     units: &RoleUnits,
@@ -822,33 +726,50 @@ fn normalize_sample(
             .and_then(|index| source.sample_at(index, time_ns, linear))
             .filter(|value| value.is_finite())
     };
-    fn unit(unit: &Option<String>) -> &str {
-        unit.as_deref().unwrap_or("")
-    }
     let speed_mps = roles.speed.and_then(|index| {
         let raw = value(Some(index), true)?;
-        normalize_speed(raw, unit(&units.speed))
+        normalize_speed(raw, units.speed.as_deref().unwrap_or(""))
     });
-    let throttle_fraction = roles
-        .throttle
-        .and_then(|index| normalize_fraction(value(Some(index), true)?, unit(&units.throttle)));
-    let brake_fraction = roles
-        .brake
-        .and_then(|index| normalize_fraction(value(Some(index), true)?, unit(&units.brake)));
+    let throttle_fraction = roles.throttle.and_then(|index| {
+        normalize_fraction(
+            value(Some(index), true)?,
+            units.throttle.as_deref().unwrap_or(""),
+        )
+    });
+    let brake_fraction = roles.brake.and_then(|index| {
+        normalize_fraction(
+            value(Some(index), true)?,
+            units.brake.as_deref().unwrap_or(""),
+        )
+    });
     let brake_pressure_bar = roles.brake_pressure.and_then(|index| {
         let raw = value(Some(index), true)?;
-        motorsport_telemetry_core::convert(raw, unit(&units.brake_pressure), "bar").ok()
+        motorsport_telemetry_core::convert(
+            raw,
+            units.brake_pressure.as_deref().unwrap_or(""),
+            "bar",
+        )
+        .ok()
     });
-    let clutch_fraction = roles
-        .clutch
-        .and_then(|index| normalize_fraction(value(Some(index), true)?, unit(&units.clutch)));
-    let steering_deg = roles
-        .steering
-        .and_then(|index| normalize_angle_deg(value(Some(index), true)?, unit(&units.steering)));
+    let clutch_fraction = roles.clutch.and_then(|index| {
+        normalize_fraction(
+            value(Some(index), true)?,
+            units.clutch.as_deref().unwrap_or(""),
+        )
+    });
+    let steering_deg = roles.steering.and_then(|index| {
+        normalize_angle_deg(
+            value(Some(index), true)?,
+            units.steering.as_deref().unwrap_or(""),
+        )
+    });
     let gear = value(roles.gear, false).map(|value| value.round() as i64);
-    let rpm = roles
-        .rpm
-        .and_then(|index| normalize_rpm(value(Some(index), false)?, unit(&units.rpm)));
+    let rpm = roles.rpm.and_then(|index| {
+        normalize_rpm(
+            value(Some(index), false)?,
+            units.rpm.as_deref().unwrap_or(""),
+        )
+    });
     let latitude_deg = roles.latitude.and_then(|index| {
         normalize_coordinate(value(Some(index), true)?, &source.channels()[index].unit)
     });
@@ -870,27 +791,20 @@ fn normalize_sample(
     // of the lap boundary.
     let lap_time_s = roles
         .lap_time
-        .and_then(|index| normalize_duration_s(value(Some(index), true)?, unit(&units.lap_time)))
+        .and_then(|index| {
+            normalize_duration_s(
+                value(Some(index), true)?,
+                units.lap_time.as_deref().unwrap_or(""),
+            )
+        })
         .or_else(|| {
             lap.as_ref()
                 .map(|lap| time_ns.saturating_sub(lap.start_ns) as f64 / 1e9)
         });
-    let lap_progress = roles
-        .lap_distance
-        .and_then(|index| {
-            let raw = value(Some(index), true)?;
-            normalize_lap_distance(raw, &source.channels()[index].unit, track)
-        })
-        .or_else(|| {
-            latitude_deg
-                .zip(longitude_deg)
-                .and_then(|(lat, lon)| track.and_then(|track| track.progress(lat, lon)))
-        })
-        .or_else(|| {
-            lap.as_ref()
-                .filter(|lap| lap.duration_ns > 0)
-                .map(|lap| time_ns.saturating_sub(lap.start_ns) as f64 / lap.duration_ns as f64)
-        });
+    let lap_progress = roles.lap_distance.and_then(|index| {
+        let raw = value(Some(index), true)?;
+        normalize_lap_progress(raw, &source.channels()[index].unit)
+    });
     let (absolute_time_ns, time_of_day_ns) = match clock {
         Some((offset, name)) => {
             let absolute = u64::try_from(i128::from(time_ns) + *offset).ok();
@@ -936,73 +850,15 @@ fn lap_at(
         .cloned()
 }
 
-/// A matched track plus precomputed centerline distances for GPS projection.
+/// A facility lookup result and the sampled GPS point used to obtain it.
+///
+/// This metadata lookup does not project samples onto the track geometry.
 #[derive(Debug, Clone)]
 pub struct TrackContext {
-    /// The selected facility and layout from the offline track atlas.
+    /// The nearest facility and its default layout from the offline atlas.
     pub matched: TrackMatch,
     /// The WGS84 `(latitude, longitude)` query point that matched the track.
     pub gps: (f64, f64),
-    centerline: Vec<[f64; 2]>,
-    cumulative_m: Vec<f64>,
-    total_m: f64,
-}
-
-impl TrackContext {
-    /// Builds projection state from a track-atlas match and its query point.
-    ///
-    /// The error indicates that the layout's embedded centerline is not valid
-    /// GeoJSON. An empty or one-point centerline constructs successfully but
-    /// cannot produce progress values.
-    pub fn new(matched: TrackMatch, gps: (f64, f64)) -> Result<Self, serde_json::Error> {
-        let value: serde_json::Value = serde_json::from_str(matched.layout.centerline_geojson)?;
-        let coordinates = &value["features"][0]["geometry"]["coordinates"];
-        let centerline = coordinates
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|point| {
-                let point = point.as_array()?;
-                Some([point.first()?.as_f64()?, point.get(1)?.as_f64()?])
-            })
-            .collect::<Vec<_>>();
-        let mut cumulative_m = Vec::with_capacity(centerline.len());
-        cumulative_m.push(0.0);
-        for pair in centerline.windows(2) {
-            let distance = haversine_m(pair[0][1], pair[0][0], pair[1][1], pair[1][0]);
-            cumulative_m.push(cumulative_m.last().copied().unwrap_or(0.0) + distance);
-        }
-        let total_m = cumulative_m.last().copied().unwrap_or(0.0);
-        Ok(Self {
-            matched,
-            gps,
-            centerline,
-            cumulative_m,
-            total_m,
-        })
-    }
-
-    /// Projects a WGS84 point onto the centerline and returns lap progress.
-    ///
-    /// Progress is clamped to `0.0..=1.0`; `None` means that the layout has no
-    /// usable centerline.
-    pub fn progress(&self, latitude: f64, longitude: f64) -> Option<f64> {
-        if self.centerline.len() < 2 || self.total_m <= 0.0 {
-            return None;
-        }
-        self.centerline
-            .windows(2)
-            .enumerate()
-            .map(|(index, segment)| {
-                let (fraction, distance) =
-                    project_segment(latitude, longitude, segment[0], segment[1]);
-                let progress_m = self.cumulative_m[index]
-                    + fraction * (self.cumulative_m[index + 1] - self.cumulative_m[index]);
-                (distance, progress_m / self.total_m)
-            })
-            .min_by(|left, right| left.0.total_cmp(&right.0))
-            .map(|(_, progress)| progress.clamp(0.0, 1.0))
-    }
 }
 
 /// Files grouped into one session using internal clocks and identity.
@@ -1061,30 +917,36 @@ where
     let opened = paths.into_iter().map(open).collect::<Result<Vec<_>, _>>()?;
     let metadata = opened
         .iter()
-        .map(|file| file.metadata())
+        .map(TelemetrySource::metadata)
         .collect::<Vec<_>>();
     let grouped = group_sessions(&metadata, max_gap_ns);
     let mut files = opened.into_iter().map(Some).collect::<Vec<_>>();
-    Ok(grouped
+    grouped
         .into_iter()
         .map(|session| {
             let selected_files = session
                 .files
                 .iter()
-                .map(|index| files[*index].take().expect("session file used once"))
-                .collect::<Vec<_>>();
+                .map(|index| {
+                    files.get_mut(*index).and_then(Option::take).ok_or_else(|| {
+                        TelemetryError::Unsupported(
+                            "invalid session grouping: missing or duplicate recording".into(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let selected_metadata = session
                 .files
                 .iter()
                 .map(|index| metadata[*index].clone())
                 .collect();
-            TelemetrySession {
+            Ok(TelemetrySession {
                 files: selected_files,
                 file_metadata: selected_metadata,
                 metadata: session,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 impl TelemetrySession {
@@ -1148,7 +1010,7 @@ fn find_sampled(channels: &[Channel], wanted: &[&str]) -> Option<usize> {
 /// [`find_sampled`] that prefers a candidate with a convertible speed unit.
 ///
 /// A speed without a unit cannot be normalised, so a unitless CAN echo
-/// (AiM `Speed_Wspd_App` with no unit string) must not outrank a lower-priority
+/// (`AiM` `Speed_Wspd_App` with no unit string) must not outrank a lower-priority
 /// channel that does say what it measures (`GPS Speed` in m/s). Priority order
 /// still decides among the unit-bearing candidates; only when none has a unit
 /// does the plain priority winner stand.
@@ -1251,13 +1113,13 @@ fn infer_roles(channels: &[Channel]) -> SignalRoles {
         lap_distance: find_sampled(
             channels,
             &[
-                "lapdistancecorrected",
-                "lapdistance",
-                "lapdist",
-                "lapdistpct",
                 "lapprogression",
                 "lapprogress",
                 "lapprogresspct",
+                "lapdistpct",
+                "lapdistancecorrected",
+                "lapdistance",
+                "lapdist",
                 "linelapdistancel",
                 "distance",
             ],
@@ -1329,13 +1191,14 @@ fn normalize_speed(value: f64, unit: &str) -> Option<f64> {
 
 fn normalize_fraction(value: f64, unit: &str) -> Option<f64> {
     match unit.trim().to_ascii_lowercase().as_str() {
-        "%" | "percent" => Some((value / 100.0).clamp(0.0, 1.0)),
         "ratio" | "fraction" => Some(value.clamp(0.0, 1.0)),
         // Cosworth PDS stores pedal position as an *angle* whose value in
         // degrees is the percent (`PPS` 0.035..1.763 rad = 2..101 deg): the
         // quantity code is angle, the meaning is pedal travel.
         "rad" | "radian" | "radians" => Some((value.to_degrees() / 100.0).clamp(0.0, 1.0)),
-        "deg" | "degree" | "degrees" | "°" => Some((value / 100.0).clamp(0.0, 1.0)),
+        "%" | "percent" | "deg" | "degree" | "degrees" | "°" => {
+            Some((value / 100.0).clamp(0.0, 1.0))
+        }
         _ => None,
     }
 }
@@ -1410,47 +1273,9 @@ fn normalize_duration_s(value: f64, unit: &str) -> Option<f64> {
     motorsport_telemetry_core::convert(value, unit, "s").ok()
 }
 
-fn normalize_lap_distance(value: f64, unit: &str, track: Option<&TrackContext>) -> Option<f64> {
-    match unit.trim().to_ascii_lowercase().as_str() {
-        "%" | "percent" => Some((value / 100.0).rem_euclid(1.0)),
-        "ratio" | "fraction" => Some(value.rem_euclid(1.0)),
-        "m" | "meter" | "metre" => track
-            .and_then(|track| track.matched.layout.length_m)
-            .filter(|length| *length > 0.0)
-            .map(|length| value.rem_euclid(length) / length),
-        _ => None,
-    }
-}
-
-fn haversine_m(a_lat: f64, a_lon: f64, b_lat: f64, b_lon: f64) -> f64 {
-    let radius = 6_371_000.0;
-    let lat1 = a_lat.to_radians();
-    let lat2 = b_lat.to_radians();
-    let dlat = lat2 - lat1;
-    let dlon = (b_lon - a_lon).to_radians();
-    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
-    2.0 * radius * h.sqrt().asin()
-}
-
-fn project_segment(latitude: f64, longitude: f64, a: [f64; 2], b: [f64; 2]) -> (f64, f64) {
-    let mean_lat = latitude.to_radians();
-    let scale_x = mean_lat.cos() * 111_320.0;
-    let scale_y = 110_540.0;
-    let ax = (a[0] - longitude) * scale_x;
-    let ay = (a[1] - latitude) * scale_y;
-    let bx = (b[0] - longitude) * scale_x;
-    let by = (b[1] - latitude) * scale_y;
-    let dx = bx - ax;
-    let dy = by - ay;
-    let length_sq = dx * dx + dy * dy;
-    let t = if length_sq == 0.0 {
-        0.0
-    } else {
-        (-(ax * dx + ay * dy) / length_sq).clamp(0.0, 1.0)
-    };
-    let px = ax + t * dx;
-    let py = ay + t * dy;
-    (t, px.hypot(py))
+fn normalize_lap_progress(value: f64, unit: &str) -> Option<f64> {
+    let fraction = motorsport_telemetry_core::convert(value, unit, "ratio").ok()?;
+    (0.0..=1.0).contains(&fraction).then_some(fraction)
 }
 
 #[cfg(test)]
@@ -1564,6 +1389,35 @@ mod tests {
         assert_eq!(name(roles.brake_pressure), Some("Brake_Pressure_Front"));
         assert_eq!(name(roles.throttle), Some("Throttle_Pedal"));
         assert_eq!(name(roles.steering), Some("Steering_Angle"));
+    }
+
+    #[test]
+    fn progress_is_only_a_source_unit_conversion() {
+        for unit in ["%", "percent", "pct"] {
+            assert_eq!(normalize_lap_progress(0.0, unit), Some(0.0));
+            assert_eq!(normalize_lap_progress(25.0, unit), Some(0.25));
+            assert_eq!(normalize_lap_progress(100.0, unit), Some(1.0));
+            assert_eq!(normalize_lap_progress(101.0, unit), None);
+        }
+        for unit in ["ratio", "fraction"] {
+            assert_eq!(normalize_lap_progress(0.25, unit), Some(0.25));
+            assert_eq!(normalize_lap_progress(1.0, unit), Some(1.0));
+            for value in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert_eq!(normalize_lap_progress(value, unit), None);
+            }
+        }
+        for unit in ["", "m", "km", "s"] {
+            assert_eq!(normalize_lap_progress(0.5, unit), None);
+        }
+    }
+
+    #[test]
+    fn source_progress_takes_precedence_over_distance() {
+        let channels = [
+            channel("Lap Distance Corrected", "m", 100),
+            channel("Lap Progression", "%", 100),
+        ];
+        assert_eq!(infer_roles(&channels).lap_distance, Some(1));
     }
 
     #[test]

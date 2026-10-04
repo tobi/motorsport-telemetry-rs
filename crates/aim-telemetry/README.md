@@ -1,13 +1,13 @@
 # aim-telemetry
 
-Native reader for AiM Sports telemetry stored as an `aimd` track inside an ISO Base Media/MP4 recording.
+Native reader for `AiM` Sports telemetry stored as an `aimd` track inside an ISO Base Media/MP4 recording.
 
 ## Design
 
 - Memory-maps the MP4. It never reads or decodes the video or audio tracks.
-- Locates telemetry by the `aimd` sample-entry FourCC, not by track number or the localized handler name.
+- Locates telemetry by the `aimd` sample-entry `FourCC`, not by track number or the localized handler name.
 - Resolves samples from standard `stsd`, `stts`, `stsc`, `stsz`, and `stco`/`co64` tables.
-- Reads channel names, record IDs, widths, and layout from AiM `CHS` schema blocks.
+- Reads channel names, record IDs, widths, and layout from `AiM` `CHS` schema blocks.
 - Reads scalar `(S … )` records using their declared record IDs and timestamps.
 - Uses the modal recorded timestamp delta as each channel's native frequency, while retaining acquisition gaps as separate chunks.
 - Rejects an MP4 immediately with `NoAimdTrack` when no `aimd` sample entry exists.
@@ -37,6 +37,12 @@ owned input.
 `GPS DOP`, `GPS Fix Type`, and `GPS Fix Flags`. ECEF-derived values are only
 reported for a u-blox position-bearing fix. MP4 edit lists provide the offset from
 file-relative telemetry timestamps to the video's presentation timeline.
+
+When GPS acquires late, the existing latitude, longitude, and altitude channels
+recover the stationary lead-in from the first valid position. Recovery requires
+independent car speed to be exactly zero throughout; movement, missing speed,
+or an acquisition gap stops it. Receiver status retains its original samples,
+and `aim.gps_start_backfilled` records the inferred interval.
 
 The reader does not decode video or audio, does not reconstruct `LapPk` without
 a payload, and leaves scalar units unknown when the `CHS` record does not

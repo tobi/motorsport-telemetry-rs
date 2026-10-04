@@ -4,11 +4,99 @@
 //! values are not stationary observations. Long recordings are subsampled so
 //! a corrupt duration cannot turn a validation check into an unbounded scan.
 
-use crate::{convert, SampleTimes, TelemetrySource};
+use crate::{can_convert, convert, names, SampleTimes, TelemetrySource};
 
 /// Maximum speed lookups per interval, independent of its reported duration.
 const MAX_PROBES: u64 = 4096;
 const SECOND_NS: u64 = 1_000_000_000;
+
+/// Finds the contiguous interval of independently recorded zero car speed
+/// ending at `end_ns`, returning `(speed_channel, start_ns)`.
+///
+/// Every native speed sample is inspected. Nonzero or non-finite speed and
+/// acquisition gaps stop recovery. GPS speed is excluded because a receiver
+/// without a fix can report zero while moving. Unitless CAN speed is accepted
+/// because an exact zero is independent of scale. Explicit samples may bridge
+/// at most two nominal periods, capped at one second.
+pub fn stationary_lead_in(source: &dyn TelemetrySource, end_ns: u64) -> Option<(usize, u64)> {
+    const CAR_SPEED: &[&str] = &[
+        "groundspeed",
+        "speedref",
+        "corrspeed",
+        "vehiclespeed",
+        "wheelspeed",
+        "speedwspdapp",
+        "vehrefspeed",
+        "vcar",
+        "speed",
+        "velocitykmh",
+    ];
+    let channels = source.channels();
+    let speed = CAR_SPEED.iter().find_map(|name| {
+        channels.iter().position(|channel| {
+            names::eq(&channel.name, name)
+                && channel.sample_count > 0
+                && (channel.unit.is_empty() || can_convert(&channel.unit, "m/s"))
+        })
+    })?;
+    if end_ns >= channels[speed].duration_ns {
+        return None;
+    }
+    let (last_chunk, last_local) = match source.sample_times(speed) {
+        SampleTimes::Explicit(times) => {
+            let global = times
+                .partition_point(|&time| time <= end_ns)
+                .checked_sub(1)?;
+            crate::chunk_for_global(&channels[speed], global as u64)?
+        }
+        SampleTimes::Grid => {
+            let index = channels[speed]
+                .chunks
+                .partition_point(|chunk| chunk.time_base_ns <= end_ns)
+                .checked_sub(1)?;
+            let chunk = &channels[speed].chunks[index];
+            let local = end_ns
+                .checked_sub(chunk.time_base_ns)?
+                .checked_div(chunk.sample_period_ns)?;
+            (index, local.min(chunk.sample_count.checked_sub(1)?))
+        }
+    };
+    let mut start_ns = end_ns;
+    'scan: for (chunk_index, chunk) in channels[speed].chunks[..=last_chunk]
+        .iter()
+        .enumerate()
+        .rev()
+    {
+        let coverage_ns = match source.sample_times(speed) {
+            SampleTimes::Grid => chunk.sample_period_ns,
+            SampleTimes::Explicit(_) => chunk.sample_period_ns.saturating_mul(2).min(SECOND_NS),
+        };
+        let count = if chunk_index == last_chunk {
+            last_local + 1
+        } else {
+            chunk.sample_count
+        };
+        for local in (0..count).rev() {
+            let time_ns = source.sample_time_ns(speed, chunk_index, local);
+            if time_ns > end_ns {
+                continue;
+            }
+            if time_ns > start_ns {
+                return None;
+            }
+            if source.decode(speed, chunk_index, local) != 0.0
+                || time_ns
+                    .saturating_add(coverage_ns)
+                    .min(channels[speed].duration_ns)
+                    < start_ns
+            {
+                break 'scan;
+            }
+            start_ns = time_ns;
+        }
+    }
+    (start_ns < end_ns).then_some((speed, start_ns))
+}
 
 /// Motion estimated from at most 4096 evenly spaced time bins.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -163,10 +251,11 @@ mod tests {
     struct Source {
         channels: Vec<Channel>,
         value: f64,
+        pulse: Option<(u64, f64)>,
         decodes: AtomicU64,
     }
     impl TelemetrySource for Source {
-        fn path(&self) -> &str {
+        fn path(&self) -> &'static str {
             "synthetic"
         }
         fn format(&self) -> &'static str {
@@ -175,14 +264,17 @@ mod tests {
         fn channels(&self) -> &[Channel] {
             &self.channels
         }
-        fn decode(&self, _: usize, _: usize, _: u64) -> f64 {
+        fn decode(&self, _: usize, _: usize, local: u64) -> f64 {
             self.decodes.fetch_add(1, Ordering::Relaxed);
-            self.value
+            self.pulse
+                .filter(|&(index, _)| index == local)
+                .map_or(self.value, |(_, value)| value)
         }
     }
     fn source(value: f64, end: u64) -> Source {
         Source {
             value,
+            pulse: None,
             decodes: AtomicU64::new(0),
             channels: vec![Channel {
                 id: 0,
@@ -201,6 +293,33 @@ mod tests {
                 }],
             }],
         }
+    }
+    #[test]
+    fn stationary_recovery_requires_independent_zero_speed() {
+        let mut s = source(0.0, 20 * SECOND_NS);
+        s.channels[0].unit.clear();
+        assert_eq!(stationary_lead_in(&s, 10 * SECOND_NS), Some((0, 0)));
+        s.channels[0].name = "GPS Speed".into();
+        assert_eq!(stationary_lead_in(&s, 10 * SECOND_NS), None);
+        for value in [0.1, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                stationary_lead_in(&source(value, 20 * SECOND_NS), 10 * SECOND_NS),
+                None
+            );
+        }
+    }
+    #[test]
+    fn stationary_recovery_checks_speed_between_gps_instants() {
+        let mut s = source(0.0, 5 * SECOND_NS);
+        s.channels[0].chunks[0].sample_period_ns = SECOND_NS / 10;
+        s.channels[0].chunks[0].sample_count = 50;
+        s.channels[0].sample_count = 50;
+        s.pulse = Some((39, 1.0)); // 3.9 s, between the 3 s and 4 s GPS fixes.
+        assert_eq!(stationary_lead_in(&s, 4 * SECOND_NS), None);
+        assert_eq!(
+            stationary_lead_in(&s, 4 * SECOND_NS + SECOND_NS / 10),
+            Some((0, 4 * SECOND_NS))
+        );
     }
     #[test]
     fn duration_is_bounded_and_fractional_tail_is_not_overcounted() {

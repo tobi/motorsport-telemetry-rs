@@ -1,5 +1,18 @@
 //! Behavior and losslessness tests on a synthetic source.
 
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use motorsport_telemetry_core::{Channel, Chunk, SampleType, TelemetrySource, UnitSource};
 use telemetry_passes::{apply_registry, PassOutcome};
 
@@ -42,7 +55,7 @@ fn f64_channel(id: u32, name: &str, unit: &str, values: &[f64]) -> (Channel, Vec
 }
 
 impl TelemetrySource for Synthetic {
-    fn path(&self) -> &str {
+    fn path(&self) -> &'static str {
         "session.test"
     }
     fn format(&self) -> &'static str {
@@ -176,6 +189,82 @@ fn registry_applies_all_three_passes() {
 }
 
 #[test]
+fn clean_coordinates_recover_a_stationary_start_without_changing_fix_flags() {
+    for boundary in [None, Some(0.1), Some(f64::NAN)] {
+        let mut source = synthetic();
+        for index in [0, 1] {
+            let mut values: Vec<_> = (0..SAMPLES).map(|i| source.decode(index, 0, i)).collect();
+            values[..40].fill(f64::NAN);
+            source.data[index] = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+        }
+        let mut speed = vec![0.0; SAMPLES as usize];
+        if let Some(value) = boundary {
+            speed[20] = value;
+        }
+        // Unitless AiM CAN speed can still prove an exact zero.
+        let (channel, data) = f64_channel(5, "Speed_Wspd_App", "", &speed);
+        source.channels.push(channel);
+        source.data.push(data);
+        let (passed, _) = apply_registry(&source).unwrap();
+        let raw = channel_index(&passed, "GPS Latitude");
+        let clean = channel_index(&passed, "GPS Latitude Clean");
+        let valid = channel_index(&passed, "GPS Fix Valid");
+        let anchor = source.decode(raw, 0, 40);
+        assert!(passed.decode(raw, 0, 0).is_nan());
+        assert_eq!(passed.decode(valid, 0, 0), 0.0);
+        if boundary.is_none() {
+            assert_eq!(passed.decode(clean, 0, 0), anchor);
+        } else {
+            assert!(passed.decode(clean, 0, 0).is_nan());
+            assert!(passed.decode(clean, 0, 20).is_nan());
+        }
+        assert_eq!(passed.decode(clean, 0, 21), anchor);
+        assert_eq!(passed.decode(clean, 0, 39), anchor);
+        assert!(passed.applied_passes()[1]
+            .inputs
+            .contains(&"Speed_Wspd_App".to_owned()));
+    }
+}
+
+#[test]
+fn zero_gps_speed_without_a_fix_does_not_backfill_clean_coordinates() {
+    let mut source = synthetic();
+    for index in [0, 1] {
+        let mut values: Vec<_> = (0..SAMPLES).map(|i| source.decode(index, 0, i)).collect();
+        values[..40].fill(f64::NAN);
+        source.data[index] = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+    }
+    source.data[3] = vec![0.0_f64.to_le_bytes(); SAMPLES as usize].concat();
+    let (passed, _) = apply_registry(&source).unwrap();
+    let clean = channel_index(&passed, "GPS Latitude Clean");
+    assert!(passed.decode(clean, 0, 0).is_nan());
+    assert!(passed.decode(clean, 0, 39).is_nan());
+    assert!(passed.decode(clean, 0, 40).is_finite());
+}
+
+#[test]
+fn a_rejected_teleport_cannot_anchor_stationary_recovery() {
+    let mut source = synthetic();
+    let teleport = 43.9_f64.to_le_bytes();
+    source.data[0][15 * 8..16 * 8].copy_from_slice(&teleport);
+    let (channel, data) = f64_channel(5, "Wheel Speed", "km/h", &vec![0.0; SAMPLES as usize]);
+    source.channels.push(channel);
+    source.data.push(data);
+    let (passed, _) = apply_registry(&source).unwrap();
+    let clean = channel_index(&passed, "GPS Latitude Clean");
+    // The valid fix after the teleport supplies the stationary coordinates.
+    for index in 10..=15 {
+        assert_eq!(passed.decode(clean, 0, index), source.decode(0, 0, 16));
+    }
+}
+
+#[test]
 fn arc_minute_coordinates_skip_gps_passes() {
     let mut source = synthetic();
     // Same fixes expressed in arc-minutes (degrees * 60), unit lost.
@@ -198,9 +287,11 @@ fn arc_minute_coordinates_skip_gps_passes() {
         let report = reports.iter().find(|report| report.name == name).unwrap();
         match &report.outcome {
             PassOutcome::Skipped { reason } => {
-                assert!(reason.contains("decode-level normalization"), "{reason}")
+                assert!(reason.contains("decode-level normalization"), "{reason}");
             }
-            other => panic!("{name} should skip on arc-minutes: {other:?}"),
+            other @ PassOutcome::Applied { .. } => {
+                panic!("{name} should skip on arc-minutes: {other:?}")
+            }
         }
     }
     // The odometer does not care about coordinates.
@@ -248,9 +339,9 @@ fn unitless_speed_skips_distance() {
         .unwrap();
     match &report.outcome {
         PassOutcome::Skipped { reason } => {
-            assert!(reason.contains("no declared unit"), "{reason}")
+            assert!(reason.contains("no declared unit"), "{reason}");
         }
-        other => panic!("expected skip: {other:?}"),
+        other @ PassOutcome::Applied { .. } => panic!("expected skip: {other:?}"),
     }
 }
 
@@ -262,21 +353,22 @@ fn passes_persist_and_strip_back_to_identical_bytes() {
     let derived = dir.path().join("derived.telemetry");
     let stripped = dir.path().join("stripped.telemetry");
 
-    telemetry_format::write_from_source(&source, &raw).unwrap();
+    telemetry_format::write_telemetry(&source, &raw).unwrap();
 
     let (passed, _) = apply_registry(&source).unwrap();
-    telemetry_format::write_from_source(&passed, &derived).unwrap();
+    telemetry_format::write_telemetry(&passed, &derived).unwrap();
 
-    let recording = telemetry_format::NativeRecording::open(&derived).unwrap();
+    let recording = telemetry_format::JsonlRecording::open(&derived).unwrap();
     // Provenance and origin survive the write/open round trip.
-    assert_eq!(recording.passes().len(), 3);
-    assert_eq!(recording.passes()[1].name, "gps.clean");
-    assert_eq!(recording.passes()[1].version, 1);
+    assert_eq!(recording.applied_passes().len(), 3);
+    assert_eq!(recording.applied_passes()[1].name, "gps.clean");
+    assert_eq!(recording.applied_passes()[1].version, 2);
     assert_eq!(
-        recording.passes()[1].params,
+        recording.applied_passes()[1].params,
         vec![
             ("max_speed_mps".to_owned(), "150".to_owned()),
             ("reanchor_after".to_owned(), "8".to_owned()),
+            ("stationary_speed".to_owned(), "0".to_owned()),
         ]
     );
     let metadata = recording.metadata();
@@ -304,7 +396,7 @@ fn passes_persist_and_strip_back_to_identical_bytes() {
     }
 
     // Strip: byte-identical to the raw conversion.
-    telemetry_format::write_from_source_stripped(&recording, &stripped).unwrap();
+    telemetry_format::write_telemetry_stripped(&recording, &stripped).unwrap();
     let raw_bytes = std::fs::read(&raw).unwrap();
     let stripped_bytes = std::fs::read(&stripped).unwrap();
     assert_eq!(
@@ -328,12 +420,13 @@ fn jsonl_header_round_trips_provenance() {
     assert_eq!(metadata.source_path, "session.test");
     assert_eq!(metadata.passes.len(), 3);
     assert_eq!(metadata.passes[1].name, "gps.clean");
-    assert_eq!(metadata.passes[1].version, 1);
+    assert_eq!(metadata.passes[1].version, 2);
     assert_eq!(
         metadata.passes[1].params,
         vec![
             ("max_speed_mps".to_owned(), "150".to_owned()),
             ("reanchor_after".to_owned(), "8".to_owned()),
+            ("stationary_speed".to_owned(), "0".to_owned()),
         ]
     );
     assert_eq!(
@@ -343,8 +436,8 @@ fn jsonl_header_round_trips_provenance() {
 
     // A second conversion hop keeps the original identity.
     let hop = dir.path().join("hop.telemetry");
-    telemetry_format::write_from_source(&recording, &hop).unwrap();
-    let reopened = telemetry_format::NativeRecording::open(&hop).unwrap();
+    telemetry_format::write_telemetry(&recording, &hop).unwrap();
+    let reopened = telemetry_format::JsonlRecording::open(&hop).unwrap();
     let hop_metadata = reopened.metadata();
     assert_eq!(hop_metadata.source_format, "test");
     assert_eq!(hop_metadata.source_path, "session.test");

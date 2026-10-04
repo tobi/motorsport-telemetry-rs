@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn find_respects_name_priority_over_channel_order() {
-        let mk = |name: &str| crate::Channel {
+        let mk = |name: &str| Channel {
             id: 0,
             name: name.into(),
             unit: String::new(),

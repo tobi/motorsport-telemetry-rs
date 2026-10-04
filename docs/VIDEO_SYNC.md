@@ -1,8 +1,8 @@
 # Video Sync: the Consumer Contract
 
 How to put a telemetry sample on the right video frame — and nothing else.
-One page, three rules. The theory and the measured failure modes live in
-[`WHY_POSITIONING_IS_HARD.md`](WHY_POSITIONING_IS_HARD.md) §2.3.
+One page, three rules. This preserves source video timing; aligning different
+laps or recordings by track position is the consuming application's job.
 
 ## The two timelines
 
@@ -19,9 +19,9 @@ synced" in a player and drifts in any tool that reconstructs time by hand.
 
 `.telemetry` stores the bridge, per recording and per video file:
 
-- `video_frames.bin` — presentation timestamp of **every frame**, in
+- header `vpts` — presentation timestamp of **every frame**, in
   presentation order (frame rate is *not* assumed constant),
-- `video_presentation_offset_ns` — the telemetry→player shift
+- header `vo` (`video_presentation_offset_ns`) — the telemetry→player shift
   (`player_ns = telemetry_ns + offset`),
 - per-lap `first_video_frame` in `FileMetadata::laps`,
 - per-file `VideoFileRef { filename, index, blake3, frame_count,
@@ -61,16 +61,15 @@ synced" in a player and drifts in any tool that reconstructs time by hand.
 
 | Container | Video sync? |
 |---|---|
-| Native `.telemetry` (v5+) | **Yes** — full contract above, bit-exact round trip |
 | Original vendor MP4 (AiM) | Yes — same API, computed from the container |
-| MTJ (`.mtj`) | **Yes** — header keys `vo`/`vf`/`vpts` (JSONL.md §4.2) carry the same offset, file refs + BLAKE3, and frame table; MTJ ↔ native round-trips the linkage bit-exactly |
-| MTX sidecars (`.mtjx`) | **No** — sidecars never carry video; the linkage belongs to the host recording |
+| MTJ (`.telemetry`, `.telemetry.jsonl`) | **Yes** — header keys `vo`/`vf`/`vpts` preserve offsets, video references, hashes, and frame timestamps exactly |
+| MTX sidecars (`.telemetry.ext.jsonl`) | **No** — sidecars never carry video; the linkage belongs to the host recording |
 
 ## What sync does *not* depend on
 
 Processing passes (`gps.quality`, `gps.clean`, `speed.distance`, …) clean
 sensor data; they neither move samples in time nor touch the video clock
-chain. The mapping above is written by every conversion since format v5,
+chain. The mapping above is written by every recording conversion,
 with or without passes. If sync looks wrong, the suspect list is: raw frame
 math somewhere downstream (rule 1), a mismatched video file (rule 3), or a
 stale sidecar `utc` — not the passes.

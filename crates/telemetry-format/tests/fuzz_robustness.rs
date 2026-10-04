@@ -1,30 +1,29 @@
-//! Deterministic fuzz/robustness harness for the native `.telemetry` zip
-//! reader and the MTJ/MTX JSONL reader.
-//!
-//! Builds three valid in-memory corpora with the crate's own writers, then
-//! mutates each with every operator in [`fuzz_harness::Op`]:
-//!   * a native `.telemetry` zip written from a MoTeC LD source,
-//!   * an uncompressed MTJ `.telemetry.jsonl` document written from the same,
-//!   * an uncompressed MTX `.telemetry.ext.jsonl` span sidecar.
-//!
-//! Uncompressed JSONL is used so mutations land on readable JSON rather than
-//! zstd framing. For each mutated input the shared invariants are asserted:
-//! no panic, no hang, and a parsed result whose channel footprint exceeds the
-//! mutated input is flagged by `validate_source` via
-//! `layout.footprint_exceeds_file`.
+//! Deterministic mutations of compressed MTJ, plain MTJ, and MTX documents.
+//! Checks that corrupted documents cannot panic or hang the reader.
 
-#![allow(missing_docs)]
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
 
 #[path = "../../../tests/fuzz_harness.rs"]
 mod fuzz_harness;
 
-use fuzz_harness::{assert_no_failures, run_case, Op, Outcome};
+use fuzz_harness::assert_no_failures;
 use motec_telemetry::MotecFile;
 use motorsport_telemetry_core::{Span, SpanPrimary, TelemetrySource};
 use std::path::PathBuf;
 use telemetry_format::{
-    write_from_source, write_jsonl_extension_from_source_with, write_jsonl_from_source_with,
-    JsonlRecording, NativeRecording, SidecarHeader,
+    write_jsonl_extension_from_source_with, write_jsonl_from_source_with, write_telemetry,
+    JsonlRecording, SidecarHeader,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -33,7 +32,7 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// A small MoTeC LD source used as the basis for the native and MTJ corpora.
+/// A small `MoTeC` LD source used as the basis for the MTJ corpora.
 fn motec_source() -> MotecFile {
     let ld = std::fs::read(fixture("synthetic_motec_multilap.ld")).unwrap();
     MotecFile::from_bytes("synthetic_motec_multilap.ld", ld).unwrap()
@@ -50,10 +49,10 @@ fn write_temp(suffix: &str, write: impl FnOnce(&std::path::Path)) -> Vec<u8> {
     std::fs::read(&path).unwrap()
 }
 
-fn native_corpus() -> Vec<u8> {
+fn compressed_corpus() -> Vec<u8> {
     let source = motec_source();
     write_temp("telemetry", |path| {
-        write_from_source(&source, path).unwrap();
+        write_telemetry(&source, path).unwrap();
     })
 }
 
@@ -99,16 +98,9 @@ fn mtx_corpus() -> Vec<u8> {
                 &spans,
                 false,
             )
-            .unwrap()
+            .unwrap();
         });
     })
-}
-
-/// Parses a mutated native `.telemetry` zip through `NativeRecording::from_bytes`.
-fn parse_native(bytes: &[u8]) -> Result<Box<dyn TelemetrySource + Send + Sync>, String> {
-    NativeRecording::from_bytes("fuzz.telemetry", bytes.to_vec())
-        .map_err(|e| e.to_string())
-        .map(|f| Box::new(f) as Box<dyn TelemetrySource + Send + Sync>)
 }
 
 /// Parses a mutated MTJ or MTX JSONL document through `JsonlRecording::from_bytes`.
@@ -126,9 +118,9 @@ fn parse_mtx(bytes: &[u8]) -> Result<Box<dyn TelemetrySource + Send + Sync>, Str
 }
 
 #[test]
-fn native_telemetry_survives_mutations() {
-    let corpus = native_corpus();
-    assert_no_failures("native_telemetry", &[&corpus], parse_native, true);
+fn compressed_telemetry_survives_mutations() {
+    let corpus = compressed_corpus();
+    assert_no_failures("compressed_telemetry", &[&corpus], parse_jsonl, false);
 }
 
 #[test]
@@ -145,19 +137,4 @@ fn mtx_sidecar_survives_mutations() {
     // An MTX sidecar carries spans and/or text sample channels; sample bytes
     // are not bounded by the input length: footprint link not asserted.
     assert_no_failures("mtx_sidecar", &[&corpus], parse_mtx, false);
-}
-
-/// Regression: `bit_flip` on the native `.telemetry` corpus at seed
-/// `0x6508ff172cc663bc` once reserved a ~601 GB vector and aborted (SIGABRT),
-/// because the catalog unpackers did `Vec::with_capacity(u32_count)` from an
-/// untrusted flatbuffer count and the params/inputs/outputs loops could spin
-/// without advancing. Every unpacker count is now bounded by
-/// `remaining_bytes / min_record_size`, so the case no longer OOMs.
-#[test]
-fn regression_native_catalog_unbounded_with_capacity_oom() {
-    let corpus = native_corpus();
-    let outcome = run_case(0x6508ff172cc663bc, Op::BitFlip, &corpus, parse_native, true);
-    if let Outcome::Failure(msg) = outcome.outcome {
-        panic!("regression returned: {msg}");
-    }
 }

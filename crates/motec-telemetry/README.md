@@ -1,6 +1,6 @@
 # motec-telemetry
 
-Standalone memory-mapped MoTeC `.ld` parser. It validates the LD header, walks channel metadata, decodes float and integer channels, and applies MoTeC scale/shift/multiplier conversion.
+Standalone memory-mapped `MoTeC` `.ld` parser. It validates the LD header, walks channel metadata, decodes float and integer channels, and applies `MoTeC` scale/shift/multiplier conversion.
 
 ## Library contract
 

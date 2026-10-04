@@ -1,5 +1,18 @@
 //! Dump a PDS as `name\tunit\tfreq\thexbits,...` for cross-validation.
 
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use cosworth_telemetry::CosworthFile;
 use motorsport_telemetry_core::TelemetrySource;
 use std::io::{BufWriter, Write};

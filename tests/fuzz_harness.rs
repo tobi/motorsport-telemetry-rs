@@ -13,17 +13,31 @@
 //!     implausible value injection into u16/u32/u64/f32/f64 fields.
 //!   * For every mutated input we assert that parsing, decoding, sampling,
 //!     and validation never panic and never hang.
-//!   * For binary-packed formats (PDS, MoTeC LD, native `.telemetry`) we also
+//!   * For binary-packed formats (PDS, `MoTeC` LD, native `.telemetry`) we also
 //!     assert the footprint link: a parsed result whose channels claim more
 //!     sample bytes than the mutated input holds MUST be flagged by
 //!     `validate_source` via `layout.footprint_exceeds_file`. That is the
 //!     invariant which would have caught the original 1.5e308 m/s misread.
-//!     Text formats (VBO, JSONL) and packet-expanding formats (AiM) do not
+//!     Text formats (VBO, JSONL) and packet-expanding formats (`AiM`) do not
 //!     bound sample bytes by input length, so the link is not asserted there.
 
-#![allow(missing_docs)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+#![allow(
+    dead_code,
+    unused_variables,
+    reason = "shared harness: each test crate uses a different subset"
+)]
 
 use motorsport_telemetry_core::{
     read_source_metadata, validate_source_with, TelemetrySource, ValidateOptions,
@@ -43,11 +57,11 @@ const PER_CASE_TIMEOUT: Duration = Duration::from_millis(1500);
 const DEFAULT_CASES: u32 = 128;
 
 /// Maximum samples decoded per channel per case. Bounds per-case work while
-/// still exercising every chunk and the public decode/sample_at paths.
+/// still exercising every chunk and the public `decode/sample_at` paths.
 const MAX_SAMPLES_PER_CHANNEL: u64 = 32;
 
 /// Reads the per-run case count override, defaulting to [`DEFAULT_CASES`].
-pub fn case_count() -> u32 {
+pub(crate) fn case_count() -> u32 {
     std::env::var("FUZZ_CASES")
         .ok()
         .and_then(|raw| raw.parse::<u32>().ok())
@@ -55,26 +69,26 @@ pub fn case_count() -> u32 {
         .unwrap_or(DEFAULT_CASES)
 }
 
-/// Deterministic SplitMix64 PRNG.
+/// Deterministic `SplitMix64` PRNG.
 ///
 /// Every case starts from an explicit `u64` seed, so a reported failure
-/// reproduces bit-for-bit. SplitMix64 is small, std-only, and good enough for
+/// reproduces bit-for-bit. `SplitMix64` is small, std-only, and good enough for
 /// byte mutation.
-pub struct Rng {
+pub(crate) struct Rng {
     state: u64,
 }
 
 impl Rng {
     /// Seeds the generator. The addend keeps `seed = 0` from being a fixed
     /// point while remaining a pure function of the seed.
-    pub fn from_seed(seed: u64) -> Self {
+    pub(crate) fn from_seed(seed: u64) -> Self {
         Self {
             state: seed.wrapping_add(0x9E3779B97F4A7C15),
         }
     }
 
     /// Returns the next 64-bit value.
-    pub fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
@@ -83,12 +97,12 @@ impl Rng {
     }
 
     /// Returns the next 32-bit value.
-    pub fn next_u32(&mut self) -> u32 {
+    pub(crate) fn next_u32(&mut self) -> u32 {
         (self.next_u64() >> 32) as u32
     }
 
     /// Returns a value in `0..n`, or `0` when `n == 0`.
-    pub fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         if n == 0 {
             0
         } else {
@@ -99,7 +113,7 @@ impl Rng {
 
 /// One mutation operator. The label is printed in assertion messages.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Op {
+pub(crate) enum Op {
     /// Flip a single bit.
     BitFlip,
     /// Flip up to eight bits.
@@ -124,40 +138,40 @@ pub enum Op {
 
 impl Op {
     /// All operators, in a stable order.
-    pub const ALL: &'static [Op] = &[
-        Op::BitFlip,
-        Op::BitFlips,
-        Op::Truncate,
-        Op::ZeroRegion,
-        Op::SplatFF,
-        Op::U16Field,
-        Op::U32Field,
-        Op::U64Field,
-        Op::F32Field,
-        Op::F64Field,
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::BitFlip,
+        Self::BitFlips,
+        Self::Truncate,
+        Self::ZeroRegion,
+        Self::SplatFF,
+        Self::U16Field,
+        Self::U32Field,
+        Self::U64Field,
+        Self::F32Field,
+        Self::F64Field,
     ];
 
     /// Stable label for assertion messages.
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
-            Op::BitFlip => "bit_flip",
-            Op::BitFlips => "bit_flips",
-            Op::Truncate => "truncate",
-            Op::ZeroRegion => "zero_region",
-            Op::SplatFF => "splat_ff",
-            Op::U16Field => "u16_field",
-            Op::U32Field => "u32_field",
-            Op::U64Field => "u64_field",
-            Op::F32Field => "f32_field",
-            Op::F64Field => "f64_field",
+            Self::BitFlip => "bit_flip",
+            Self::BitFlips => "bit_flips",
+            Self::Truncate => "truncate",
+            Self::ZeroRegion => "zero_region",
+            Self::SplatFF => "splat_ff",
+            Self::U16Field => "u16_field",
+            Self::U32Field => "u32_field",
+            Self::U64Field => "u64_field",
+            Self::F32Field => "f32_field",
+            Self::F64Field => "f64_field",
         }
     }
 
     fn width(self) -> usize {
         match self {
-            Op::U16Field => 2,
-            Op::U32Field | Op::F32Field => 4,
-            Op::U64Field | Op::F64Field => 8,
+            Self::U16Field => 2,
+            Self::U32Field | Self::F32Field => 4,
+            Self::U64Field | Self::F64Field => 8,
             _ => 0,
         }
     }
@@ -165,7 +179,7 @@ impl Op {
     fn is_field(self) -> bool {
         matches!(
             self,
-            Op::U16Field | Op::U32Field | Op::U64Field | Op::F32Field | Op::F64Field
+            Self::U16Field | Self::U32Field | Self::U64Field | Self::F32Field | Self::F64Field
         )
     }
 }
@@ -175,7 +189,7 @@ impl Op {
 /// Length-preserving operators leave the byte count unchanged; [`Op::Truncate`]
 /// shrinks it. Field injection overwrites a little-endian u16/u32/u64 or
 /// f32/f64 region with an implausible value drawn from a fixed table.
-pub fn mutate(base: &[u8], seed: u64, op: Op) -> Vec<u8> {
+pub(crate) fn mutate(base: &[u8], seed: u64, op: Op) -> Vec<u8> {
     let mut rng = Rng::from_seed(seed ^ (op as u64).wrapping_mul(0x100000001b3));
     let mut out = base.to_vec();
     if out.is_empty() {
@@ -278,11 +292,11 @@ fn implausible_bytes(op: Op, rng: &mut Rng) -> [u8; 8] {
 ///
 /// Returns the parsed source on success, or an error string on a clean
 /// rejection. Panics are caught separately by the harness.
-pub type Parse = fn(&[u8]) -> Result<Box<dyn TelemetrySource + Send + Sync>, String>;
+pub(crate) type Parse = fn(&[u8]) -> Result<Box<dyn TelemetrySource + Send + Sync>, String>;
 
 /// Outcome of one fuzz case.
 #[derive(Debug)]
-pub struct CaseOutcome {
+pub(crate) struct CaseOutcome {
     /// The seed that produced this case.
     pub seed: u64,
     /// The operator label.
@@ -293,7 +307,7 @@ pub struct CaseOutcome {
 
 /// What happened for one mutated input.
 #[derive(Debug)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     /// Parsed and all invariants held.
     Accepted,
     /// Parser returned `Err`; acceptable.
@@ -305,13 +319,13 @@ pub enum Outcome {
 /// Runs one mutated case under a watchdog thread and returns its outcome.
 ///
 /// `validate_file_len` should be `true` only for binary-packed formats whose
-/// channel footprint is bounded by the input length (PDS, MoTeC LD, native
+/// channel footprint is bounded by the input length (PDS, `MoTeC` LD, native
 /// `.telemetry`). It MUST be `false` for text formats (VBO, JSONL) and
-/// packet-expanding formats (AiM), where sample bytes are not bounded by the
+/// packet-expanding formats (`AiM`), where sample bytes are not bounded by the
 /// input length. When true, a parsed result whose channels claim more sample
 /// bytes than the mutated input holds MUST be flagged by `validate_source`
 /// via `layout.footprint_exceeds_file`, or the case is recorded as a failure.
-pub fn run_case(
+pub(crate) fn run_case(
     seed: u64,
     op: Op,
     base: &[u8],
@@ -407,11 +421,11 @@ fn run_worker(
 /// Extracts a readable string from a panic payload.
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
+        (*s).to_owned()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
     } else {
-        "<non-string panic payload>".to_string()
+        "<non-string panic payload>".to_owned()
     }
 }
 
@@ -500,10 +514,10 @@ fn check_invariants(
         let footprint: u128 = channels
             .iter()
             .map(|channel| {
-                (channel.sample_count as u128) * (channel.sample_type.byte_width() as u128)
+                u128::from(channel.sample_count) * (channel.sample_type.byte_width() as u128)
             })
             .sum();
-        if footprint > len as u128 && diags.find("layout.footprint_exceeds_file").is_none() {
+        if footprint > u128::from(len) && diags.find("layout.footprint_exceeds_file").is_none() {
             return Err(format!(
                 "footprint {footprint} sample-bytes > file_len {len}, but validate_source \
                  did not emit layout.footprint_exceeds_file; diagnostics: {diags}"
@@ -520,13 +534,13 @@ fn check_invariants(
 /// `format_name` is included in the final assertion so a CI failure names the
 /// format, every failing seed, and the operator. Acceptable outcomes
 /// (Accepted/Rejected) are counted and reported via `eprintln` for visibility.
-pub fn assert_no_failures(
+pub(crate) fn assert_no_failures(
     format_name: &str,
     corpus: &[&[u8]],
     parse: Parse,
     validate_file_len: bool,
 ) {
-    let n = case_count() as u64;
+    let n = u64::from(case_count());
     let mut failures = Vec::new();
     let mut accepted = 0u32;
     let mut rejected = 0u32;
@@ -539,7 +553,7 @@ pub fn assert_no_failures(
             Outcome::Accepted => accepted += 1,
             Outcome::Rejected => rejected += 1,
             Outcome::Failure(msg) => {
-                failures.push(format!("seed={seed:#x} op={}: {msg}", op.label()))
+                failures.push(format!("seed={seed:#x} op={}: {msg}", op.label()));
             }
         }
     }

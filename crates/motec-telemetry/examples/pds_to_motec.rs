@@ -1,8 +1,21 @@
-//! End-to-end PDS -> MoTeC LD -> read-back verification on a real recording.
+//! End-to-end PDS -> `MoTeC` LD -> read-back verification on a real recording.
 //!
-//! Usage: pds_to_motec INPUT.pds [OUTPUT.ld]
+//! Usage: `pds_to_motec` INPUT.pds [OUTPUT.ld]
 //!
 //! Exits non-zero if a single sample, name, unit, rate or count differs.
+
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
 
 use cosworth_telemetry::CosworthFile;
 use motec_telemetry::{motec_sidecar_path, write_motec, MotecFile, MotecMetadata};
@@ -123,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let verdict = if problems.is_empty() {
-            "OK".to_string()
+            "OK".to_owned()
         } else {
             failures += 1;
             format!("FAIL: {}", problems.join("; "))

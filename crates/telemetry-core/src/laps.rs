@@ -3,7 +3,7 @@
 //! Vendor files almost never agree on lap identity, so the pipeline follows a
 //! fixed precedence (matching the README "How laps are recovered" section):
 //!
-//! 1. [`authoritative_laps`] — laps a source format supplies directly (MoTeC
+//! 1. [`authoritative_laps`] — laps a source format supplies directly (`MoTeC`
 //!    LDX, a `.telemetry` catalog).
 //! 2. [`counter_laps`] — an incrementing counter. `Lap Number` wins only when
 //!    it actually counts (high-water >= 2); a 0/1 flag loses to
@@ -266,8 +266,7 @@ fn increasing_counter_laps(
                     && laps
                         .last()
                         .is_some_and(|lap: &LapMetadata| lap.end_ns == open.start_ns);
-                if pit_event {
-                    let mut in_lap = laps.pop().expect("checked above");
+                if let Some(in_lap) = laps.last_mut().filter(|_| pit_event) {
                     in_lap.end_ns = time_ns;
                     in_lap.duration_ns = time_ns - in_lap.start_ns;
                     in_lap.complete = false;
@@ -276,7 +275,6 @@ fn increasing_counter_laps(
                     } else {
                         LapKind::In
                     };
-                    laps.push(in_lap);
                     crossings -= 1;
                 } else {
                     close(&mut laps, open, time_ns, false, stint);
@@ -469,7 +467,7 @@ fn timer_seconds_per_unit(unit: &str, max_value: f64) -> Option<f64> {
     if unit.trim().is_empty() {
         Some(if max_value > 1_000.0 { 0.001 } else { 1.0 })
     } else {
-        crate::convert(1.0, unit, "s").ok()
+        convert(1.0, unit, "s").ok()
     }
 }
 
@@ -917,8 +915,8 @@ mod tests {
         channels: Vec<crate::Channel>,
         values: Vec<f64>,
     }
-    impl crate::TelemetrySource for StopSource {
-        fn path(&self) -> &str {
+    impl TelemetrySource for StopSource {
+        fn path(&self) -> &'static str {
             "synthetic"
         }
         fn format(&self) -> &'static str {
@@ -971,7 +969,7 @@ mod tests {
         classify_laps(&source, &mut laps);
         let shape: Vec<(LapKind, i64, u64, u64)> = laps
             .iter()
-            .map(|l| (l.kind, l.stint as i64, l.start_ns, l.end_ns))
+            .map(|l| (l.kind, i64::from(l.stint), l.start_ns, l.end_ns))
             .collect();
         assert_eq!(
             shape,

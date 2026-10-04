@@ -1,8 +1,17 @@
+//! Generate the embedded track catalog from the checked-in atlas data.
+
+#![allow(
+    clippy::expect_used,
+    clippy::print_stdout,
+    reason = "build script: panics fail the build; cargo: directives go to stdout"
+)]
+
 use serde_json::Value;
+use std::fmt::Write;
 use std::{env, fs, path::PathBuf};
 
 fn q(value: &str) -> String {
-    format!("{:?}", value)
+    format!("{value:?}")
 }
 
 fn main() {
@@ -46,7 +55,7 @@ fn main() {
                     .get("centerline_geojson")
                     .expect("embedded centerline geometry"),
             )
-            .unwrap();
+            .expect("serialize centerline geometry");
             let points = layout["point_layers"]
                 .as_array()
                 .cloned()
@@ -55,30 +64,32 @@ fn main() {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            let points_json = serde_json::to_string(&points).unwrap();
-            let ranges_json = serde_json::to_string(&ranges).unwrap();
-            layout_code.push_str(&format!(
+            let points_json = serde_json::to_string(&points).expect("serialize point layers");
+            let ranges_json = serde_json::to_string(&ranges).expect("serialize range layers");
+            write!(
+                layout_code,
                 "Layout {{ id: {}, name: {}, length_m: {}, direction: {}, centerline: {}, centerline_geojson: {}, point_layers_json: {}, range_layers_json: {} }},",
                 q(id),
                 q(layout_name),
-                length.map_or("None".into(), |value| format!("Some({value:?})")),
-                direction.map_or("None".into(), |value| format!("Some({})", q(value))),
+                length.map_or_else(|| "None".into(), |value| format!("Some({value:?})")),
+                direction.map_or_else(|| "None".into(), |value| format!("Some({})", q(value))),
                 q(centerline),
                 q(&centerline_geojson),
                 q(&points_json),
                 q(&ranges_json)
-            ));
+            ).expect("append generated layout");
         }
-        tracks.push_str(&format!(
+        write!(
+            tracks,
             "Track {{ slug: {}, name: {}, aka: &[{aka}], country: {}, timezone: {}, latitude: {lat}, longitude: {lon}, layouts: &[{layout_code}] }},",
             q(slug), q(name), q(country), q(timezone)
-        ));
+        ).expect("append generated track");
     }
     let output = format!(
         "/// Upstream track-atlas Git revision used to generate this catalog.\npub const TRACK_ATLAS_REVISION: &str = {};\n/// Complete generated track catalog. Prefer [`tracks`] for normal access.\npub static TRACKS: &[Track] = &[{}];\n",
         q(&revision),
         tracks
     );
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("track_atlas.rs");
+    let out = PathBuf::from(env::var("OUT_DIR").expect("Cargo OUT_DIR")).join("track_atlas.rs");
     fs::write(out, output).expect("write generated track atlas");
 }

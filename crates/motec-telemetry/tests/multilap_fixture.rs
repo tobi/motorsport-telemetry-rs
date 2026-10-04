@@ -1,3 +1,16 @@
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use motec_telemetry::{infer_lap_markers, MotecFile};
 use motorsport_telemetry_core::{LapKind, TelemetrySource};
 use std::path::PathBuf;

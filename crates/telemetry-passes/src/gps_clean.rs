@@ -4,7 +4,7 @@ use crate::{
     collect_samples, degrees_precondition, gps_quality, sample_times_monotonic, Applicability,
     DerivedChannel, PassError, PassOutput, TelemetryPass,
 };
-use motorsport_telemetry_core::{names, TelemetrySource};
+use motorsport_telemetry_core::{motion::stationary_lead_in, names, TelemetrySource};
 
 /// Motion faster than this between consecutive fixes is a teleport, not a
 /// race car (150 m/s = 540 km/h).
@@ -17,9 +17,9 @@ const REANCHOR_AFTER: u32 = 8;
 /// the latitude channel's exact timeline, with invalid fixes and teleports
 /// masked to NaN instead of being smoothed over.
 ///
-/// Downstream consumers get a hard guarantee: every non-NaN sample is a
-/// plausible position of this car. No interpolation, no filtering — samples
-/// are either passed through exactly or masked.
+/// A masked gap during independently recorded zero car speed is recovered
+/// from the next accepted fix. Movement, unknown speed, and acquisition gaps
+/// stop that recovery. Receiver quality flags remain unchanged.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GpsClean;
 
@@ -29,7 +29,7 @@ impl TelemetryPass for GpsClean {
     }
 
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn description(&self) -> &'static str {
@@ -40,7 +40,9 @@ impl TelemetryPass for GpsClean {
     fn requirements(&self) -> &'static str {
         "GPS latitude and longitude channels in decimal degrees. Uses \
          gps.quality's GPS Fix Valid flags when present; consecutive fixes \
-         implying motion faster than 150 m/s are masked as teleports."
+         implying motion faster than 150 m/s are masked as teleports. Masked \
+         stationary intervals use the next accepted fix only when independent \
+         car-speed samples are exactly zero throughout."
     }
 
     fn check(&self, source: &dyn TelemetrySource) -> Applicability {
@@ -86,7 +88,9 @@ impl TelemetryPass for GpsClean {
         let mut clean_longitude = Vec::with_capacity(samples.len());
         let mut last_accepted: Option<(u64, f64, f64)> = None;
         let mut rejected_streak = 0u32;
-        for (time_ns, lat) in samples {
+        let mut gap_start = None;
+        let mut recovery_speed = None;
+        for &(time_ns, lat) in &samples {
             let lon = source
                 .sample_at(longitude, time_ns, true)
                 .unwrap_or(f64::NAN);
@@ -130,11 +134,23 @@ impl TelemetryPass for GpsClean {
                 }
             }
             if accept {
+                if let Some(first) = gap_start.take() {
+                    if let Some((speed, start_ns)) = stationary_lead_in(source, time_ns) {
+                        for index in first..clean_latitude.len() {
+                            if samples[index].0 >= start_ns {
+                                clean_latitude[index] = lat;
+                                clean_longitude[index] = lon;
+                                recovery_speed = Some(speed);
+                            }
+                        }
+                    }
+                }
                 rejected_streak = 0;
                 last_accepted = Some((time_ns, lat, lon));
                 clean_latitude.push(lat);
                 clean_longitude.push(lon);
             } else {
+                gap_start.get_or_insert(clean_latitude.len());
                 clean_latitude.push(f64::NAN);
                 clean_longitude.push(f64::NAN);
             }
@@ -147,10 +163,14 @@ impl TelemetryPass for GpsClean {
         if let Some(index) = fix_valid {
             inputs.push(channels[index].name.clone());
         }
+        if let Some(index) = recovery_speed {
+            inputs.push(channels[index].name.clone());
+        }
         Ok(PassOutput {
             params: vec![
                 ("max_speed_mps".to_owned(), "150".to_owned()),
                 ("reanchor_after".to_owned(), "8".to_owned()),
+                ("stationary_speed".to_owned(), "0".to_owned()),
             ],
             inputs,
             channels: vec![

@@ -38,38 +38,32 @@ fn plausible_band(dimension: Dimension) -> Option<(f64, f64)> {
     Some(match dimension {
         // 500 m/s covers any land vehicle with a wide margin.
         Dimension::Speed => (-500.0, 500.0),
-        // Track positions plus lifetime vehicle odometers (up to 1 million km).
-        Dimension::Length => (-1.0e9, 1.0e9),
+        // Track positions and odometers, frequencies, power, and resistance.
+        Dimension::Length | Dimension::Frequency | Dimension::Power | Dimension::Resistance => {
+            (-1.0e9, 1.0e9)
+        }
         // ~100 g. Impacts reach 60 g; nothing survives ten times that.
         Dimension::Acceleration => (-1000.0, 1000.0),
-        // Unwrapped heading integrations stay far inside this.
-        Dimension::Angle => (-1.0e5, 1.0e5),
+        // Unwrapped headings, ignition coil and hybrid bus potentials/currents.
+        Dimension::Angle | Dimension::Voltage | Dimension::Current => (-1.0e5, 1.0e5),
         // 30000 rad/s is ~286000 rpm, past any turbo or driveline sensor.
         Dimension::AngularVelocity => (-30000.0, 30000.0),
-        Dimension::AngularAcceleration => (-1.0e6, 1.0e6),
+        // Ratios may be fractions or percentages; none of these reaches 1e6.
+        Dimension::AngularAcceleration | Dimension::Torque | Dimension::Mass | Dimension::Ratio => {
+            (-1.0e6, 1.0e6)
+        }
         // 0..10 kbar absolute; brake lines peak near 200 bar.
         Dimension::Pressure => (-1.0e6, 1.0e9),
         // 0 K to well past exhaust gas temperature.
         Dimension::Temperature => (0.0, 5000.0),
         // Includes Unix-epoch clocks as well as session-relative seconds.
-        Dimension::Time => (-1.0e12, 1.0e12),
-        Dimension::Frequency => (-1.0e9, 1.0e9),
+        Dimension::Time | Dimension::Energy => (-1.0e12, 1.0e12),
         Dimension::Force => (-1.0e7, 1.0e7),
-        Dimension::Torque => (-1.0e6, 1.0e6),
-        Dimension::Energy => (-1.0e12, 1.0e12),
-        Dimension::Power => (-1.0e9, 1.0e9),
-        // Includes ignition coil and hybrid bus potentials.
-        Dimension::Voltage => (-1.0e5, 1.0e5),
-        Dimension::Current => (-1.0e5, 1.0e5),
-        Dimension::Resistance => (-1.0e9, 1.0e9),
-        Dimension::Mass => (-1.0e6, 1.0e6),
-        Dimension::Volume => (-1.0e4, 1.0e4),
-        Dimension::VolumetricFlow => (-1.0e4, 1.0e4),
-        Dimension::MassFlow => (-1.0e4, 1.0e4),
-        // A ratio channel may be stored as a fraction or a percent.
-        Dimension::Ratio => (-1.0e6, 1.0e6),
-        // Decibel-like scales are already compressed; nothing real is past this.
-        Dimension::Logarithmic => (-1.0e4, 1.0e4),
+        // Flow and volume in SI units; decibel-like scales are compressed.
+        Dimension::Volume
+        | Dimension::VolumetricFlow
+        | Dimension::MassFlow
+        | Dimension::Logarithmic => (-1.0e4, 1.0e4),
         // Counts, codes, and markers carry no physical bound.
         Dimension::Count | Dimension::Marker => return None,
     })
@@ -340,10 +334,7 @@ fn check_values(
             let value = source.decode(index, chunk_index, local);
             let time_ns = source.sample_time_ns(index, chunk_index, local);
             seen += 1;
-            if !value.is_finite() {
-                nonfinite += 1;
-                first_nonfinite_ns.get_or_insert(time_ns);
-            } else {
+            if value.is_finite() {
                 if value.abs() > extreme.abs() {
                     extreme = value;
                 }
@@ -359,6 +350,9 @@ fn check_values(
                         first_out_of_band_ns.get_or_insert(time_ns);
                     }
                 }
+            } else {
+                nonfinite += 1;
+                first_nonfinite_ns.get_or_insert(time_ns);
             }
             let next = local.saturating_add(stride);
             if next == local {
@@ -439,7 +433,7 @@ mod tests {
     }
 
     impl TelemetrySource for Fake {
-        fn path(&self) -> &str {
+        fn path(&self) -> &'static str {
             "fake"
         }
         fn format(&self) -> &'static str {
@@ -518,7 +512,7 @@ mod tests {
         assert!(diagnostics.find("laps.long_lap_while_moving").is_none());
 
         // A counter that advances normally produces no finding.
-        let counter: Vec<f64> = (0..1300).map(|t| (t / 100) as f64).collect();
+        let counter: Vec<f64> = (0..1300).map(|t| f64::from(t / 100)).collect();
         let diagnostics = validate_source(&lapping(vec![60.0; 1300], counter));
         assert!(diagnostics.find("laps.long_lap_while_moving").is_none());
         assert!(diagnostics.find("laps.none_while_moving").is_none());

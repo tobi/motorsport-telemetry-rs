@@ -1,3 +1,16 @@
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use cosworth_telemetry::CosworthFile;
 use motorsport_telemetry_core::TelemetrySource;
 
@@ -48,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for s in 0..chunk.sample_count {
                 let v = file.decode(ci, chunk_i, s);
                 total += 1;
-                let rt = v as f32 as f64;
+                let rt = f64::from(v as f32);
                 if rt != v {
                     lossy += 1;
                     let err = (rt - v).abs();

@@ -5,7 +5,18 @@
 //! and a parsed result whose channel footprint exceeds the mutated input is
 //! flagged by `validate_source` via `layout.footprint_exceeds_file`.
 
-#![allow(missing_docs)]
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
 
 #[path = "../../../tests/fuzz_harness.rs"]
 mod fuzz_harness;

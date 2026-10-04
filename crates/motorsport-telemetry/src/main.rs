@@ -1,3 +1,11 @@
+//! Inspect, convert, and verify motorsport telemetry recordings.
+
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI: stdout is the product, stderr carries diagnostics"
+)]
+
 use motorsport_telemetry::motorsport_telemetry_core::{
     names, Diagnostic, Diagnostics, FileMetadata, Severity, TelemetrySource,
 };
@@ -8,13 +16,13 @@ use motorsport_telemetry::{
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use telemetry_format::{
-    is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, needs_update, write_from_source,
-    write_from_source_stripped, write_jsonl_extension_from_source_with,
-    write_jsonl_from_source_with, write_telemetry, write_telemetry_stripped, FORMAT_VERSION,
+    is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, stripped_view,
+    write_jsonl_extension_from_source_with, write_jsonl_from_source_with, write_telemetry,
 };
 use telemetry_passes::{apply_registry, PassOutcome};
 
@@ -28,7 +36,7 @@ Commands:
   inspect    Print laps, track, video, identity, and diagnostics
              for a file or every matching recording under a folder
   convert    Write .telemetry (zstd MTJ, default) or JSONL by suffix
-  verify     Check .telemetry (either container) / .telemetry.jsonl /
+  verify     Check .telemetry / .telemetry.jsonl /
              .zstd and flag decode faults
 
 Run motorsport-telemetry <command> --help for that command.
@@ -102,9 +110,6 @@ Arguments:
 Options:
   --no-passes          Convert the source as-is; run no passes
   --strip-passes       Drop previously applied pass outputs
-                       (.telemetry output only)
-  --native-zip         Write the legacy native STORE zip container
-                       instead of zstd MTJ (.telemetry output only)
 
 Output suffix:
   .telemetry                    MTJ, one zstd frame (the default)
@@ -125,10 +130,8 @@ Examples:
 const VERIFY_HELP: &str = "\
 Usage: motorsport-telemetry verify <file>...
 
-Check that each file is a valid .telemetry (zstd MTJ, or the legacy
-native zip, told apart by content) or an MTJ/MTX JSONL document (plain
-or zstd). Opens a legacy zip without rewriting an older catalog. Decodes
-one sample from every channel.
+Check that each file is a valid MTJ recording or MTX sidecar (plain
+or zstd-compressed JSONL). Decodes one sample from every channel.
 
 After the format check, reader diagnostics and plausibility findings are
 printed for every file. A file whose channels claim more sample bytes than
@@ -172,8 +175,6 @@ struct LapRow {
 struct Inspection {
     file: String,
     format: String,
-    format_version: Option<u16>,
-    format_needs_update: Option<bool>,
     source_format: String,
     source_path: String,
     passes: Vec<String>,
@@ -218,8 +219,7 @@ fn main() {
             input,
             output,
             passes,
-            container,
-        }) => match convert(&input, output.as_deref(), passes, container) {
+        }) => match convert(&input, output.as_deref(), passes) {
             Ok(dest) => println!("{}", dest.display()),
             Err(error) => {
                 eprintln!("motorsport-telemetry: {error}");
@@ -290,21 +290,10 @@ enum Command {
         input: PathBuf,
         output: Option<PathBuf>,
         passes: PassMode,
-        container: OutputContainer,
     },
     Verify {
         paths: Vec<PathBuf>,
     },
-}
-
-/// Which container a `.telemetry` destination is written in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum OutputContainer {
-    /// zstd-compressed MTJ JSONL (the default).
-    #[default]
-    JsonlZstd,
-    /// Legacy aligned STORE zip with a FlatBuffers catalog (`--native-zip`).
-    NativeZip,
 }
 
 /// What `convert` does with the processing-pass registry.
@@ -381,7 +370,7 @@ fn parse_inspect(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
         if text == "-m" || text == "--mask" {
             let value = args
                 .next()
-                .ok_or_else(|| "inspect --mask needs a glob".to_string())?;
+                .ok_or_else(|| "inspect --mask needs a glob".to_owned())?;
             masks.push(value.to_string_lossy().into_owned());
             continue;
         }
@@ -406,7 +395,6 @@ fn parse_inspect(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
 fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut positional = Vec::new();
     let mut passes = PassMode::Apply;
-    let mut container = OutputContainer::default();
     for argument in args {
         if argument == "-h" || argument == "--help" {
             return Ok(Command::Help {
@@ -421,10 +409,6 @@ fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
             passes = PassMode::Strip;
             continue;
         }
-        if argument == "--native-zip" {
-            container = OutputContainer::NativeZip;
-            continue;
-        }
         if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option {}", argument.to_string_lossy()));
         }
@@ -435,13 +419,11 @@ fn parse_convert(args: impl IntoIterator<Item = OsString>) -> Result<Command, St
             input: input.clone(),
             output: None,
             passes,
-            container,
         }),
         [input, output] => Ok(Command::Convert {
             input: input.clone(),
             output: Some(output.clone()),
             passes,
-            container,
         }),
         [] => Err("convert is missing an input file".into()),
         _ => Err("convert expects <input> [output]".into()),
@@ -517,21 +499,18 @@ fn run_inspect(path: &Path, json: bool, masks: &[String]) -> Result<(), String> 
         }
     }
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "root": path.display().to_string(),
-                "mask": masks,
-                "ok": files.len(),
-                "failed": errors.len(),
-                "files": files.iter().map(inspection_json).collect::<Vec<_>>(),
-                "errors": errors.iter().map(|(file, error)| json!({
-                    "file": file,
-                    "error": error,
-                })).collect::<Vec<_>>(),
-            }))
-            .expect("scan JSON is serializable")
-        );
+        let report = json!({
+            "root": path.display().to_string(),
+            "mask": masks,
+            "ok": files.len(),
+            "failed": errors.len(),
+            "files": files.iter().map(inspection_json).collect::<Vec<_>>(),
+            "errors": errors.iter().map(|(file, error)| json!({
+                "file": file,
+                "error": error,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{report:#}");
     } else {
         println!(
             "---\nscanned {} file{}, {} error{}",
@@ -575,7 +554,7 @@ fn walk_inspect(
     out: &mut Vec<PathBuf>,
 ) -> std::io::Result<()> {
     let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(Result::ok).collect();
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(fs::DirEntry::path);
     for entry in entries {
         let path = entry.path();
         let name = entry.file_name();
@@ -618,7 +597,7 @@ fn is_known_telemetry_path(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|extension| extension.to_str())
-            .map(|extension| extension.to_ascii_lowercase())
+            .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("mp4" | "pds" | "ld" | "vbo")
     )
@@ -706,16 +685,8 @@ fn convert(
     input: &Path,
     output: Option<&Path>,
     passes: PassMode,
-    container: OutputContainer,
 ) -> Result<PathBuf, TelemetryError> {
-    let dest = output
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_telemetry_dest(input));
-    if container == OutputContainer::NativeZip && !is_telemetry_ext(&dest) {
-        return Err(TelemetryError::Unsupported(
-            "--native-zip applies to .telemetry output only".into(),
-        ));
-    }
+    let dest = output.map_or_else(|| default_telemetry_dest(input), Path::to_path_buf);
     let file = open(input)?;
     match passes {
         PassMode::Apply => {
@@ -731,57 +702,50 @@ fn convert(
                     }
                 }
             }
-            write_converted(&passed, &dest, container)?;
+            write_converted(&passed, &dest)?;
         }
-        PassMode::Skip => write_converted(&file, &dest, container)?,
+        PassMode::Skip => write_converted(&file, &dest)?,
         PassMode::Strip => {
-            if is_jsonl_path(&dest) {
-                return Err(TelemetryError::Unsupported(
-                    "--strip-passes writes .telemetry output only".into(),
-                ));
-            }
-            let write_stripped = |dest: &Path| match container {
-                OutputContainer::JsonlZstd => write_telemetry_stripped(&file, dest),
-                OutputContainer::NativeZip => write_from_source_stripped(&file, dest),
-            };
+            let view = stripped_view(&file);
             if dest == input {
-                // In-place strip: write next to the destination, then swap.
+                // Write next to the destination, then swap for an in-place strip.
                 let dir = dest.parent().unwrap_or_else(|| Path::new("."));
                 let name = dest
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("recording");
                 let temp = dir.join(format!(".{name}.strip-tmp"));
-                write_stripped(&temp)?;
+                // Use the destination suffix, even though the temporary name differs.
+                write_converted_as(&view, &temp, &dest)?;
+                drop(view);
                 drop(file);
-                fs::rename(&temp, &dest)
-                    .map_err(telemetry_format::TelemetryFormatError::Io)
-                    .map_err(TelemetryError::Telemetry)?;
+                fs::rename(&temp, &dest).map_err(telemetry_format::TelemetryFormatError::Io)?;
             } else {
-                write_stripped(&dest)?;
+                write_converted(&view, &dest)?;
             }
         }
     }
     Ok(dest)
 }
 
-fn write_converted(
+fn write_converted(source: &dyn TelemetrySource, dest: &Path) -> Result<(), TelemetryError> {
+    write_converted_as(source, dest, dest)
+}
+
+fn write_converted_as(
     source: &dyn TelemetrySource,
     dest: &Path,
-    container: OutputContainer,
+    format_path: &Path,
 ) -> Result<(), TelemetryError> {
-    if is_jsonl_path(dest) {
-        let compress = is_jsonl_zstd_path(dest);
-        if is_jsonl_ext_path(dest) {
+    if is_jsonl_path(format_path) {
+        let compress = is_jsonl_zstd_path(format_path);
+        if is_jsonl_ext_path(format_path) {
             write_jsonl_extension_from_source_with(source, dest, compress)?;
         } else {
             write_jsonl_from_source_with(source, dest, compress)?;
         }
     } else {
-        match container {
-            OutputContainer::JsonlZstd => write_telemetry(source, dest)?,
-            OutputContainer::NativeZip => write_from_source(source, dest)?,
-        }
+        write_telemetry(source, dest)?;
     }
     Ok(())
 }
@@ -806,45 +770,27 @@ fn is_telemetry_ext(path: &Path) -> bool {
 fn format_verify_report(path: &Path, report: &VerifyReport) -> String {
     let utc = report
         .utc_start_ns
-        .map(|utc| utc.to_string())
-        .unwrap_or_else(|| "none".into());
-    let mut out = match report.kind {
-        VerifyKind::Native => format!(
-            "{}: ok  native v{}  channels={} laps={} utc={}{}",
-            path.display(),
-            report.format_version.unwrap_or(0),
-            report.channels,
-            report.laps,
-            utc,
-            if report.needs_update {
-                format!("  needs_update (current v{FORMAT_VERSION})")
-            } else {
-                String::new()
-            }
-        ),
-        VerifyKind::Mtj | VerifyKind::Mtx => {
-            let kind = match report.kind {
-                VerifyKind::Mtj => "mtj",
-                _ => "mtx",
-            };
-            let extra = if matches!(report.kind, VerifyKind::Mtx) {
-                format!("  groups={}", report.sidecar_groups)
-            } else {
-                format!("  laps={}", report.laps)
-            };
-            format!(
-                "{}: ok  {kind}:{}{}  channels={} spans={} utc={} q={}{}",
-                path.display(),
-                report.jsonl_version.unwrap_or(0),
-                if report.compressed { "  zstd" } else { "" },
-                report.channels,
-                report.spans,
-                utc,
-                report.quantum_ns,
-                extra
-            )
-        }
+        .map_or_else(|| "none".into(), |utc| utc.to_string());
+    let kind = match report.kind {
+        VerifyKind::Mtj => "mtj",
+        VerifyKind::Mtx => "mtx",
     };
+    let extra = if report.kind == VerifyKind::Mtx {
+        format!("  groups={}", report.sidecar_groups)
+    } else {
+        format!("  laps={}", report.laps)
+    };
+    let mut out = format!(
+        "{}: ok  {kind}:{}{}  channels={} spans={} utc={} q={}{}",
+        path.display(),
+        report.jsonl_version,
+        if report.compressed { "  zstd" } else { "" },
+        report.channels,
+        report.spans,
+        utc,
+        report.quantum_ns,
+        extra
+    );
     out.push_str(&format_diagnostics_block(report.diagnostics.items()));
     out
 }
@@ -895,7 +841,7 @@ fn format_diagnostics_block(items: &[Diagnostic]) -> String {
     }
     let mut out = format!("\ndiagnostics: {}", diagnostics_summary(items));
     for diagnostic in items {
-        out.push_str(&format!("\n  {diagnostic}"));
+        let _ = write!(out, "\n  {diagnostic}");
     }
     out
 }
@@ -908,7 +854,7 @@ fn decode_fault_message(diagnostics: &Diagnostics) -> String {
     message
 }
 
-fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryError> {
+fn inspect(path: &Path) -> Result<Inspection, TelemetryError> {
     let file = open_for_inspection(path)?;
     let metadata = file.metadata();
     let track = file.match_track();
@@ -957,14 +903,12 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
     Ok(Inspection {
         file: path.to_string_lossy().into_owned(),
         format: metadata.format.clone(),
-        format_version: metadata.format_version,
-        format_needs_update: metadata.format_version.map(needs_update),
         source_format: metadata.source_format.clone(),
         source_path: metadata.source_path.clone(),
         passes: metadata
             .passes
             .iter()
-            .map(motorsport_telemetry::motorsport_telemetry_core::AppliedPass::label)
+            .map(motorsport_telemetry_core::AppliedPass::label)
             .collect(),
         driver_ids: metadata.driver_ids.clone(),
         laps: metadata.laps.len(),
@@ -992,7 +936,10 @@ fn inspect(path: &Path) -> Result<Inspection, motorsport_telemetry::TelemetryErr
             .collect(),
         fastest_lap_ns: metadata.fastest_lap.as_ref().map(|lap| lap.duration_ns),
         fastest_lap_number: metadata.fastest_lap.as_ref().map(|lap| lap.number),
-        fastest_lap_label: metadata.fastest_lap.as_ref().map(|lap| lap.label()),
+        fastest_lap_label: metadata
+            .fastest_lap
+            .as_ref()
+            .map(motorsport_telemetry_core::LapMetadata::label),
         video_included,
         video_filenames,
         video_file_indices,
@@ -1043,7 +990,7 @@ struct EventDate {
 
 fn event_date(path: &Path, metadata: &FileMetadata) -> EventDate {
     let telemetry = telemetry_date(metadata);
-    let created = std::fs::metadata(path)
+    let created = fs::metadata(path)
         .and_then(|metadata| metadata.created())
         .ok()
         .and_then(date_from_system_time);
@@ -1196,7 +1143,7 @@ fn civil_from_days(days: i64) -> Option<CivilDate> {
     })
 }
 
-fn open_for_inspection(path: &Path) -> Result<TelemetryFile, motorsport_telemetry::TelemetryError> {
+fn open_for_inspection(path: &Path) -> Result<TelemetryFile, TelemetryError> {
     if path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1287,13 +1234,8 @@ fn nearby_video_filenames(path: &Path) -> Vec<String> {
                 .file_stem()?
                 .to_string_lossy()
                 .to_ascii_lowercase();
-            (stem == source_stem || stem.starts_with(&format!("{source_stem}_"))).then(|| {
-                candidate
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            (stem == source_stem || stem.starts_with(&format!("{source_stem}_")))
+                .then(|| entry.file_name().to_string_lossy().into_owned())
         })
         .collect::<Vec<_>>();
     files.sort();
@@ -1303,13 +1245,6 @@ fn nearby_video_filenames(path: &Path) -> Vec<String> {
 fn print_human(inspection: &Inspection) {
     println!("file: {}", inspection.file);
     println!("format: {}", inspection.format);
-    if let Some(version) = inspection.format_version {
-        println!("format_version: {version}");
-        println!(
-            "format_needs_update: {}",
-            inspection.format_needs_update.unwrap_or(false)
-        );
-    }
     println!("source_format: {}", inspection.source_format);
     println!("source_path: {}", inspection.source_path);
     println!(
@@ -1340,8 +1275,7 @@ fn print_human(inspection: &Inspection) {
         "fastest_lap: {}",
         inspection
             .fastest_lap_ns
-            .map(format_duration)
-            .unwrap_or_else(|| "unknown".into())
+            .map_or_else(|| "unknown".into(), format_duration)
     );
     println!(
         "fastest_lap_number: {}",
@@ -1441,11 +1375,7 @@ fn print_human(inspection: &Inspection) {
 }
 
 fn print_json(inspection: &Inspection) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&inspection_json(inspection))
-            .expect("inspection JSON is serializable")
-    );
+    println!("{:#}", inspection_json(inspection));
 }
 
 fn inspection_json(inspection: &Inspection) -> serde_json::Value {
@@ -1456,8 +1386,6 @@ fn inspection_json(inspection: &Inspection) -> serde_json::Value {
     json!({
         "file": inspection.file,
         "format": inspection.format,
-        "format_version": inspection.format_version,
-        "format_needs_update": inspection.format_needs_update,
         "source_format": inspection.source_format,
         "source_path": inspection.source_path,
         "passes": inspection.passes,
@@ -1602,7 +1530,6 @@ mod tests {
                 input: PathBuf::from("run.pds"),
                 output: None,
                 passes: PassMode::Apply,
-                container: OutputContainer::JsonlZstd,
             })
         );
         assert_eq!(
@@ -1611,7 +1538,6 @@ mod tests {
                 input: PathBuf::from("run.pds"),
                 output: None,
                 passes: PassMode::Skip,
-                container: OutputContainer::JsonlZstd,
             })
         );
         assert_eq!(
@@ -1624,23 +1550,9 @@ mod tests {
                 input: PathBuf::from("run.telemetry"),
                 output: None,
                 passes: PassMode::Strip,
-                container: OutputContainer::JsonlZstd,
             })
         );
-        assert_eq!(
-            arguments([
-                "convert".into(),
-                "--native-zip".into(),
-                "run.pds".into(),
-                "run.telemetry".into()
-            ]),
-            Ok(Command::Convert {
-                input: PathBuf::from("run.pds"),
-                output: Some(PathBuf::from("run.telemetry")),
-                passes: PassMode::Apply,
-                container: OutputContainer::NativeZip,
-            })
-        );
+        assert!(arguments(["convert".into(), "--native-zip".into(), "run.pds".into()]).is_err());
         assert_eq!(
             arguments([
                 "verify".into(),

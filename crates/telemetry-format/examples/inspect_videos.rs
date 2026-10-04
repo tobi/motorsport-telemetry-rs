@@ -1,9 +1,22 @@
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use motorsport_telemetry_core::TelemetrySource;
-use telemetry_format::NativeRecording;
+use telemetry_format::JsonlRecording;
 
 fn main() {
     let path = std::env::args().nth(1).expect("file");
-    let file = NativeRecording::open(&path).unwrap();
+    let file = JsonlRecording::open(&path).unwrap();
     let meta = file.metadata();
     println!(
         "format={} duration_s={:.1} channels={} samples={}",

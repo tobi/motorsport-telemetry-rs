@@ -1,5 +1,18 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::unreadable_literal,
+        clippy::float_cmp,
+        reason = "unit tests: fail loudly, print freely, exact fixture values"
+    )
+)]
 
 use std::sync::Arc;
 
@@ -146,13 +159,13 @@ impl SampleType {
         }
         let slice = &bytes[..width];
         Some(match self {
-            Self::I8 => i8::from_le_bytes(slice.try_into().ok()?) as f64,
-            Self::U8 => u8::from_le_bytes(slice.try_into().ok()?) as f64,
-            Self::I16 => i16::from_le_bytes(slice.try_into().ok()?) as f64,
-            Self::U16 => u16::from_le_bytes(slice.try_into().ok()?) as f64,
-            Self::I32 => i32::from_le_bytes(slice.try_into().ok()?) as f64,
-            Self::U32 => u32::from_le_bytes(slice.try_into().ok()?) as f64,
-            Self::F32 => f32::from_le_bytes(slice.try_into().ok()?) as f64,
+            Self::I8 => f64::from(i8::from_le_bytes(slice.try_into().ok()?)),
+            Self::U8 => f64::from(u8::from_le_bytes(slice.try_into().ok()?)),
+            Self::I16 => f64::from(i16::from_le_bytes(slice.try_into().ok()?)),
+            Self::U16 => f64::from(u16::from_le_bytes(slice.try_into().ok()?)),
+            Self::I32 => f64::from(i32::from_le_bytes(slice.try_into().ok()?)),
+            Self::U32 => f64::from(u32::from_le_bytes(slice.try_into().ok()?)),
+            Self::F32 => f64::from(f32::from_le_bytes(slice.try_into().ok()?)),
             Self::F64 => f64::from_le_bytes(slice.try_into().ok()?),
         })
     }
@@ -167,27 +180,27 @@ impl SampleType {
         let width = self.byte_width();
         match self {
             Self::I8 => {
-                let v = clamp_to_int(value, i8::MIN as i64, i8::MAX as i64) as i8;
+                let v = clamp_to_int(value, i64::from(i8::MIN), i64::from(i8::MAX)) as i8;
                 out[..width].copy_from_slice(&v.to_le_bytes());
             }
             Self::U8 => {
-                let v = clamp_to_int(value, 0, u8::MAX as i64) as u8;
+                let v = clamp_to_int(value, 0, i64::from(u8::MAX)) as u8;
                 out[..width].copy_from_slice(&v.to_le_bytes());
             }
             Self::I16 => {
-                let v = clamp_to_int(value, i16::MIN as i64, i16::MAX as i64) as i16;
+                let v = clamp_to_int(value, i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
                 out[..width].copy_from_slice(&v.to_le_bytes());
             }
             Self::U16 => {
-                let v = clamp_to_int(value, 0, u16::MAX as i64) as u16;
+                let v = clamp_to_int(value, 0, i64::from(u16::MAX)) as u16;
                 out[..width].copy_from_slice(&v.to_le_bytes());
             }
             Self::I32 => {
-                let v = clamp_to_int(value, i32::MIN as i64, i32::MAX as i64) as i32;
+                let v = clamp_to_int(value, i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
                 out[..width].copy_from_slice(&v.to_le_bytes());
             }
             Self::U32 => {
-                let v = clamp_to_int(value, 0, u32::MAX as i64) as u32;
+                let v = clamp_to_int(value, 0, i64::from(u32::MAX)) as u32;
                 out[..width].copy_from_slice(&v.to_le_bytes());
             }
             Self::F32 => {
@@ -440,25 +453,25 @@ pub trait TelemetrySource: Send + Sync {
     ///
     /// This reports what *reading* found. Physical plausibility of the values
     /// is a separate judgement made by [`crate::validate::validate_source`].
-    fn diagnostics(&self) -> &[crate::Diagnostic] {
+    fn diagnostics(&self) -> &[Diagnostic] {
         &[]
     }
 
     /// Interval annotations on the file-relative timeline. Empty when none.
-    fn spans(&self) -> &[crate::Span] {
+    fn spans(&self) -> &[Span] {
         &[]
     }
 
     /// Sparse comment labels on one sample channel, oldest first.
     ///
     /// Empty when the channel has none. Times are file-relative nanoseconds.
-    fn channel_labels(&self, _channel_index: usize) -> &[crate::ChannelLabel] {
+    fn channel_labels(&self, _channel_index: usize) -> &[ChannelLabel] {
         &[]
     }
 
     /// Display class, optional scale, and rounding for one sample channel.
-    fn channel_display(&self, _channel_index: usize) -> crate::ChannelDisplay {
-        crate::ChannelDisplay::trace()
+    fn channel_display(&self, _channel_index: usize) -> ChannelDisplay {
+        ChannelDisplay::trace()
     }
 
     /// Processing passes recorded as applied to this source, in order.
@@ -468,7 +481,7 @@ pub trait TelemetrySource: Send + Sync {
     /// that appended their derived channels. Every listed pass is lossless:
     /// dropping the channels named in [`AppliedPass::outputs`] recovers the
     /// raw conversion byte for byte.
-    fn applied_passes(&self) -> &[crate::AppliedPass] {
+    fn applied_passes(&self) -> &[AppliedPass] {
         &[]
     }
 
@@ -478,7 +491,7 @@ pub trait TelemetrySource: Send + Sync {
     /// `None` means this source *is* the origin. Writers persist this so a
     /// `.telemetry` file always remembers the name and format it was
     /// converted from, even across rewrites.
-    fn source_origin(&self) -> Option<crate::SourceOrigin> {
+    fn source_origin(&self) -> Option<SourceOrigin> {
         None
     }
 
@@ -499,7 +512,7 @@ pub trait TelemetrySource: Send + Sync {
     }
 
     /// Linked video files. Empty when the recording has no video.
-    fn video_files(&self) -> &[crate::VideoFileRef] {
+    fn video_files(&self) -> &[VideoFileRef] {
         &[]
     }
 
@@ -841,7 +854,7 @@ macro_rules! impl_telemetry_source_for_wrapper {
     };
 }
 
-impl_telemetry_source_for_wrapper!(&T, Box<T>, std::sync::Arc<T>);
+impl_telemetry_source_for_wrapper!(&T, Box<T>, Arc<T>);
 
 #[cfg(test)]
 mod tests {
@@ -866,7 +879,7 @@ mod tests {
     }
 
     impl TelemetrySource for TestSource {
-        fn path(&self) -> &str {
+        fn path(&self) -> &'static str {
             "test"
         }
         fn format(&self) -> &'static str {
@@ -962,7 +975,7 @@ mod tests {
     }
 
     impl TelemetrySource for ExplicitTimesSource {
-        fn path(&self) -> &str {
+        fn path(&self) -> &'static str {
             "explicit"
         }
         fn format(&self) -> &'static str {
@@ -1061,7 +1074,7 @@ mod tests {
             let decoded = sample_type.decode_le(&buf[..n]).unwrap();
             if sample_type.is_float() {
                 let expected = if matches!(sample_type, SampleType::F32) {
-                    value as f32 as f64
+                    f64::from(value as f32)
                 } else {
                     value
                 };

@@ -1,5 +1,19 @@
 //! Minimal files reproducing naming/layout combinations observed in the NAS
 //! audit. No real recording is required by these tests.
+
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
+
 use motorsport_telemetry::motorsport_telemetry_core::TelemetrySource;
 use motorsport_telemetry::{open, SourceExt};
 
@@ -42,13 +56,13 @@ fn pedal_export() -> Vec<u8> {
 }
 
 #[test]
-fn synthetic_ld_pedals_normalize_and_survive_native_conversion() {
+fn synthetic_ld_pedals_normalize_and_survive_jsonl_conversion() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("pedals.ld");
     std::fs::write(&input, pedal_export()).unwrap();
     let source = open(&input).unwrap();
     let destination = directory.path().join("pedals.telemetry");
-    telemetry_format::write_from_source(&source, &destination).unwrap();
+    telemetry_format::write_telemetry(&source, &destination).unwrap();
     for file in [source, open(&destination).unwrap()] {
         let roles = file.signal_roles();
         assert_eq!(

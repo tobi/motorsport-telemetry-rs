@@ -2,8 +2,8 @@
 //!
 //! # Why this exists
 //!
-//! Each logging system spells units its own way. Across a single MQ12Di log and
-//! a set of MoTeC files we observe `s` and `sec` for seconds, `m/s` alongside
+//! Each logging system spells units its own way. Across a single `MQ12Di` log and
+//! a set of `MoTeC` files we observe `s` and `sec` for seconds, `m/s` alongside
 //! `mm` and `deg`, and marker text like `raw`, `flag`, `pp1` and `Driver` that
 //! labels a channel without naming a physical dimension.
 //!
@@ -206,7 +206,7 @@ const G_TO_MPS2: f64 = 9.806_65;
 
 /// The registry.
 ///
-/// Every unit observed in Cosworth PDS, MoTeC LD and VBO files appears here,
+/// Every unit observed in Cosworth PDS, `MoTeC` LD and VBO files appears here,
 /// plus the display units teams commonly convert to.
 pub static UNITS: &[UnitDef] = &[
     // ── Length ─────────────────────────────────────────────────────────
@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(normalize("wat"), None);
     }
 
-    /// Units seen in real Cosworth, MoTeC and VBO files must all resolve.
+    /// Units seen in real Cosworth, `MoTeC` and VBO files must all resolve.
     #[test]
     fn covers_every_unit_observed_in_real_files() {
         // From a native MQ12Di log (1115 channels) and MoTeC LD exports.

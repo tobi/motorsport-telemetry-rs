@@ -28,11 +28,11 @@ const ACCURACY: &[&str] = &[
 ];
 const DOP: &[&str] = &["gpsdop", "gpshdop", "hdop"];
 
-/// Fix codes below this are not a position solution (AiM: 2 = 2D fix).
+/// Fix codes below this are not a position solution (`AiM`: 2 = 2D fix).
 const MIN_FIX: f64 = 2.0;
 /// Minimum satellites for a usable solution when no fix-type channel exists.
 const MIN_SATELLITES: f64 = 4.0;
-/// AiM writes ~4294967.29 m into accuracy when there is no fix.
+/// `AiM` writes ~4294967.29 m into accuracy when there is no fix.
 const SENTINEL_M: f64 = 4_000_000.0;
 /// User-equivalent range error: sigma ≈ DOP × UERE when only DOP is known.
 const UERE_M: f64 = 5.0;
@@ -44,7 +44,7 @@ const DEFAULT_SIGMA_M: f64 = 15.0;
 ///
 /// This is the gatekeeper for every GPS-based strategy downstream: it turns
 /// "the camera wrote coordinates" into "these samples are a position
-/// solution, this good". Sources whose GPS never locked — SmartyCam
+/// solution, this good". Sources whose GPS never locked — `SmartyCam`
 /// sessions recorded before the receiver acquired — come out with every
 /// sample invalid, which is the correct, honest answer.
 #[derive(Debug, Clone, Copy, Default)]
@@ -181,10 +181,10 @@ fn to_f32_clamped(value: f64) -> f32 {
     if value.is_nan() {
         return f32::NAN;
     }
-    if value > f32::MAX as f64 {
+    if value > f64::from(f32::MAX) {
         return f32::MAX;
     }
-    if value < f32::MIN as f64 {
+    if value < f64::from(f32::MIN) {
         return f32::MIN;
     }
     value as f32

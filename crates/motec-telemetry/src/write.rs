@@ -1,6 +1,6 @@
-//! MoTeC LD writer.
+//! `MoTeC` LD writer.
 //!
-//! Serialises any [`TelemetrySource`] into a MoTeC LD file. The writer is
+//! Serialises any [`TelemetrySource`] into a `MoTeC` LD file. The writer is
 //! deliberately conservative: rather than silently degrading a recording it
 //! refuses to write anything that cannot be recovered byte-for-byte by
 //! [`crate::MotecFile`].
@@ -43,7 +43,7 @@ const UNIT_CAP: usize = 12;
 const IDENTITY_CAP: usize = 64;
 const COMMENT_CAP: usize = 1024;
 
-/// Errors returned while serializing or writing MoTeC LD/LDX output.
+/// Errors returned while serializing or writing `MoTeC` LD/LDX output.
 #[derive(Debug, Error)]
 pub enum MotecWriteError {
     /// An output file could not be written.
@@ -116,7 +116,7 @@ pub struct MotecMetadata {
 }
 
 impl MotecMetadata {
-    /// Carry identity across a MoTeC -> MoTeC round trip.
+    /// Carry identity across a `MoTeC` -> `MoTeC` round trip.
     pub fn from_file(file: &crate::MotecFile) -> Self {
         Self {
             driver: file.driver.clone(),
@@ -164,6 +164,10 @@ impl Encoded {
         }
     }
 
+    #[allow(
+        clippy::float_cmp,
+        reason = "lossless output requires exact representability in the chosen sample type"
+    )]
     fn encode(self, value: f64, channel: &str, out: &mut Vec<u8>) -> Result<(), MotecWriteError> {
         match (self.datatype_a, self.width) {
             (0x08, 8) => out.extend_from_slice(&value.to_le_bytes()),
@@ -178,8 +182,8 @@ impl Encoded {
             (_, 2) => {
                 if !value.is_finite()
                     || value.round() != value
-                    || value < i16::MIN as f64
-                    || value > i16::MAX as f64
+                    || value < f64::from(i16::MIN)
+                    || value > f64::from(i16::MAX)
                 {
                     return Err(MotecWriteError::ValueOutOfRange {
                         channel: channel.to_owned(),
@@ -190,8 +194,8 @@ impl Encoded {
             (_, 4) => {
                 if !value.is_finite()
                     || value.round() != value
-                    || value < i32::MIN as f64
-                    || value > i32::MAX as f64
+                    || value < f64::from(i32::MIN)
+                    || value > f64::from(i32::MAX)
                 {
                     return Err(MotecWriteError::ValueOutOfRange {
                         channel: channel.to_owned(),
@@ -284,7 +288,7 @@ fn flatten(
         ));
     }
     let frequency = 1_000_000_000u64 / period;
-    if frequency == 0 || frequency > u16::MAX as u64 {
+    if frequency == 0 || frequency > u64::from(u16::MAX) {
         return Err(channel_error(
             name,
             format!("frequency {frequency} Hz is outside the LD u16 range"),
@@ -372,7 +376,7 @@ fn put_u32(buffer: &mut [u8], offset: usize, value: u32) {
     put(buffer, offset, &value.to_le_bytes());
 }
 
-/// Serialise `source` as a MoTeC LD file.
+/// Serialise `source` as a `MoTeC` LD file.
 pub fn write_motec_bytes(
     source: &dyn TelemetrySource,
     metadata: &MotecMetadata,
@@ -488,8 +492,7 @@ pub fn write_motec_bytes(
         } else {
             (at + CHANNEL_META_SIZE) as u32
         };
-        #[allow(clippy::identity_op)]
-        put_u32(&mut buffer, at + 0x00, prev);
+        put_u32(&mut buffer, at, prev);
         put_u32(&mut buffer, at + 0x04, next);
         put_u32(&mut buffer, at + 0x08, channel_data_ptr as u32);
         put_u32(&mut buffer, at + 0x0c, channel.values.len() as u32);
@@ -529,7 +532,7 @@ pub fn motec_sidecar_path(path: impl AsRef<Path>) -> std::path::PathBuf {
     sidecar
 }
 
-/// Write the companion MoTeC LDX sidecar and return its byte length.
+/// Write the companion `MoTeC` LDX sidecar and return its byte length.
 pub fn write_motec_sidecar(
     source: &dyn TelemetrySource,
     metadata: &MotecMetadata,
@@ -545,7 +548,7 @@ pub fn write_motec_sidecar(
     Ok(len)
 }
 
-/// Serialise `source` to a MoTeC LD file and write its companion LDX sidecar.
+/// Serialise `source` to a `MoTeC` LD file and write its companion LDX sidecar.
 pub fn write_motec(
     source: &dyn TelemetrySource,
     metadata: &MotecMetadata,

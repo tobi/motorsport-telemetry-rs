@@ -1,11 +1,22 @@
-//! Deterministic fuzz/robustness harness for the AiM `aimd` MP4 reader.
+//! Deterministic fuzz/robustness harness for the `AiM` `aimd` MP4 reader.
 //!
 //! Mutates the committed `synthetic_aimd.mp4` corpus with every operator in
 //! [`fuzz_harness::Op`] and asserts the shared invariants: no panic, no hang,
 //! and a parsed result whose channel footprint exceeds the mutated input is
 //! flagged by `validate_source` via `layout.footprint_exceeds_file`.
 
-#![allow(missing_docs)]
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreadable_literal,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    reason = "test and example code: fail loudly, print freely, exact fixture values"
+)]
 
 #[path = "../../../tests/fuzz_harness.rs"]
 mod fuzz_harness;
@@ -21,7 +32,7 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Parses a mutated AiM MP4 buffer through the public `from_bytes` entry point.
+/// Parses a mutated `AiM` MP4 buffer through the public `from_bytes` entry point.
 fn parse_aim(bytes: &[u8]) -> Result<Box<dyn TelemetrySource + Send + Sync>, String> {
     AimFile::from_bytes("fuzz.mp4", bytes.to_vec())
         .map_err(|e| e.to_string())
@@ -54,7 +65,7 @@ fn regression_tagged_blocks_then_some_panic() {
 /// `video_frame_times_ns` reserved and filled `decode_times` from a mutated
 /// stts `samples` count with no upper bound, and `parse_track` reserved an
 /// stsc vector from an unvalidated count. Both counts are now bounded against
-/// the file/box size, so the cases reject instead of looping or OOMing.
+/// the file/box size, so the cases reject instead of looping or `OOMing`.
 #[test]
 fn regression_video_stts_unbounded_frame_count_hang() {
     let mp4 = std::fs::read(fixture("synthetic_aimd.mp4")).unwrap();

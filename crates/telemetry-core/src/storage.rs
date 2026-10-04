@@ -26,6 +26,10 @@ impl Storage {
     /// files. The bytes are still readable, so that is not a reason to fail
     /// the open; an empty file cannot be mapped at all and is returned as an
     /// empty buffer for the parser to reject with its own message.
+    #[allow(
+        clippy::verbose_file_reads,
+        reason = "fallback must read the already-open file, even if the path has since been replaced"
+    )]
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let mut file = std::fs::File::open(path)?;
         if file.metadata()?.len() == 0 {
@@ -34,14 +38,13 @@ impl Storage {
         // SAFETY: the file is mapped read-only; the caller must ensure no
         // external process truncates or mutates it while samples are decoded,
         // the same contract every mmap-based parser already holds.
-        match unsafe { memmap2::Mmap::map(&file) } {
-            Ok(mmap) => Ok(Self::Mapped(mmap)),
-            Err(_) => {
-                // Read the already-open file, not a possibly replaced path.
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                Ok(Self::Owned(bytes))
-            }
+        if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
+            Ok(Self::Mapped(mmap))
+        } else {
+            // Read the already-open file, not a possibly replaced path.
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Self::Owned(bytes))
         }
     }
 

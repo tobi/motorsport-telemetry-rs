@@ -1,5 +1,18 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::unreadable_literal,
+        clippy::float_cmp,
+        reason = "unit tests: fail loudly, print freely, exact fixture values"
+    )
+)]
 
 use motorsport_telemetry_core::{SampleType, TelemetrySource};
 
@@ -226,62 +239,7 @@ impl PassReport {
     }
 }
 
-/// A pass that is designed and documented but not yet implemented.
-///
-/// Listed so tooling can show the full strategy ladder — including which
-/// strategies exist in principle — next to the ones actually employed.
-#[derive(Debug, Clone, Copy)]
-pub struct PlannedPass {
-    /// Stable dotted identifier the implementation will use.
-    pub name: &'static str,
-    /// What the pass will derive.
-    pub summary: &'static str,
-    /// What has to be true of a source for the pass to be employed.
-    pub requirements: &'static str,
-}
-
-/// Passes designed in `docs/WHY_POSITIONING_IS_HARD.md` but not yet
-/// implemented. Order is the intended position in the ladder after the
-/// implemented registry.
-pub const PLANNED: &[PlannedPass] = &[
-    PlannedPass {
-        name: "progress.project",
-        summary: "Projects cleaned GPS onto the venue centerline spline, \
-                  yielding an arc-length lap-progress channel with sigma.",
-        requirements: "gps.clean outputs present; a surveyed centerline \
-                       spline for the venue; a confident venue match from \
-                       the track atlas.",
-    },
-    PlannedPass {
-        name: "progress.fuse",
-        summary: "Fuses the wheel-speed odometer with GPS-anchored progress \
-                  through a monotonic filter, so progress is smooth at \
-                  odometer rate, pinned to GPS truth, and never runs \
-                  backwards except through reverse/spin gates.",
-        requirements: "Distance Odometer present, plus either \
-                       progress.project output or per-lap start/finish \
-                       anchors (beacons).",
-    },
-    PlannedPass {
-        name: "landmark.damper",
-        summary: "Detects repeatable bump signatures in damper-position \
-                  channels and records them as landmark spans, so no-GPS \
-                  sources can be aligned on the same physical bump just \
-                  before a corner — exactly where turn-in alignment \
-                  matters most.",
-        requirements: "Damper position channels sampled at 100 Hz or \
-                       faster; a reference lap to correlate against.",
-    },
-    PlannedPass {
-        name: "progress.time",
-        summary: "Last-resort progress from lap-relative elapsed time \
-                  alone, honestly labeled with a large sigma.",
-        requirements: "Lap start/end boundaries; nothing else. Employed \
-                       only when every better strategy was skipped.",
-    },
-];
-
-/// The implemented pass ladder, in application order.
+/// The supported processing passes, in application order.
 pub fn registry() -> Vec<Box<dyn TelemetryPass>> {
     vec![
         Box::new(GpsQuality),

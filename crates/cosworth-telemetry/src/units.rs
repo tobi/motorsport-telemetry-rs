@@ -22,7 +22,7 @@
 //! # Evidence
 //!
 //! The code -> unit table below was derived by cross-referencing 1115 channels
-//! in a native Cosworth MQ12Di ECU log (which declares both a quantity code
+//! in a native Cosworth `MQ12Di` ECU log (which declares both a quantity code
 //! and a unit string) against 31 channels in a Pi Toolbox export of the same
 //! car (which declares only the code). In the native log the mapping is 1:1
 //! with no contradictions: every one of the 50 channels with code 4 declared
@@ -92,7 +92,7 @@ pub enum Quantity {
 impl Quantity {
     /// Map an on-disk quantity code to a dimension.
     ///
-    /// Codes are from a native MQ12Di log cross-checked against a Toolbox
+    /// Codes are from a native `MQ12Di` log cross-checked against a Toolbox
     /// export; see the module docs for provenance.
     pub fn from_code(code: u32) -> Self {
         match code {
@@ -169,7 +169,7 @@ impl Quantity {
             ),
             Self::Dimensionless => text.is_empty() || is_dimensionless_marker(text),
             Self::Unknown(_) => true,
-            _ => lookup_unit(text).is_some_and(|def| def.dimension == self.dimension().unwrap()),
+            _ => lookup_unit(text).is_some_and(|def| Some(def.dimension) == self.dimension()),
         }
     }
 }
@@ -221,7 +221,7 @@ impl DefLayout {
     };
 
     /// Offset of the unit string in every PDS definition record observed so far
-    /// (native MQ12Di logs and Pi Toolbox exports alike). Used only as a
+    /// (native `MQ12Di` logs and Pi Toolbox exports alike). Used only as a
     /// tie-breaker when a unit string cannot be corroborated by a quantity code.
     const CANONICAL_UNIT_OFFSET: usize = 0x90;
 
@@ -258,6 +258,8 @@ impl DefLayout {
     /// This is what makes the reader version-robust: the offsets are evidence,
     /// not assumptions.
     pub fn detect(records: &[&[u8]], name_offset: usize) -> Self {
+        const MIN_RECORDS_FOR_FALLBACK: usize = 8;
+
         if records.is_empty() {
             return Self::NONE;
         }
@@ -393,7 +395,6 @@ impl DefLayout {
         // `unknown` is correct when the file cannot tell us; inventing a
         // dimension from a coincidence is the failure mode this module exists
         // to prevent.
-        const MIN_RECORDS_FOR_FALLBACK: usize = 8;
         if records.len() < MIN_RECORDS_FOR_FALLBACK {
             return Self::NONE;
         }
@@ -458,13 +459,13 @@ fn utf16_field_len(record: &[u8], offset: usize, max_bytes: usize) -> Option<usi
         if !(0x20..0x7f).contains(&code) {
             return None;
         }
-        if code != b' ' as u16 {
+        if code != u16::from(b' ') {
             started = true;
         }
         if started {
             length += 1;
         }
-        if started && code != b' ' as u16 {
+        if started && code != u16::from(b' ') {
             trimmed = length;
         }
     }
@@ -497,7 +498,7 @@ fn utf16_field(record: &[u8], offset: usize, max_bytes: usize) -> Option<String>
 mod tests {
     use super::*;
 
-    /// Build a synthetic definition record with the native MQ12Di layout:
+    /// Build a synthetic definition record with the native `MQ12Di` layout:
     /// quantity u32 at 0x88, UTF-16LE unit string at 0x90.
     fn record(name: &str, quantity: u32, unit: &str) -> Vec<u8> {
         let mut buffer = vec![0u8; 0x130];
@@ -511,7 +512,7 @@ mod tests {
         buffer
     }
 
-    /// Channels from the real MQ12Di log, with their real codes and units.
+    /// Channels from the real `MQ12Di` log, with their real codes and units.
     fn native_records() -> Vec<Vec<u8>> {
         vec![
             record("A_ign_base", 7, "rad"),
@@ -532,7 +533,7 @@ mod tests {
     #[test]
     fn detects_native_layout_from_code_and_string_agreement() {
         let owned = native_records();
-        let records: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let records: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let layout = DefLayout::detect(&records, 8);
         assert_eq!(layout.quantity, Some(0x88), "quantity offset");
         assert_eq!(layout.unit, Some(0x90), "unit string offset");
@@ -541,7 +542,7 @@ mod tests {
     #[test]
     fn declared_units_win_over_the_quantity_code() {
         let owned = native_records();
-        let records: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let records: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let layout = DefLayout::detect(&records, 8);
         // A file declaring km/h for a speed channel keeps km/h, not m/s.
         let declared = record("GPS Speed", 3, "km/h");
@@ -553,7 +554,7 @@ mod tests {
     #[test]
     fn marker_text_is_never_reported_as_a_real_unit() {
         let owned = native_records();
-        let records: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let records: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let layout = DefLayout::detect(&records, 8);
         for marker in ["raw", "flag", "cnt", "pp1", "user defined"] {
             let (unit, source) = layout.resolve(&record("X", 0, marker));
@@ -580,7 +581,7 @@ mod tests {
             record("gear", 0, ""),
             record("Lap Number", 0, ""),
         ];
-        let records: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let records: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let layout = DefLayout::detect(&records, 8);
         assert_eq!(layout.quantity, Some(0x88));
         assert_eq!(layout.unit, None, "export declares no unit strings");
@@ -612,7 +613,7 @@ mod tests {
             record("P_F_BRAKE", 9, ""),
             record("I_ACCEL_LONG", 10, ""),
         ];
-        let records: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let records: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let layout = DefLayout::detect(&records, 8);
         for (name, code, forbidden) in [
             ("STEER", 7u32, "deg"),
@@ -645,7 +646,7 @@ mod tests {
             relocated(11, "V"),
             relocated(8, "rad/s"),
         ];
-        let records: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let records: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let layout = DefLayout::detect(&records, 8);
         assert_eq!(layout.quantity, Some(0x30));
         assert_eq!(layout.unit, Some(0x50));
@@ -664,7 +665,7 @@ mod tests {
                 buffer
             })
             .collect();
-        let records: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let records: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let layout = DefLayout::detect(&records, 8);
         assert_eq!(layout.quantity, None);
         assert_eq!(layout.unit, None);
@@ -683,7 +684,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        let records: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let records: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let layout = DefLayout::detect(&records, 8);
         assert_eq!(layout.unit, None, "noise must not produce a unit field");
     }
