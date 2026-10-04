@@ -18,6 +18,17 @@ pub enum Storage {
 }
 
 impl Storage {
+    /// Prefer isolated page reads for parsers that skip large unrelated payloads.
+    /// This best-effort hint avoids reading surrounding video pages when MP4
+    /// telemetry chunks are sparse. Owned buffers and unsupported platforms
+    /// are unaffected; a failed hint never changes parsing behavior.
+    pub fn prefer_random_access(&self) {
+        #[cfg(unix)]
+        if let Self::Mapped(map) = self {
+            let _ = map.advise(memmap2::Advice::Random);
+        }
+    }
+
     /// Memory-maps `path` read-only, reading it into owned bytes when the
     /// filesystem refuses to map it.
     ///

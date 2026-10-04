@@ -1199,6 +1199,7 @@ impl AimFile {
     }
 
     fn parse(display: String, data: Storage, mode: ParseMode) -> Result<Self, AimError> {
+        data.prefer_random_access();
         let video_frame_times_ns = match mode {
             ParseMode::Full => video_frame_times_ns(&data, &display)?,
             ParseMode::Index => Vec::new(),
