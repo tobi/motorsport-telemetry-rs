@@ -260,7 +260,7 @@ pub fn audit_track(
         .any(|c| {
             ["lapnumber", "lapnum", "lapcount", "beaconeventcount"]
                 .iter()
-                .any(|n| names::eq(&c.name, n))
+                .any(|n| names::eq_with_numeric_suffix(&c.name, n))
         })
     {
         report.add(
@@ -442,7 +442,7 @@ pub fn audit_track(
         for (boundary, code, message) in [
             (LapBoundary::GpsPitEntry, "recovered-moving-pit-pass", "Separate moving pit lane recovered from native GPS despite no dash reset; atlas marker times are estimates."),
             (LapBoundary::MotionDeparture, "recovered-motion-departure", "Stationary activity separated from the out fragment using sustained motion and later circuit evidence."),
-            (LapBoundary::RejectedCrossing, "rejected-short-crossing", "Implausibly short crossing rejected against the native reference; activity remains uncertain."),
+            (LapBoundary::RejectedCrossing, "rejected-short-crossing", "Implausibly short crossing rejected against the native reference or GPS-matched atlas physical bound; activity remains uncertain."),
         ] {
             if lap.end_boundary == boundary {
                 report.add("info", code, Some(lap.number), Some(lap.end_ns), message);

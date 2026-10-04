@@ -114,8 +114,8 @@ pub enum LapBoundary {
     CounterCrossing,
     /// Confirmed running-timer reset, possibly refining a counter crossing.
     TimerCrossing,
-    /// Candidate crossing contradicted by the recording's reference-lap
-    /// lower bound. Cannot anchor a flying lap.
+    /// Candidate crossing contradicted by a reference-lap or GPS-matched
+    /// atlas physical lower bound. Cannot anchor a flying lap.
     RejectedCrossing,
     /// Sustained drop of the lap counter; closes the active stint.
     CounterReset,
@@ -1409,6 +1409,86 @@ mod tests {
             [(0, 49_940_000_000), (49_940_000_000, 80_000_000_000)]
         );
         assert!(metadata.laps.iter().all(|lap| lap.duration_ns > 0));
+    }
+
+    #[test]
+    fn numbered_native_counter_alias_preserves_pit_reset_when_reference_is_zero() {
+        let source = channels_source(
+            1_000_000_000,
+            vec![
+                (
+                    "Lap_Number_001",
+                    "",
+                    (0..220)
+                        .map(|t| match t {
+                            100..=179 => 1.0,
+                            180..=204 => 2.0,
+                            205 => 3.0,
+                            _ => 0.0,
+                        })
+                        .collect(),
+                ),
+                (
+                    "Current_Lap_Time",
+                    "s",
+                    (0..220)
+                        .map(|t| match t {
+                            0..=99 => f64::from(t),
+                            100..=179 => f64::from(t - 100),
+                            180..=204 => f64::from(t - 180),
+                            _ => f64::from(t - 205),
+                        })
+                        .collect(),
+                ),
+                (
+                    "Speed_Wspd_App",
+                    "",
+                    (0..220)
+                        .map(|t| if t >= 203 { 0.0 } else { 200.0 })
+                        .collect(),
+                ),
+                ("Ref_Lap_Time", "s", vec![0.0; 220]),
+            ],
+        );
+        let m = read_source_metadata(&source);
+        assert_eq!(m.valid_laps, 0);
+        assert_eq!(
+            m.laps.iter().map(|l| l.kind).collect::<Vec<_>>(),
+            [LapKind::Out, LapKind::In, LapKind::Pit]
+        );
+        let (_, observations) = crate::inspect_lap_recovery(&source);
+        assert!(observations
+            .iter()
+            .any(|o| o.code == "recovered-pit-close-beacon"));
+    }
+
+    #[test]
+    fn atlas_rejects_impossible_timer_laps_without_a_dash_reference() {
+        for quality in [0.0, 3.0] {
+            let source = channels_source(
+                1_000_000_000,
+                vec![
+                    (
+                        "Current_Lap_Time",
+                        "s",
+                        (0..80).map(|t| f64::from(t % 25)).collect(),
+                    ),
+                    ("GPS Latitude", "deg", vec![43.79812; 80]),
+                    ("GPS Longitude", "deg", vec![-87.98951; 80]),
+                    ("GPS Fix Type", "raw", vec![quality; 80]),
+                    ("GPS Position Accuracy", "m", vec![2.0; 80]),
+                    ("Speed_Wspd_App", "", vec![200.0; 80]),
+                ],
+            );
+            let m = read_source_metadata(&source);
+            assert_eq!(m.valid_laps == 0, quality == 3.0, "{m:?}");
+            assert_eq!(
+                m.laps
+                    .iter()
+                    .any(|l| l.end_boundary == LapBoundary::RejectedCrossing),
+                quality == 3.0
+            );
+        }
     }
 
     #[test]

@@ -113,3 +113,10 @@ Private Road Atlanta acceptance checks can be rerun with:
 ```sh
 ROAD_ATLANTA_CORPUS=/path/to/weekend cargo test --release -p motorsport-telemetry --test road_atlanta_verify -- --ignored
 ```
+
+Native numbered counter aliases such as `Lap_Number_001` participate in counter
+selection; a suffix cannot silently discard stationary reset evidence. When
+native receiver-qualified GPS identifies a facility and the dash reference is
+absent, complete candidates also obey the shortest atlas layout / 120 m/s
+physical floor. This rejects impossible complete laps without setting a slow
+lap cutoff or assuming a layout from GPS alone.

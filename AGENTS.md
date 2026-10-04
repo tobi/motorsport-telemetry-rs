@@ -70,7 +70,8 @@ a GPS pit-exit timestamp. Pit activity otherwise continues through movement.
 A moving pit pass requires a separate slow GPS lane, a displaced entry
 approach and a return beyond the atlas exit, calibrated against two fast
 native dash crossings. GPS pit entry/exit cannot anchor flying laps.
-A complete candidate below half the reference lap is `Uncertain`; rejected
+A complete candidate below half the reference lap or the trusted-GPS matched
+atlas physical floor (shortest facility layout / 120 m/s) is `Uncertain`; rejected
 crossings clear the anchor. Never apply an upper classification bound to FCY
 laps. A long stop alone remains uncertain. Native GPS-located standstill on
 the circuit is `Stopped` (no crash cause is inferred); it cannot become pit

@@ -32,6 +32,17 @@ pub fn eq(value: &str, wanted: &str) -> bool {
         .eq(wanted.bytes())
 }
 
+/// Match a native numbered channel alias such as `Lap_Number_001`.
+/// Only an underscore followed by exactly three ASCII digits is removed;
+/// ordinary numbered sensors retain their distinct names. Use this explicitly
+/// for semantic channels that vendors may export with numbered aliases.
+pub fn eq_with_numeric_suffix(value: &str, wanted: &str) -> bool {
+    eq(value, wanted)
+        || value.rsplit_once('_').is_some_and(|(base, suffix)| {
+            suffix.len() == 3 && suffix.bytes().all(|b| b.is_ascii_digit()) && eq(base, wanted)
+        })
+}
+
 /// Allocation-free normalized substring: `needle` occurs within `value` when it
 /// appears as a contiguous subsequence of the filtered, lowercased stream.
 ///
@@ -128,5 +139,17 @@ mod tests {
         // Falls back to the lower-priority name when the first misses.
         assert_eq!(find(&channels, &["missing", "lap"]), Some(0));
         assert_eq!(find(&channels, &["missing"]), None);
+    }
+    #[test]
+    fn native_aliases_do_not_conflate_arbitrary_numbered_sensors() {
+        assert!(eq_with_numeric_suffix("Lap_Number_001", "lapnumber"));
+        assert!(eq_with_numeric_suffix(
+            "beaconEventCount_002",
+            "beaconeventcount"
+        ));
+        assert!(!eq_with_numeric_suffix("Lap_Number1", "lapnumber"));
+        assert!(!eq_with_numeric_suffix("Lap_Number_1", "lapnumber"));
+        assert!(!eq_with_numeric_suffix("Lap_Number_001extra", "lapnumber"));
+        assert!(!eq("Lap_Number_001", "lapnumber"));
     }
 }

@@ -174,3 +174,37 @@ pub(crate) fn on_circuit(source: &dyn TelemetrySource, time: u64) -> bool {
         .and_then(|g| g.locate(lat, lon))
         .is_some_and(|p| p.distance_m <= 20.0 && !p.pit_sector)
 }
+
+// A permissive physical floor also works when the dash reference is zero or
+// unavailable. Use the shortest known layout because GPS identifies a facility,
+// not its configuration. Two separated trustworthy fixes must agree on venue.
+pub(crate) fn physical_minimum_lap_ns(source: &dyn TelemetrySource) -> Option<u64> {
+    let duration = source.channels().iter().map(|c| c.duration_ns).max()?;
+    let mut matched = None;
+    for i in 0..16u64 {
+        let time = duration / 16 * i;
+        let Some((a, b)) = trusted_position(source, time) else {
+            continue;
+        };
+        let Some(candidate) = motorsport_track_atlas::match_track(a, b, 10_000.0) else {
+            continue;
+        };
+        if let Some((slug, before)) = matched {
+            if candidate.track.slug == slug && time.saturating_sub(before) >= 10_000_000_000 {
+                let length = candidate
+                    .track
+                    .layouts
+                    .iter()
+                    .filter_map(|l| l.length_m)
+                    .filter(|d| d.is_finite() && *d > 0.0)
+                    .min_by(f64::total_cmp)?;
+                return crate::metadata::finite_u64(length / 120.0 * 1e9);
+            }
+        }
+        if matched.is_some_and(|(slug, _)| slug == candidate.track.slug) {
+            continue;
+        }
+        matched = Some((candidate.track.slug, time));
+    }
+    None
+}

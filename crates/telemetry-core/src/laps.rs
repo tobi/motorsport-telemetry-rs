@@ -152,13 +152,13 @@ const LAP_COUNTER_NAMES: &[&str] = &[
 fn lap_counter_rank(name: &str) -> Option<usize> {
     LAP_COUNTER_NAMES
         .iter()
-        .position(|wanted| names::eq(name, wanted))
+        .position(|wanted| names::eq_with_numeric_suffix(name, wanted))
 }
 
 fn is_completed_lap_counter(channel: &crate::Channel) -> bool {
     ["beaconeventcount", "beaconcount", "lapbeaconcount"]
         .iter()
-        .any(|wanted| names::eq(&channel.name, wanted))
+        .any(|wanted| names::eq_with_numeric_suffix(&channel.name, wanted))
 }
 
 /// Returns the active lap number at `time_ns`, offsetting beacon counts.
@@ -1151,12 +1151,17 @@ fn reference_lap_ns(source: &dyn TelemetrySource) -> Option<u64> {
 }
 
 /// A timer and counter may agree on a dash reset that is not a physical lap.
-/// Reuse the existing reference lower bound; never apply the upper bound to
+/// Use the reference lower bound or GPS-matched atlas physical bound; never apply the upper bound to
 /// classification because slow/FCY laps are still track laps. A rejected
 /// crossing clears the anchor until a subsequent accepted crossing, so its
 /// following interval cannot silently remain a flying lap either.
 pub(crate) fn validate_crossings(source: &dyn TelemetrySource, laps: &mut [LapMetadata]) {
-    let Some(reference) = reference_lap_ns(source) else {
+    let minimum = reference_lap_ns(source)
+        .map(|r| r / 2)
+        .into_iter()
+        .chain(crate::track::physical_minimum_lap_ns(source))
+        .max();
+    let Some(minimum) = minimum else {
         return;
     };
     let mut phase = Phase::Initial;
@@ -1173,7 +1178,7 @@ pub(crate) fn validate_crossings(source: &dyn TelemetrySource, laps: &mut [LapMe
                 lap.start_boundary = LapBoundary::RejectedCrossing;
             }
         }
-        let rejected = lap.complete && lap.duration_ns < reference / 2;
+        let rejected = lap.complete && lap.duration_ns < minimum;
         let event = if rejected {
             Event::RejectedCrossing
         } else {
