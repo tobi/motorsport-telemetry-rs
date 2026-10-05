@@ -154,6 +154,9 @@ impl TelemetrySource for JsonlRecording {
     fn video_files(&self) -> &[VideoFileRef] {
         &self.videos
     }
+    fn video_timeline(&self) -> Option<&motorsport_telemetry_core::VideoTimeline> {
+        self.video_timeline.as_ref()
+    }
 
     fn video_presentation_times_ns(&self) -> Option<&[u64]> {
         (!self.video_times.is_empty()).then_some(self.video_times.as_slice())

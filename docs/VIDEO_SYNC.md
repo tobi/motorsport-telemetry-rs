@@ -26,8 +26,10 @@ synced" in a player and drifts in any tool that reconstructs time by hand.
 - per-lap `first_video_frame` in `FileMetadata::laps`,
 - per-file `VideoFileRef { filename, index, blake3, frame_count,
   presentation_offset_ns }` for multi-file recordings,
-- BLAKE3 of each video so a consumer can verify it is pairing the
-  telemetry with the exact file that was present at convert time.
+- optional BLAKE3 identities explicitly supplied by a source. Conversion
+  preserves them and never reads whole video payloads merely to hash them,
+- header `vmap` / `VideoTimeline`: native telemetry→file→presentation points
+  for clocks that change at split-file rolls or are not a constant offset.
 
 ## The three rules
 
@@ -36,12 +38,15 @@ synced" in a player and drifts in any tool that reconstructs time by hand.
    per-file edit lists break all three, each by more than a frame.
 2. **Always go through the stored mapping.** All of it is one call away on
    any opened source (`TelemetrySource`):
+   - `video_timeline()` → immutable normalized native clock, when supplied;
+     `presentation_at(t)` returns `VideoPosition { file_index,
+     presentation_time_ns }`; `telemetry_at(file_index, pts)` is its inverse;
    - `video_frame_at(telemetry_ns)` → frame index — filmstrips, thumbnails;
    - `video_presentation_time_ns(telemetry_ns)` → player seek position;
    - `video_reference_at(telemetry_ns)` → `VideoReference { file_index,
      presentation_time_ns, frame_index, .. }` — the multi-file-safe form;
-   - inverse (frame → telemetry): `video_presentation_times_ns()[frame] −
-     video_presentation_offset_ns()`.
+   - when no native timeline exists, inverse (frame → telemetry):
+     `video_presentation_times_ns()[frame] − video_presentation_offset_ns()`.
 3. **Verify identity before trusting the pairing.** Match the video by the
    stored BLAKE3 (or at minimum basename + frame count). A `.telemetry` next
    to a re-encoded or trimmed MP4 is a different presentation timeline.
@@ -55,7 +60,37 @@ synced" in a player and drifts in any tool that reconstructs time by hand.
   − offset`, then `sample_at(channel, t, …)`. Render. The overlay is now on
   the frame the player would show at that instant.
 - **VBOX two-file rolls**: call `video_reference_at(t)` and switch files on
-  `file_index`; each `VideoFileRef` carries its own offset.
+  `file_index`, or use `video_timeline().presentation_at(t)` directly. VBOX
+  uses its native integer milliseconds since each video file started, including
+  nonzero initial PTS. The raw `avitime`/`avisynctime` channel is unchanged;
+  the surplus builtin unit label `s` does not redefine the native clock.
+
+## Native clock support and ambiguity
+
+`VideoTimeline::from_segments` validates nonempty segments with positive file
+indices, strictly increasing telemetry timestamps and nondecreasing PTS values.
+Segments follow telemetry order without overlapping. Clock resets, file rolls,
+invalid/no-video rows and missing-sample gaps split the VBOX timeline. Exact
+duplicate observations are deduplicated in this cached mapping while all raw
+samples remain unchanged. Conflicting duplicates or reversed telemetry time
+disable the native mapping with a diagnostic.
+
+Interpolation uses integer arithmetic inside one supported segment only. No
+query extrapolates before/after observations or through a gap. Repeated PTS
+values and overlapping PTS ranges after a same-file reset have an ambiguous
+inverse: `VideoMappingError::Ambiguous`. Uncovered instants return `Unmapped`;
+malformed supplied segments return `InvalidTimeline`. Do not replace a refused
+inverse with an estimated constant offset or nominal frame rate.
+
+`FileMetadata::video_timeline` and MTJ header-only reads retain exactly this
+clock, independently of decoded channel arrays. The segment bounds describe
+**recorded synchronization support**, not playable media duration. A real VBOX
+roll can report a final old-file PTS about 66 ms beyond the MP4's stream end.
+Check independently measured media extents before seeking and report unsupported
+positions; never silently clamp or claim max-avitime is the media duration.
+
+The native millisecond convention is documented in Racelogic's
+[VBOX Video HD2 CAN output](https://en.racelogic.support/automotive/data-loggers/vbvdhd2/technical/can-output/).
 
 ## Which files can do this
 

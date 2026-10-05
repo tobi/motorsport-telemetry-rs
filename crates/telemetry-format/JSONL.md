@@ -185,6 +185,7 @@ Line 1 is a JSON object. Writers SHOULD emit keys in the order listed.
 | `vo` | integer | no | Recording-level video presentation offset, nanoseconds: `player_ns = t + vo`. See 4.2. |
 | `vf` | array | no | Linked video files, in index order. See 4.2. |
 | `vpts` | array | no | Presentation-order video frame timestamps, nanoseconds on the movie timeline. Requires `vf`. See 4.2. |
+| `vmap` | array | no | Native multi-file synchronization segments, preserving telemetry and presentation nanoseconds. Requires `vf`. See 4.2. |
 | `passes` | array | no | Processing passes applied to this file, in application order. See 4.1. |
 | `meta` | object | no | File-level descriptive metadata, including resolved `TRACK.yml` fields. See 4.3. |
 | `hash` | string | no | 16-digit lowercase hex schema hash. |
@@ -235,7 +236,7 @@ conversion exactly.
 Readers that do not understand a pass name MUST still treat its `out`
 channels as ordinary channels; the entry only explains where they came from.
 
-### 4.2 Video linkage (`vo`, `vf`, `vpts`)
+### 4.2 Video linkage (`vo`, `vf`, `vpts`, `vmap`)
 
 A recording converted from a camera container — or from a `.telemetry` file
 that carried the linkage — keeps its video synchronization. The pixels stay
@@ -252,13 +253,25 @@ time `t` (file-relative nanoseconds) and the player's presentation timeline.
 | `n` | string | yes | Video filename (basename; resolve next to this document). |
 | `i` | integer ≥ 1 | yes | File index; multi-file rolls count up from 1. |
 | `fc` | integer ≥ 0 | yes | Frame count, `0` when unknown. |
-| `b3` | string | no | BLAKE3-256 of the video file, 64 hex digits, when it was present at convert time. Verify before trusting frame-accurate sync. |
+| `b3` | string | no | BLAKE3-256 explicitly supplied by the source, 64 hex digits. Conversion preserves it and does not implicitly read/hash video payloads. |
 | `po` | integer | no | Per-file presentation offset: `video_presentation_ns = file_relative_ns + po`. |
 
 - `vpts` — the presentation-order frame timestamp table: one integer per
   frame, nanoseconds on the movie timeline, non-decreasing. These timestamps
   preserve the source video timeline exactly. `vpts` without
   `vf` is invalid.
+
+- `vmap` — native clock segments: `[[file_index, [[telemetry_ns,
+  presentation_ns], ...]], ...]`. Each nonempty segment uses one positive
+  index with exactly one matching `vf` entry. Telemetry stamps strictly
+  increase; PTS is nondecreasing. Segments follow increasing, nonoverlapping
+  telemetry bounds. Both axes preserve source nanoseconds independently of
+  the channel lattice. Interpolation is supported only inside one segment;
+  no extrapolation or interpolation crosses a gap, invalid row, file roll,
+  or reset. Repeated PTS/reset overlap has no unique inverse. A singleton
+  supports its exact instant only. Segment bounds are source clock support,
+  not measured video duration. When present, this mapping takes precedence
+  over constant `vo`/`po` offsets for time conversion.
 
 The frame shown at telemetry time `t` is the last index whose `vpts` entry
 is `<= t + vo` (clamped to `0`). Never derive frames from a nominal frame

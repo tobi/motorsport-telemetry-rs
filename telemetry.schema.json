@@ -1508,6 +1508,13 @@
           "description": "Presentation timestamp of every video frame, ns, presentation order, non-decreasing. Preserves the source video timeline exactly.",
           "$comment": "Non-decreasing order and vpts-requires-vf are enforced by the reader, not JSON Schema (dependentRequired covers presence)."
         },
+        "vmap": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/videoSyncSegment" },
+          "description": "Native video mapping segments, each [file_index, [[telemetry_ns, presentation_ns], ...]]. Segment bounds describe recorded clock support, not playable media duration. No interpolation between segments.",
+          "$comment": "Checked ordering, nonoverlapping telemetry ranges and matching vf indices are enforced by the reader. Presentation times may repeat; their inverse is ambiguous."
+        },
         "passes": {
           "type": "array",
           "maxItems": 64,
@@ -1536,6 +1543,9 @@
       ],
       "dependentRequired": {
         "vpts": [
+          "vf"
+        ],
+        "vmap": [
           "vf"
         ]
       }
@@ -2063,6 +2073,24 @@
       "description": "Recording-level telemetry→player presentation shift in nanoseconds (player_ns = t + vo). Signed; MP4 edit lists make it per-file and non-zero.",
       "examples": [
         101333333
+      ]
+    },
+    "videoSyncSegment": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 }
+          }
+        }
       ]
     },
     "videoFileRef": {

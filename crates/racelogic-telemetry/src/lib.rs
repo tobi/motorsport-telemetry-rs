@@ -16,7 +16,8 @@
 
 use motorsport_telemetry_core::{
     names, Channel, Chunk, Diagnostic, LapMetadata, SampleTimes, SampleType, SourceLapMetadata,
-    Storage, TelemetrySource, UnitSource, VideoFileRef,
+    Storage, TelemetrySource, UnitSource, VideoFileRef, VideoSyncPoint, VideoSyncSegment,
+    VideoTimeline,
 };
 use std::path::Path;
 use thiserror::Error;
@@ -122,6 +123,7 @@ pub struct RacelogicFile {
     pub recording_time: String,
     /// Linked video files discovered next to the VBO (`prefixNNNN.ext`).
     pub videos: Vec<VideoFileRef>,
+    video_timeline: Option<VideoTimeline>,
     values: Vec<Vec<f64>>,
     absolute_start_ns: u64,
     /// Laps from GPS crossings of the `[laptiming]` start/finish gate.
@@ -551,6 +553,13 @@ impl RacelogicFile {
             });
         }
         let videos = discover_videos(&parsed.avi, &short_names, &values);
+        let video_timeline = video_timeline(
+            &short_names,
+            &values,
+            &time_ns,
+            sample_period,
+            &mut diagnostics,
+        );
         let laps = gate_laps(
             &parsed.laptiming,
             &short_names,
@@ -567,6 +576,7 @@ impl RacelogicFile {
             date: parsed.created_date,
             recording_time: parsed.created_time,
             videos,
+            video_timeline,
             values,
             absolute_start_ns: (first * 1e9).round().max(0.0) as u64,
             diagnostics,
@@ -844,8 +854,9 @@ fn discover_videos(avi: &[&str], short_names: &[&str], values: &[Vec<f64>]) -> V
         .position(|name| names::eq(name, "avifileindex"))
     {
         for value in &values[column] {
-            if value.is_finite() && *value >= 0.0 {
-                indices.insert(value.round() as u32);
+            if let Some(index) = native_integer(*value).and_then(|value| u32::try_from(value).ok())
+            {
+                indices.insert(index);
             }
         }
     }
@@ -872,6 +883,98 @@ fn discover_videos(avi: &[&str], short_names: &[&str], values: &[Vec<f64>]) -> V
         .collect()
 }
 
+// HD1/HD2 Video Time (PTS) is integer milliseconds since this video file
+// started. The surplus `[channel units]` entry sometimes says `s`; it does
+// not change the native field's scale. Preserve the raw channel untouched.
+// https://en.racelogic.support/automotive/data-loggers/vbvdhd2/technical/can-output/
+#[allow(
+    clippy::float_cmp,
+    reason = "native video fields must be exact nonnegative integers"
+)]
+fn native_integer(value: f64) -> Option<u64> {
+    (value.is_finite() && value >= 0.0 && value < u64::MAX as f64 && value.fract() == 0.0)
+        .then_some(value as u64)
+}
+
+fn video_timeline(
+    names: &[&str],
+    values: &[Vec<f64>],
+    times: &[u64],
+    sample_period: u64,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<VideoTimeline> {
+    let index_column = names
+        .iter()
+        .position(|name| names::eq(name, "avifileindex"))?;
+    let sync_column = names
+        .iter()
+        .position(|name| names::eq(name, "avitime") || names::eq(name, "avisynctime"))?;
+    let mut segments = Vec::<VideoSyncSegment>::new();
+    let mut current = None::<VideoSyncSegment>;
+    let finish = |current: &mut Option<VideoSyncSegment>, segments: &mut Vec<VideoSyncSegment>| {
+        if let Some(segment) = current.take() {
+            segments.push(segment);
+        }
+    };
+    for (row, &time) in times.iter().enumerate() {
+        let index = values[index_column]
+            .get(row)
+            .copied()
+            .and_then(native_integer)
+            .and_then(|index| u32::try_from(index).ok())
+            .filter(|index| *index > 0);
+        let presentation = values[sync_column]
+            .get(row)
+            .copied()
+            .and_then(native_integer)
+            .and_then(|milliseconds| milliseconds.checked_mul(1_000_000));
+        let (Some(index), Some(presentation)) = (index, presentation) else {
+            finish(&mut current, &mut segments);
+            continue;
+        };
+        // Broken telemetry timestamps must not make an overlapping segment.
+        let last_segment = current.as_ref().or_else(|| segments.last());
+        if let Some((segment, last)) =
+            last_segment.and_then(|segment| segment.points.last().map(|point| (segment, point)))
+        {
+            if time == last.telemetry_time_ns
+                && index == segment.file_index
+                && presentation == last.presentation_time_ns
+            {
+                continue; // duplicate native observation, raw samples stay intact
+            }
+            if time <= last.telemetry_time_ns {
+                diagnostics.push(Diagnostic::warning("vbo.video_clock_conflict",
+                    "conflicting or reversed telemetry-time video observations; synchronization disabled"));
+                return None;
+            }
+        }
+        let split = current.as_ref().is_some_and(|segment| {
+            segment.file_index != index
+                || segment.points.last().is_some_and(|last| {
+                    presentation < last.presentation_time_ns
+                        || time.saturating_sub(last.telemetry_time_ns)
+                            > sample_period.saturating_add(sample_period / 2)
+                })
+        });
+        if split {
+            finish(&mut current, &mut segments);
+        }
+        current
+            .get_or_insert_with(|| VideoSyncSegment {
+                file_index: index,
+                points: Vec::new(),
+            })
+            .points
+            .push(VideoSyncPoint {
+                telemetry_time_ns: time,
+                presentation_time_ns: presentation,
+            });
+    }
+    finish(&mut current, &mut segments);
+    VideoTimeline::from_segments(segments).ok()
+}
+
 impl TelemetrySource for RacelogicFile {
     fn path(&self) -> &str {
         &self.path
@@ -884,6 +987,9 @@ impl TelemetrySource for RacelogicFile {
     }
     fn video_files(&self) -> &[VideoFileRef] {
         &self.videos
+    }
+    fn video_timeline(&self) -> Option<&VideoTimeline> {
+        self.video_timeline.as_ref()
     }
     fn decode(&self, channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
         let Some(values) = self.values.get(channel_index) else {
@@ -948,6 +1054,70 @@ impl TelemetrySource for RacelogicFile {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn clock_fixture(rows: &str) -> RacelogicFile {
+        let text = format!("[header]\ntime\nsampleperiod\navifileindex\navisynctime\n[AVI]\nrun_\nmp4\n[column names]\ntime Tsample avifileindex avitime\n[data]\n{rows}");
+        RacelogicFile::from_bytes("run.vbo", text.into_bytes()).unwrap()
+    }
+
+    #[test]
+    fn native_video_clock_is_milliseconds_and_preserves_raw_samples() {
+        let file = clock_fixture("120000.000 0.040 1 16233\n120000.040 0.040 1 16266\n120000.080 0.040 2 0\n120000.120 0.040 2 33\n");
+        let clock = file.video_timeline().unwrap();
+        assert_eq!(
+            clock.presentation_at(0).unwrap().presentation_time_ns,
+            16_233_000_000
+        );
+        assert_eq!(file.decode(3, 0, 0), 16233.0);
+        assert_eq!(file.video_reference_at(80_000_000).file_index, Some(2));
+        assert_eq!(
+            file.video_reference_at(80_000_000).presentation_time_ns,
+            Some(0)
+        );
+        assert_eq!(
+            file.video_reference_at(60_000_000).presentation_time_ns,
+            None
+        );
+        assert_eq!(file.metadata().video_timeline.as_ref(), Some(clock));
+    }
+
+    #[test]
+    fn no_video_rows_gaps_and_resets_do_not_supply_interpolation() {
+        let file = clock_fixture("120000.000 0.040 1 0\n120000.040 0.040 1 40\n120000.080 0.040 0 80\n120000.120 0.040 1 120\n120000.400 0.040 1 400\n120000.440 0.040 1 10\n120000.480 0.040 1 50\n");
+        let clock = file.video_timeline().unwrap();
+        for time in [
+            60_000_000,
+            80_000_000,
+            100_000_000,
+            200_000_000,
+            420_000_000,
+        ] {
+            assert!(clock.presentation_at(time).is_err(), "{time}");
+        }
+        assert_eq!(
+            clock.telemetry_at(1, 20_000_000),
+            Err(motorsport_telemetry_core::VideoMappingError::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn exact_duplicate_observations_are_deduplicated_but_conflicts_disable_sync() {
+        let file = clock_fixture("120000.000 0.040 1 10\n120000.040 0.040 1 50\n120000.040 0.040 1 50\n120000.120 0.040 1 130\n");
+        assert_eq!(file.channels[0].sample_count, 4);
+        assert_eq!(file.video_timeline().unwrap().segments().len(), 2);
+        assert!(file
+            .video_timeline()
+            .unwrap()
+            .presentation_at(80_000_000)
+            .is_err());
+        let conflict =
+            clock_fixture("120000.000 0.040 1 10\n120000.040 0.040 1 50\n120000.040 0.040 1 60\n");
+        assert!(conflict.video_timeline().is_none());
+        assert!(conflict
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "vbo.video_clock_conflict"));
+    }
 
     fn fixture(contents: &str) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();

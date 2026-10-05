@@ -349,6 +349,9 @@ impl<S: TelemetrySource> TelemetrySource for ViewSource<S> {
     fn video_files(&self) -> &[VideoFileRef] {
         self.inner.video_files()
     }
+    fn video_timeline(&self) -> Option<&crate::VideoTimeline> {
+        self.inner.video_timeline()
+    }
     fn video_presentation_times_ns(&self) -> Option<&[u64]> {
         self.inner.video_presentation_times_ns()
     }

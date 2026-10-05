@@ -506,6 +506,27 @@ fn write_videos(
             writer.write_all(b"]")?;
         }
     }
+    if let Some(timeline) = source.video_timeline() {
+        writer.write_all(b",\"vmap\":[")?;
+        for (index, segment) in timeline.segments().iter().enumerate() {
+            if index > 0 {
+                writer.write_all(b",")?;
+            }
+            write!(writer, "[{},[", segment.file_index)?;
+            for (index, point) in segment.points.iter().enumerate() {
+                if index > 0 {
+                    writer.write_all(b",")?;
+                }
+                write!(
+                    writer,
+                    "[{},{}]",
+                    point.telemetry_time_ns, point.presentation_time_ns
+                )?;
+            }
+            writer.write_all(b"]]")?;
+        }
+        writer.write_all(b"]")?;
+    }
     Ok(())
 }
 fn write_laps(writer: &mut impl Write, laps: &[LapMetadata]) -> Result<(), TelemetryFormatError> {
@@ -951,7 +972,7 @@ fn span_label(span: &Span) -> &str {
 pub(crate) fn linked_videos(
     source: &dyn TelemetrySource,
 ) -> Vec<motorsport_telemetry_core::VideoFileRef> {
-    let mut videos = hash_videos(source);
+    let mut videos = source.video_files().to_vec();
     if let Some(count) = source.video_frame_count() {
         if let Some(video) = videos.first_mut() {
             video.frame_count = count;
@@ -959,7 +980,7 @@ pub(crate) fn linked_videos(
             videos.push(motorsport_telemetry_core::VideoFileRef {
                 filename: name.to_string_lossy().into_owned(),
                 index: 1,
-                blake3: hash_file(Path::new(source.path())),
+                blake3: None,
                 frame_count: count,
                 presentation_offset_ns: source.video_presentation_offset_ns(),
             });
@@ -972,37 +993,4 @@ pub(crate) fn linked_videos(
         }
     }
     videos
-}
-
-fn hash_videos(source: &dyn TelemetrySource) -> Vec<motorsport_telemetry_core::VideoFileRef> {
-    let parent = Path::new(source.path()).parent();
-    source
-        .video_files()
-        .iter()
-        .cloned()
-        .map(|mut video| {
-            if video.blake3.is_none() {
-                if let Some(path) = parent.map(|dir| dir.join(&video.filename)) {
-                    if path.is_file() {
-                        video.blake3 = hash_file(&path);
-                    }
-                }
-            }
-            video
-        })
-        .collect()
-}
-
-fn hash_file(path: &Path) -> Option<[u8; 32]> {
-    let mut file = File::open(path).ok()?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 8 * 1024];
-    loop {
-        let read = std::io::Read::read(&mut file, &mut buf).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Some(*hasher.finalize().as_bytes())
 }

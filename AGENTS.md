@@ -114,9 +114,19 @@ and `.telemetry.jsonl.zstd`. Writers compress with zstd level 11 by default
 `write_jsonl_from_source_with` for raw UTF-8. Readers sniff the zstd magic
 so a compressed frame still opens under a `.telemetry.jsonl` name.
 Recording documents carry video linkage in the header (`vo` / `vf` /
-`vpts`, `JSONL.md` §4.2): presentation offset, file references, and the
+`vpts` / `vmap`, `JSONL.md` §4.2): presentation offset, file references, and the
 frame timestamp table, preserved bit-exactly when rewriting JSONL. Sidecars MUST NOT carry
 those keys.
+
+`VideoTimeline` is the immutable normalized clock for source-native split or
+non-affine synchronization. VBOX AVI time is integer milliseconds since each
+video started, regardless of a surplus `s` unit label. Native file rolls,
+resets, invalid rows and sample gaps split segments; queries interpolate only
+inside supported segments and refuse ambiguous inverse PTS. Segment bounds
+are not media duration. Preserve this clock in `FileMetadata` and MTJ headers,
+forward it through trait wrappers and `ViewSource`, and never re-derive it
+from FPS. Conversion preserves explicitly supplied video hashes but never
+implicitly reads whole linked videos to calculate one.
 
 An MTX sidecar (`.telemetry.ext.jsonl`) is header + records. The sidecar is
 the group (header `n` + `vis`). Records are sample channels and/or spans.

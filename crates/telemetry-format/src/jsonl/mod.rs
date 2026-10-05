@@ -6,7 +6,7 @@
 use crate::write::TelemetryFormatError;
 use motorsport_telemetry_core::{
     read_source_metadata, AbsoluteTimeRange, AppliedPass, Channel, ChannelDisplay, ChannelLabel,
-    FileMetadata, LapKind, LapMetadata, MetadataMap, SourceIdentity, VideoFileRef,
+    FileMetadata, LapKind, LapMetadata, MetadataMap, SourceIdentity, VideoFileRef, VideoTimeline,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -72,6 +72,7 @@ pub struct JsonlRecording {
     pub(super) videos: Vec<VideoFileRef>,
     pub(super) video_times: Vec<u64>,
     pub(super) video_offset_ns: Option<i128>,
+    pub(super) video_timeline: Option<VideoTimeline>,
 }
 impl JsonlRecording {
     /// Reads an MTJ file from `path`.
@@ -238,6 +239,7 @@ impl JsonlRecording {
             video_frame_count,
             video_presentation_offset_ns: header.video_offset_ns,
             videos,
+            video_timeline: header.video_timeline,
         };
         metadata.apply_extra_metadata();
         Ok(Some(metadata))

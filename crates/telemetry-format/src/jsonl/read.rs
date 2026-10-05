@@ -14,7 +14,7 @@ use motorsport_telemetry_core::{
     parse_timespan_ms, timespan_ms_in_range, AbsoluteTimeRange, AppliedPass, Channel,
     ChannelDisplay, ChannelLabel, ChannelPlot, Chunk, LapKind, LapMetadata, MetadataMap,
     SampleType, SourceIdentity, Span, SpanMetaValue, SpanPrimary, UnitSource, VideoFileRef,
-    TIMESPAN_MS,
+    VideoSyncPoint, VideoSyncSegment, VideoTimeline, TIMESPAN_MS,
 };
 use serde_json::{Map, Number, Value};
 use std::io::BufRead;
@@ -38,6 +38,7 @@ pub(super) struct ParsedHeader {
     pub(super) videos: Vec<VideoFileRef>,
     pub(super) video_times: Vec<u64>,
     pub(super) video_offset_ns: Option<i128>,
+    pub(super) video_timeline: Option<VideoTimeline>,
     pub(super) schema_hash: Option<u64>,
     /// `nc` / `nsc` / `ns`: channel count, sampled channel count, total
     /// samples. Written since 1.3.2 so a metadata read need not touch the
@@ -157,6 +158,7 @@ pub(super) fn parse_header_line(header_line: &str) -> Result<ParsedHeader, Telem
     let source_path = string_field(header, "srcp");
     let passes = parse_passes(header)?;
     let (videos, video_times, video_offset_ns) = parse_videos(header, extension)?;
+    let video_timeline = parse_video_timeline(header, &videos)?;
     let schema_hash = parse_schema_hash(header)?;
     let counts = match (
         int_field(header, "nc")?,
@@ -242,6 +244,7 @@ pub(super) fn parse_header_line(header_line: &str) -> Result<ParsedHeader, Telem
         videos,
         video_times,
         video_offset_ns,
+        video_timeline,
         schema_hash,
         counts,
         driver_ids,
@@ -282,6 +285,7 @@ impl JsonlRecording {
             videos,
             video_times,
             video_offset_ns,
+            video_timeline,
             schema_hash,
             ..
         } = parse_header_line(&header_line)?;
@@ -405,6 +409,7 @@ impl JsonlRecording {
             videos,
             video_times,
             video_offset_ns,
+            video_timeline,
         })
     }
 }
@@ -952,7 +957,7 @@ fn parse_videos(
     extension: bool,
 ) -> Result<ParsedVideos, TelemetryFormatError> {
     if extension {
-        for key in ["vo", "vf", "vpts"] {
+        for key in ["vo", "vf", "vpts", "vmap"] {
             if header.contains_key(key) {
                 return Err(invalid(format!(
                     "mtx sidecars cannot carry video linkage ({key}); video belongs to the host recording"
@@ -1037,6 +1042,61 @@ fn parse_videos(
         }
     };
     Ok((videos, video_times, video_offset_ns))
+}
+
+fn parse_video_timeline(
+    header: &Map<String, Value>,
+    videos: &[VideoFileRef],
+) -> Result<Option<VideoTimeline>, TelemetryFormatError> {
+    let Some(value) = header.get("vmap") else {
+        return Ok(None);
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| invalid("vmap must be an array"))?;
+    let mut segments = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let fields = entry
+            .as_array()
+            .filter(|fields| fields.len() == 2)
+            .ok_or_else(|| invalid("vmap segment must be [file_index, points]"))?;
+        let file_index = json_u64(&fields[0])?
+            .and_then(|index| u32::try_from(index).ok())
+            .filter(|index| *index > 0)
+            .ok_or_else(|| invalid("vmap file index must be a positive u32"))?;
+        if videos
+            .iter()
+            .filter(|video| video.index == file_index)
+            .count()
+            != 1
+        {
+            return Err(invalid("vmap file index requires one matching vf entry"));
+        }
+        let points = fields[1]
+            .as_array()
+            .ok_or_else(|| invalid("vmap points must be an array"))?;
+        let points = points
+            .iter()
+            .map(|point| {
+                let fields = point
+                    .as_array()
+                    .filter(|fields| fields.len() == 2)
+                    .ok_or_else(|| invalid("vmap point must be [telemetry_ns, presentation_ns]"))?;
+                Ok(VideoSyncPoint {
+                    telemetry_time_ns: json_u64(&fields[0])?.ok_or_else(|| {
+                        invalid("vmap telemetry time must be an unsigned integer")
+                    })?,
+                    presentation_time_ns: json_u64(&fields[1])?.ok_or_else(|| {
+                        invalid("vmap presentation time must be an unsigned integer")
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, TelemetryFormatError>>()?;
+        segments.push(VideoSyncSegment { file_index, points });
+    }
+    VideoTimeline::from_segments(segments)
+        .map(Some)
+        .map_err(|error| invalid(format!("vmap: {error}")))
 }
 /// Decodes a 64-digit hex string into a BLAKE3-256 digest.
 fn decode_blake3_hex(hex: &str) -> Result<[u8; 32], TelemetryFormatError> {

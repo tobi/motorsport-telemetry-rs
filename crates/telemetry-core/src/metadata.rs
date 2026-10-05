@@ -302,7 +302,8 @@ pub struct VideoFileRef {
     pub filename: String,
     /// Source file index (`avifileindex`), when the recording spans files.
     pub index: u32,
-    /// BLAKE3-256 of the video file, when it was present at convert time.
+    /// BLAKE3-256 of the video file, when explicitly supplied by the source.
+    /// Conversion preserves it but never hashes video payloads implicitly.
     pub blake3: Option<[u8; 32]>,
     /// Presentation-order frame count, when known.
     pub frame_count: u64,
@@ -395,6 +396,9 @@ pub struct FileMetadata {
     pub video_presentation_offset_ns: Option<i128>,
     /// Linked video files in index order. Empty when the recording has no video.
     pub videos: Vec<VideoFileRef>,
+    /// Native synchronization observations for split or non-affine clocks.
+    /// Preserved in the recording header and metadata-only reads.
+    pub video_timeline: Option<crate::VideoTimeline>,
 }
 
 /// Metadata merged across files that belong to one recording session.
@@ -803,6 +807,7 @@ pub fn read_source_metadata(source: &dyn TelemetrySource) -> FileMetadata {
         video_frame_count,
         video_presentation_offset_ns,
         videos,
+        video_timeline: source.video_timeline().cloned(),
     };
     let timezone = crate::placement::resolve_timezone(source);
     let utc_start_ns = source

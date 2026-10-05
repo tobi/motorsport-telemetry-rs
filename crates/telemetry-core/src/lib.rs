@@ -42,6 +42,8 @@ pub mod track;
 pub mod units;
 /// Physical plausibility checks over a loaded source.
 pub mod validate;
+/// Native multi-file video clock mappings.
+pub mod video;
 /// A window over another source: retained channels plus appended mirrors.
 pub mod view;
 
@@ -74,6 +76,9 @@ pub use units::{
     Dimension, UnitDef, UNITS,
 };
 pub use validate::{implies_decode_fault, validate_source, validate_source_with, ValidateOptions};
+pub use video::{
+    VideoMappingError, VideoPosition, VideoSyncPoint, VideoSyncSegment, VideoTimeline,
+};
 pub use view::{ViewError, ViewSource};
 
 /// Native scalar representation used by a telemetry channel.
@@ -532,6 +537,12 @@ pub trait TelemetrySource: Send + Sync {
         &[]
     }
 
+    /// Normalized native synchronization observations, retained independently
+    /// of raw channels. `None` uses the existing per-video offset clock.
+    fn video_timeline(&self) -> Option<&VideoTimeline> {
+        None
+    }
+
     /// Presentation-order movie-timeline timestamps for each video frame.
     ///
     /// Values are nanoseconds on the same timeline
@@ -558,6 +569,12 @@ pub trait TelemetrySource: Send + Sync {
 
     /// Maps a file-relative telemetry timestamp to the video's movie timeline.
     fn video_presentation_time_ns(&self, time_ns: u64) -> Option<u64> {
+        if let Some(timeline) = self.video_timeline() {
+            return timeline
+                .presentation_at(time_ns)
+                .ok()
+                .map(|position| position.presentation_time_ns);
+        }
         u64::try_from(i128::from(time_ns) + self.video_presentation_offset_ns()?).ok()
     }
 
@@ -589,6 +606,12 @@ pub trait TelemetrySource: Send + Sync {
             })
             .and_then(|index| self.sample_at(index, time_ns, false))
             .filter(|value| value.is_finite());
+        let file_index = self.video_timeline().map_or(file_index, |timeline| {
+            timeline
+                .presentation_at(time_ns)
+                .ok()
+                .map(|position| position.file_index)
+        });
         VideoReference {
             file_index,
             sync_time,
@@ -827,6 +850,9 @@ macro_rules! impl_telemetry_source_for_wrapper {
                 }
                 fn video_files(&self) -> &[crate::VideoFileRef] {
                     (**self).video_files()
+                }
+                fn video_timeline(&self) -> Option<&crate::VideoTimeline> {
+                    (**self).video_timeline()
                 }
                 fn video_presentation_times_ns(&self) -> Option<&[u64]> {
                     (**self).video_presentation_times_ns()

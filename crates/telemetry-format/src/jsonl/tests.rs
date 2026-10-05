@@ -7,6 +7,7 @@ use motorsport_telemetry_core::{
 };
 
 struct TinySource {
+    path: String,
     identity: SourceIdentity,
     extra: MetadataMap,
     clock: Option<AbsoluteTimeRange>,
@@ -18,13 +19,14 @@ struct TinySource {
     videos: Vec<VideoFileRef>,
     video_times: Vec<u64>,
     video_offset_ns: Option<i128>,
+    video_timeline: Option<VideoTimeline>,
     sample_times: Vec<Vec<u64>>,
     spans: Vec<Span>,
 }
 
 impl TelemetrySource for TinySource {
-    fn path(&self) -> &'static str {
-        "tiny"
+    fn path(&self) -> &str {
+        &self.path
     }
     fn format(&self) -> &'static str {
         "pds"
@@ -68,6 +70,9 @@ impl TelemetrySource for TinySource {
     }
     fn video_files(&self) -> &[VideoFileRef] {
         &self.videos
+    }
+    fn video_timeline(&self) -> Option<&VideoTimeline> {
+        self.video_timeline.as_ref()
     }
     fn video_presentation_times_ns(&self) -> Option<&[u64]> {
         (!self.video_times.is_empty()).then_some(self.video_times.as_slice())
@@ -113,6 +118,7 @@ fn channel(name: &str, unit: &str, period_ns: u64, count: u64, t0: u64) -> Chann
 
 fn tiny() -> TinySource {
     TinySource {
+        path: "tiny".into(),
         identity: SourceIdentity {
             driver: "Tobi".into(),
             venue: "Road America".into(),
@@ -130,6 +136,7 @@ fn tiny() -> TinySource {
         videos: Vec::new(),
         video_times: Vec::new(),
         video_offset_ns: None,
+        video_timeline: None,
         sample_times: Vec::new(),
         spans: Vec::new(),
         laps: vec![LapMetadata {
@@ -354,6 +361,137 @@ fn video_linkage_round_trips() {
     );
     assert_eq!(compressed.video_presentation_offset_ns(), Some(101_333_333));
     assert_eq!(compressed.video_frame_at(40_000_000), Some(1));
+}
+
+#[test]
+fn normalized_split_video_clock_survives_full_header_and_native_round_trips() {
+    use motorsport_telemetry_core::{VideoMappingError, VideoSyncPoint, VideoSyncSegment};
+    let mut source = tiny();
+    source.videos = [1, 2]
+        .into_iter()
+        .map(|index| VideoFileRef {
+            filename: format!("run_{index:04}.mp4"),
+            index,
+            blake3: None,
+            frame_count: 0,
+            presentation_offset_ns: None,
+        })
+        .collect();
+    source.video_timeline = Some(
+        VideoTimeline::from_segments(vec![
+            VideoSyncSegment {
+                file_index: 1,
+                points: vec![
+                    VideoSyncPoint {
+                        telemetry_time_ns: 0,
+                        presentation_time_ns: 16_233_000_000,
+                    },
+                    VideoSyncPoint {
+                        telemetry_time_ns: 10_000_000,
+                        presentation_time_ns: 16_266_000_000,
+                    },
+                ],
+            },
+            VideoSyncSegment {
+                file_index: 2,
+                points: vec![
+                    VideoSyncPoint {
+                        telemetry_time_ns: 30_000_000,
+                        presentation_time_ns: 0,
+                    },
+                    VideoSyncPoint {
+                        telemetry_time_ns: 39_000_000,
+                        presentation_time_ns: 33_000_000,
+                    },
+                ],
+            },
+        ])
+        .unwrap(),
+    );
+    let clock = source.video_timeline().unwrap();
+    for compressed in [false, true] {
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        write_jsonl_from_source_with(&source, destination.path(), compressed).unwrap();
+        let opened = JsonlRecording::open(destination.path()).unwrap();
+        let header = JsonlRecording::read_header_metadata(destination.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.video_timeline(), Some(clock));
+        assert_eq!(header.video_timeline.as_ref(), Some(clock));
+        assert_eq!(opened.metadata().video_timeline.as_ref(), Some(clock));
+        assert_eq!(opened.video_reference_at(30_000_000).file_index, Some(2));
+        assert_eq!(
+            opened.video_reference_at(30_000_000).presentation_time_ns,
+            Some(0)
+        );
+        assert_eq!(
+            opened.video_timeline().unwrap().presentation_at(20_000_000),
+            Err(VideoMappingError::Unmapped)
+        );
+        let rewritten = tempfile::NamedTempFile::new().unwrap();
+        write_jsonl_from_source_with(&opened, rewritten.path(), compressed).unwrap();
+        assert_eq!(
+            JsonlRecording::open(rewritten.path())
+                .unwrap()
+                .video_timeline(),
+            Some(clock)
+        );
+    }
+}
+
+#[test]
+fn rejects_invalid_normalized_video_clocks_and_sidecar_clocks() {
+    for mapping in [
+        "[]",
+        "[[0,[[0,0]]]]",
+        "[[2,[[0,0]]]]",
+        "[[1,[]]]",
+        "[[1,[[0,5],[0,6]]]]",
+        "[[1,[[0,5],[10,4]]]]",
+        "[[1,[[0,0],[10,10]]],[1,[[10,0]]]]",
+        "[[1,[[0,-1]]]]",
+        "[[1,[[0,0.5]]]]",
+    ] {
+        let document = format!("{{\"mtj\":1,\"q\":10000000,\"dur\":40000000,\"vf\":[{{\"n\":\"run.mp4\",\"i\":1}}],\"vmap\":{mapping}}}\n{{\"laps\":[]}}\n");
+        assert!(
+            JsonlRecording::from_bytes("bad", document.as_bytes()).is_err(),
+            "{mapping}"
+        );
+    }
+    let document = b"{\"mtx\":1,\"q\":10000000,\"dur\":40000000,\"n\":\"Extra\",\"vis\":true,\"utc\":1,\"tz\":\"UTC\",\"vmap\":[[1,[[0,0]]]]}\n";
+    assert!(JsonlRecording::from_bytes("sidecar", document)
+        .unwrap_err()
+        .to_string()
+        .contains("video belongs to the host"));
+}
+
+#[test]
+fn conversion_does_not_implicitly_hash_linked_video_payloads() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = tiny();
+    source.path = directory
+        .path()
+        .join("run.vbo")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(
+        directory.path().join("run_0001.mp4"),
+        b"video payload is not conversion input",
+    )
+    .unwrap();
+    source.videos = vec![VideoFileRef {
+        filename: "run_0001.mp4".into(),
+        index: 1,
+        blake3: None,
+        frame_count: 0,
+        presentation_offset_ns: None,
+    }];
+    let destination = directory.path().join("cache.telemetry");
+    write_jsonl_from_source(&source, &destination).unwrap();
+    assert_eq!(
+        JsonlRecording::open(&destination).unwrap().video_files()[0].blake3,
+        None
+    );
 }
 
 #[test]
