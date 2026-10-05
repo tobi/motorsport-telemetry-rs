@@ -33,11 +33,16 @@ use thiserror::Error;
 
 mod track_audit;
 mod track_metadata;
+mod video_links;
 pub use motorsport_telemetry_core::{driver_name_for_id, MetadataMap};
 pub use track_audit::{audit_track, TrackAuditOptions, TrackAuditReport, TrackFinding};
 pub use track_metadata::{
     load_track_directory_metadata, load_track_metadata, read_track_metadata_document, OpenOptions,
     TrackMetadataError, TrackMetadataLayers,
+};
+pub use video_links::{
+    find_video_recording, resolve_linked_videos, ResolvedVideoFile, VideoLinkError,
+    VideoRecordingLink,
 };
 
 pub use motorsport_telemetry_core;

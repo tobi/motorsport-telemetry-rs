@@ -11,6 +11,7 @@ readme = "README.md"
 categories = ["parser-implementations", "science"]
 
 [dependencies]
+blake3.workspace = true
 motorsport-telemetry-core.workspace = true
 motorsport-track-atlas.workspace = true
 aim-telemetry.workspace = true
