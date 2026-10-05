@@ -476,8 +476,7 @@ fn write_videos(
             {
                 return Err(invalid(
                     "video timeline index requires one matching video catalog entry",
-                )
-                .into());
+                ));
             }
         }
     }
