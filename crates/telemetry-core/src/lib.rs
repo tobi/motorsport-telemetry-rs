@@ -45,7 +45,7 @@ pub mod validate;
 /// A window over another source: retained channels plus appended mirrors.
 pub mod view;
 
-pub use context::{merge_metadata, MetadataMap};
+pub use context::{driver_name_for_id, merge_metadata, MetadataMap};
 pub use diag::{Diagnostic, Diagnostics, Severity};
 pub use display::{ChannelDisplay, ChannelPlot};
 mod lap_evidence;

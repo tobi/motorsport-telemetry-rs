@@ -33,8 +33,12 @@ use thiserror::Error;
 
 mod track_audit;
 mod track_metadata;
+pub use motorsport_telemetry_core::{driver_name_for_id, MetadataMap};
 pub use track_audit::{audit_track, TrackAuditOptions, TrackAuditReport, TrackFinding};
-pub use track_metadata::{OpenOptions, TrackMetadataError};
+pub use track_metadata::{
+    load_track_directory_metadata, load_track_metadata, read_track_metadata_document, OpenOptions,
+    TrackMetadataError, TrackMetadataLayers,
+};
 
 pub use motorsport_telemetry_core;
 pub use motorsport_track_atlas;
@@ -121,10 +125,7 @@ fn open_with_metadata(
     ensure_supported(path)?;
     let layers = track_metadata::load(path, options)?;
     let source = open_native(path, metadata_only)?;
-    if layers
-        .iter()
-        .all(motorsport_telemetry_core::MetadataMap::is_empty)
-    {
+    if layers.iter().all(MetadataMap::is_empty) {
         return Ok(source);
     }
     let mut view = motorsport_telemetry_core::ViewSource::new(source);

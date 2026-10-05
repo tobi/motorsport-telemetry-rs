@@ -89,26 +89,35 @@ impl FileMetadata {
     /// alternate spellings (`"02.500"`) are accepted like Omatrack. Missing or
     /// invalid codes never pick the wildcard; explicit null names mask it.
     /// This does not relabel the recorded driver-ID channel or its stints.
-    #[allow(
-        clippy::float_cmp,
-        reason = "driver codes are exact identifiers, not measurements"
-    )]
     pub fn driver_name_for_id(&self, driver_id: f64) -> Option<&str> {
-        if !driver_id.is_finite() || driver_id <= 0.0 {
-            return None;
-        }
-        let mappings = field(&self.extra, &["driver", "mappings"])?.as_object()?;
-        // Omatrack canonicalizes sorted mapping keys; the last alias wins.
-        let exact = mappings.iter().rev().find_map(|(key, value)| {
-            let code = key.trim().parse::<f64>().ok()?;
-            (code.is_finite() && code > 0.0 && code == driver_id).then_some(value)
-        });
-        exact
-            .or_else(|| mappings.get("*"))?
-            .as_str()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
+        driver_name_for_id(&self.extra, driver_id)
     }
+}
+
+/// Resolve a positive numeric driver code through a metadata map's mappings.
+///
+/// Exact numeric aliases (including fractional IDs) precede the wildcard;
+/// the last sorted alias wins. Invalid IDs do not use the wildcard. Explicit
+/// nulls and blank exact names mask it. This helper never changes metadata.
+#[allow(
+    clippy::float_cmp,
+    reason = "driver codes are exact identifiers, not measurements"
+)]
+pub fn driver_name_for_id(metadata: &MetadataMap, driver_id: f64) -> Option<&str> {
+    if !driver_id.is_finite() || driver_id <= 0.0 {
+        return None;
+    }
+    let mappings = field(metadata, &["driver", "mappings"])?.as_object()?;
+    // Omatrack canonicalizes sorted mapping keys; the last alias wins.
+    let exact = mappings.iter().rev().find_map(|(key, value)| {
+        let code = key.trim().parse::<f64>().ok()?;
+        (code.is_finite() && code > 0.0 && code == driver_id).then_some(value)
+    });
+    exact
+        .or_else(|| mappings.get("*"))?
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
 }
 
 #[cfg(test)]
@@ -127,5 +136,38 @@ mod tests {
         assert_eq!(base["car"], json!({"number":null,"class":"LMP2"}));
         assert_eq!(base["tags"], json!(["b"]));
         assert_eq!(base["event"], "race");
+    }
+
+    #[test]
+    fn pure_driver_lookup_handles_fractional_aliases_fallbacks_and_masks() {
+        let extra = json!({"driver":{"name":"Not a mapping fallback","mappings":{
+            "02.500":"Alias", "2.5":"Canonical", "3":null, "4":"  ",
+            "5":"  Trimmed  ", "6":42, "7.0":"First", "7.00":"Last", "*":" Guest "
+        }}})
+        .as_object()
+        .unwrap()
+        .clone();
+        for (id, expected) in [
+            (2.5, Some("Canonical")),
+            (3.0, None),
+            (4.0, None),
+            (5.0, Some("Trimmed")),
+            (6.0, None),
+            (7.0, Some("Last")),
+            (8.0, Some("Guest")),
+            (0.0, None),
+            (-1.0, None),
+            (f64::NAN, None),
+            (f64::INFINITY, None),
+        ] {
+            assert_eq!(driver_name_for_id(&extra, id), expected);
+        }
+        for masked in [
+            json!({"driver":null}),
+            json!({"driver":{"mappings":null}}),
+            json!({}),
+        ] {
+            assert_eq!(driver_name_for_id(masked.as_object().unwrap(), 8.0), None);
+        }
     }
 }

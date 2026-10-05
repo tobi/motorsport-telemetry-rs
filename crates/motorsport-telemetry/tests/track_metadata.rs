@@ -9,9 +9,10 @@
 )]
 
 use motorsport_telemetry::{
+    load_track_directory_metadata, load_track_metadata,
     motorsport_telemetry_core::{MetadataMap, TelemetrySource, ViewSource},
     open, open_metadata, open_metadata_with_options, open_with_options, read_metadata,
-    read_metadata_with_options, OpenOptions, SourceExt,
+    read_metadata_with_options, read_track_metadata_document, OpenOptions, SourceExt,
 };
 use serde_json::json;
 use std::{
@@ -413,4 +414,291 @@ fn symlinks_cannot_escape_an_explicit_root() {
             .event,
         "Inside"
     );
+}
+
+#[test]
+fn public_recording_resolver_supports_empty_and_non_vendor_files_without_decoding() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = temp.path().join("run");
+    yaml(temp.path(), "outside: do not inherit\n");
+    yaml(
+        &folder,
+        "event: Video\noverrides:\n  - match: '*.MOV'\n    metadata: {session: MOV session}\n",
+    );
+    for name in ["clip.MOV", "clip.mkv", "remote.mp4", "arbitrary.bin"] {
+        let path = folder.join(name);
+        fs::write(&path, []).unwrap();
+        let resolved = load_track_metadata(&path, &OpenOptions::default()).unwrap();
+        assert_eq!(resolved.paths, vec![folder.join("TRACK.yml")]);
+        let mut extra = MetadataMap::new();
+        resolved.apply_to(&mut extra);
+        assert_eq!(extra["event"], "Video");
+        assert!(!extra.contains_key("outside"));
+        assert_eq!(
+            extra.get("session").and_then(serde_json::Value::as_str),
+            (name == "clip.MOV").then_some("MOV session")
+        );
+        assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn public_layers_preserve_null_masks_rule_order_and_contributing_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("collection");
+    let folder = root.join("event/run");
+    let path = recording(&folder);
+    yaml(temp.path(), "outside: excluded\n");
+    yaml(&root, "schema: '2'\ncustom: null\noverrides:\n  - match: '**/*.mp4'\n    metadata: {event: First}\n  - match: '**'\n    metadata: {event: Last}\n");
+    yaml(&folder, "custom: {new: true}\n");
+    let resolved = load_track_metadata(&path, &rooted(&root)).unwrap();
+    assert_eq!(
+        resolved.paths,
+        vec![root.join("TRACK.yml"), folder.join("TRACK.yml")]
+    );
+    assert_eq!(resolved.layers.len(), 4);
+    assert!(resolved.layers[0]["custom"].is_null());
+    let mut embedded = json!({"custom":{"old":true},"embedded":true})
+        .as_object()
+        .unwrap()
+        .clone();
+    resolved.apply_to(&mut embedded);
+    assert_eq!(
+        embedded,
+        json!({"custom":{"new":true},"embedded":true,"event":"Last"})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert_eq!(
+        open_with_options(&path, &rooted(&root))
+            .unwrap()
+            .metadata()
+            .extra,
+        {
+            let mut empty = MetadataMap::new();
+            resolved.apply_to(&mut empty);
+            empty
+        }
+    );
+}
+
+#[test]
+fn directory_resolution_reads_only_defaults_and_can_exclude_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("collection");
+    let child = root.join("event/run");
+    yaml(temp.path(), "outside: forbidden\n");
+    yaml(&root, "event: Ancestor\ncustom: null\noverrides:\n  - match: '**'\n    metadata: {event: Must not apply, rule_only: true}\n");
+    yaml(&child, "event: Child\ncustom: {new: true}\n");
+    let all = load_track_directory_metadata(&child, &rooted(&root), false).unwrap();
+    assert_eq!(all.layers.len(), 2);
+    assert_eq!(
+        all.paths,
+        vec![root.join("TRACK.yml"), child.join("TRACK.yml")]
+    );
+    let mut extra = json!({"custom":{"old":true}}).as_object().unwrap().clone();
+    all.apply_to(&mut extra);
+    assert_eq!(
+        extra,
+        json!({"event":"Child","custom":{"new":true}})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    let inherited = load_track_directory_metadata(&child, &rooted(&root), true).unwrap();
+    assert_eq!(inherited.paths, vec![root.join("TRACK.yml")]);
+    assert_eq!(
+        inherited.layers,
+        vec![json!({"event":"Ancestor","custom":null})
+            .as_object()
+            .unwrap()
+            .clone()]
+    );
+    assert!(
+        load_track_directory_metadata(&child, &OpenOptions::default(), true)
+            .unwrap()
+            .layers
+            .is_empty()
+    );
+    assert!(load_track_directory_metadata(&root, &rooted(&root), true)
+        .unwrap()
+        .paths
+        .is_empty());
+    // Exclusion does not read the document being edited, but inherited files
+    // still use the exact same validation policy as recording resolution.
+    yaml(&child, "event: [\n");
+    assert!(load_track_directory_metadata(&child, &rooted(&root), true).is_ok());
+    assert!(load_track_directory_metadata(&child, &rooted(&root), false).is_err());
+}
+
+#[test]
+fn raw_document_reader_preserves_editor_data_and_never_reads_ancestors() {
+    let temp = tempfile::tempdir().unwrap();
+    let child = temp.path().join("child");
+    yaml(temp.path(), "invalid: [\n");
+    let text = "schema: '2'\ncustom: {items: [one, 2, null], flag: true}\noverrides:\n  - match: ['*.MOV', '**/*.mkv']\n    metadata: {schema: legacy, driver: {mappings: {'2.5': Tobi, '*': Guest}}, unknown: [1, false]}\n";
+    yaml(&child, text);
+    let path = child.join("TRACK.yml");
+    let document = read_track_metadata_document(&path, Some(temp.path())).unwrap();
+    assert_eq!(document["schema"], "2");
+    assert_eq!(
+        document["custom"],
+        json!({"items":["one",2,null],"flag":true})
+    );
+    assert_eq!(document["overrides"][0]["metadata"]["schema"], "legacy");
+    assert_eq!(
+        document["overrides"][0]["match"],
+        json!(["*.MOV", "**/*.mkv"])
+    );
+    assert_eq!(
+        document["overrides"][0]["metadata"]["unknown"],
+        json!([1, false])
+    );
+    assert_eq!(read_track_metadata_document(&path, None).unwrap(), document);
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    yaml(&child, "");
+    assert!(read_track_metadata_document(&path, None)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn public_resolvers_validate_all_rules_even_without_a_recording_match() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("clip.MOV");
+    fs::write(&path, []).unwrap();
+    for text in [
+        "overrides: [{match: '*.vbo', metadata: {driver: []}}]",
+        "overrides: [{match: ['*.MOV', '../*'], metadata: {}}]",
+        "overrides: [{match: '[', metadata: {}}]",
+        "overrides: [{match: '*.vbo', metadata: {overrides: []}}]",
+        "overrides: [{match: '*.vbo', metadata: {}, unknown_rule_key: true}]",
+    ] {
+        yaml(temp.path(), text);
+        for error in [
+            load_track_metadata(&path, &OpenOptions::default()).unwrap_err(),
+            load_track_directory_metadata(temp.path(), &OpenOptions::default(), false).unwrap_err(),
+            read_track_metadata_document(temp.path().join("TRACK.yml"), None).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("TRACK.yml"));
+        }
+    }
+}
+
+#[test]
+fn public_document_reader_enforces_shared_yaml_budgets_and_single_document_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("TRACK.yml");
+    for text in [
+        format!("value: {}", "x".repeat(1048576)),
+        format!("value: {}0{}", "[".repeat(70), "]".repeat(70)),
+        format!(
+            "v: &v {}\nrefs: [{}]",
+            "x".repeat(32768),
+            vec!["*v"; 256].join(",")
+        ),
+        format!(
+            "v: &v [1,2,3,4,5,6,7,8]\nrefs: [{}]",
+            vec!["*v"; 10000].join(",")
+        ),
+        "event: First\n---\nevent: Second".into(),
+        "custom: !tag value".into(),
+        "custom: .inf".into(),
+        "event: duplicate\nevent: duplicate".into(),
+        "- not a mapping".into(),
+    ] {
+        fs::write(&path, text).unwrap();
+        assert!(read_track_metadata_document(&path, None).is_err());
+        assert!(
+            load_track_directory_metadata(temp.path(), &OpenOptions::default(), false).is_err()
+        );
+    }
+}
+
+#[test]
+fn public_resolvers_report_explicit_target_and_root_errors_including_opt_out() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("clip.MOV");
+    fs::write(&file, []).unwrap();
+    let sibling = temp.path().join("sibling");
+    fs::create_dir(&sibling).unwrap();
+    for ignore_track_yml in [false, true] {
+        for root in [&sibling, &file, &temp.path().join("missing")] {
+            let options = OpenOptions {
+                root_path: Some(root.clone()),
+                ignore_track_yml,
+            };
+            assert!(load_track_metadata(&file, &options).is_err());
+            assert!(load_track_directory_metadata(temp.path(), &options, true).is_err());
+        }
+        let options = OpenOptions {
+            ignore_track_yml,
+            ..OpenOptions::default()
+        };
+        assert!(load_track_metadata(temp.path(), &options).is_err());
+        assert!(load_track_directory_metadata(&file, &options, false).is_err());
+        assert!(load_track_metadata(temp.path().join("missing"), &options).is_err());
+        assert!(
+            load_track_directory_metadata(temp.path().join("missing"), &options, true).is_err()
+        );
+    }
+    assert!(read_track_metadata_document(&file, Some(&sibling)).is_err());
+    assert!(read_track_metadata_document(&file, Some(&file)).is_err());
+    assert!(read_track_metadata_document(temp.path(), None).is_err());
+    assert!(read_track_metadata_document(temp.path().join("missing"), None).is_err());
+    yaml(temp.path(), "invalid: [");
+    assert!(load_track_metadata(&file, &ignored())
+        .unwrap()
+        .paths
+        .is_empty());
+    assert!(
+        load_track_directory_metadata(temp.path(), &ignored(), false)
+            .unwrap()
+            .layers
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn public_resolvers_enforce_canonical_roots_and_metadata_symlink_boundaries() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("collection");
+    let child = root.join("child");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&child).unwrap();
+    yaml(&outside, "event: Outside");
+    let file = child.join("clip.MOV");
+    fs::write(&file, []).unwrap();
+    symlink(outside.join("TRACK.yml"), child.join("TRACK.yml")).unwrap();
+    assert!(load_track_metadata(&file, &rooted(&root)).is_err());
+    assert!(load_track_directory_metadata(&child, &rooted(&root), false).is_err());
+    assert!(read_track_metadata_document(child.join("TRACK.yml"), Some(&root)).is_err());
+    assert!(read_track_metadata_document(child.join("TRACK.yml"), None).is_err());
+    fs::remove_file(child.join("TRACK.yml")).unwrap();
+    yaml(&root, "event: Inside");
+    symlink(root.join("TRACK.yml"), child.join("TRACK.yml")).unwrap();
+    let resolved = load_track_metadata(&file, &rooted(&root)).unwrap();
+    assert_eq!(
+        resolved.paths,
+        vec![root.join("TRACK.yml"), child.join("TRACK.yml")]
+    );
+    assert_eq!(
+        read_track_metadata_document(child.join("TRACK.yml"), Some(&root)).unwrap()["event"],
+        "Inside"
+    );
+    assert!(read_track_metadata_document(child.join("TRACK.yml"), None).is_err());
+    let alias = temp.path().join("root-alias");
+    symlink(&root, &alias).unwrap();
+    assert_eq!(
+        load_track_metadata(alias.join("child/clip.MOV"), &rooted(&alias)).unwrap(),
+        resolved
+    );
+    symlink(&outside, root.join("escape")).unwrap();
+    assert!(load_track_directory_metadata(root.join("escape"), &rooted(&root), false).is_err());
+    fs::write(outside.join("stub.MKV"), []).unwrap();
+    symlink(outside.join("stub.MKV"), child.join("escape.MKV")).unwrap();
+    assert!(load_track_metadata(child.join("escape.MKV"), &rooted(&root)).is_err());
 }
