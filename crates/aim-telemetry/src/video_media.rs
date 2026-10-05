@@ -340,6 +340,20 @@ pub fn inspect_mp4_media(path: impl AsRef<Path>) -> Result<VideoMediaMetadata, A
     inspect_reader(&mut file, byte_size, &name)
 }
 
+/// Inspect a caller-owned seekable MP4 byte source with the same bounded policy.
+///
+/// `byte_size` is the independently known source extent. An HTTP Range adapter
+/// can implement `Read + Seek`; this function issues absolute seeks and reads
+/// only metadata/header ranges, without downloading media or falling back to a
+/// full read. Transport failures propagate as `AimError::Io`. Diagnostics use
+/// the name `<MP4 reader>`; timing/limits/fingerprint match the local inspector.
+pub fn inspect_mp4_media_reader(
+    reader: &mut (impl Read + Seek),
+    byte_size: u64,
+) -> Result<VideoMediaMetadata, AimError> {
+    inspect_reader(reader, byte_size, "<MP4 reader>")
+}
+
 fn inspect_reader(
     file: &mut (impl Read + Seek),
     byte_size: u64,

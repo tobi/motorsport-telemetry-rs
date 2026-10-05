@@ -51,7 +51,9 @@ use thiserror::Error;
 #[cfg(not(target_os = "emscripten"))]
 mod video_media;
 #[cfg(not(target_os = "emscripten"))]
-pub use video_media::{inspect_mp4_media, VideoMediaMetadata, VideoStreamMetadata};
+pub use video_media::{
+    inspect_mp4_media, inspect_mp4_media_reader, VideoMediaMetadata, VideoStreamMetadata,
+};
 
 const AIMD: &[u8; 4] = b"aimd";
 const RECORD_START: &[u8; 2] = b"(S";

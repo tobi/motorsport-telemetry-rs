@@ -193,7 +193,7 @@ fn large_payload_is_never_read_and_metadata_limits_fail_before_reading() {
         moov,
         moov_at,
     };
-    let metadata = inspect_reader(&mut sparse, size, "sparse.mp4").unwrap();
+    let metadata = inspect_mp4_media_reader(&mut sparse, size).unwrap();
     assert_eq!(metadata.byte_size, size);
     assert_eq!(metadata.video_streams[0].presentation_end_ns, 160_000_000);
 
@@ -205,6 +205,28 @@ fn large_payload_is_never_read_and_metadata_limits_fail_before_reading() {
         moov_at: MAX_MOOV + 1,
     };
     assert!(inspect_reader(&mut oversized, MAX_MOOV + 1, "oversized.mp4").is_err());
+}
+
+#[test]
+fn caller_owned_range_read_failures_propagate_without_full_read_fallback() {
+    struct Unavailable;
+    impl Read for Unavailable {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "HTTP Range unavailable",
+            ))
+        }
+    }
+    impl Seek for Unavailable {
+        fn seek(&mut self, _position: SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+    assert!(matches!(
+        inspect_mp4_media_reader(&mut Unavailable, 100),
+        Err(AimError::Io { .. })
+    ));
 }
 
 #[test]

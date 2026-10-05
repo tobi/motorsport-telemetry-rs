@@ -38,6 +38,33 @@ duplicate comparison. These are discovery APIs, not content authentication:
 matching a basename does not establish playable extent or media identity.
 Consumers must independently validate the chosen media and native timeline.
 
+## Discovery from cached native catalogs
+
+`VideoRecordingCatalog { recording_path, metadata_path, videos }` lets remote
+consumers supply already-loaded native metadata while original VBOs remain
+zero-byte mirror stubs. `find_video_recording_in_catalogs(video_path, catalogs,
+root_path)` performs the same exact-stem / case-insensitive-extension match and
+returns the original canonical `recording_path` and source index. It does not
+read original recording rows, infer from renamed stems or fetch anything.
+The caller supplies the candidate set and must obtain each catalog's `videos`
+from its associated converted object; this function validates paths and catalog
+names/indices, without parsing those objects again.
+
+The canonical collection root applies to videos and original recording paths.
+Native objects must be existing nonempty regular files but may live outside
+that root in a shared cache. Multiple matching candidates select deterministically
+only if their source indices agree and they share one canonical native object
+or have byte-identical native objects. Different native contents or conflicting
+source indices are explicit ambiguity. Original zero-byte stub equality never
+establishes duplicate identity. Native-byte equality proves identical converted
+recordings, not original source bytes or media payloads. Catalog objects must
+actually be converted recordings; never supply a video as `metadata_path`.
+
+Each call accepts at most 4096 catalogs and 4096 total video references. Distinct
+native objects use the same 128 MiB/object / 512 MiB total comparison budget.
+Sharing one canonical native object needs no hash. Zero/no-video source indices
+and duplicate indices are rejected by both catalog selection and resolution.
+
 ## Bounded MP4 media inspection
 
 `inspect_video_media(path, root_path)` uses the same canonical target/root
@@ -65,3 +92,14 @@ It deliberately ignores video payloads: equal-size files with identical
 headers and different video content have the same fingerprint. It is not
 content authentication or a substitute for a supplied whole-file digest.
 Existing AiM clocks and frame-table readers are unchanged.
+
+Range-capable consumers can call
+`aim_telemetry::inspect_mp4_media_reader(&mut reader, byte_size)` with a caller-
+owned `Read + Seek` adapter. The source size must be independently known. The
+same upstream inspector chooses all reads/seeks and applies the same bounds;
+it does not implement a separate remote box walker. It propagates transport
+failures and never falls back to downloading the whole source. Read-at/Range
+adapters remain responsible for their transport and source consistency.
+The facade also exports `inspect_video_media_reader` with the same parameters
+and the facade's `VideoMediaError` return type, so callers need no reader-crate
+dependency.

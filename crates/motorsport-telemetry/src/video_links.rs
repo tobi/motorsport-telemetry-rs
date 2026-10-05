@@ -21,6 +21,18 @@ pub struct VideoRecordingLink {
     pub file_index: u32,
 }
 
+/// An existing recording (possibly a remote stub) with its cached native catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoRecordingCatalog {
+    /// Original recording identity returned by discovery, within collection root.
+    pub recording_path: PathBuf,
+    /// Existing converted native object used only for duplicate comparison.
+    /// May reside outside the collection root in a shared cache.
+    pub metadata_path: PathBuf,
+    /// Source-declared references from that converted object's native metadata.
+    pub videos: Vec<VideoFileRef>,
+}
+
 /// An existing file matched to one source video reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedVideoFile {
@@ -63,6 +75,9 @@ pub enum VideoLinkError {
     /// Source indices must uniquely identify catalog entries.
     #[error("duplicate source video index {0}")]
     DuplicateVideoIndex(u32),
+    /// Zero is the native no-video sentinel, not a linked roll index.
+    #[error("invalid source video index {0}; expected a positive index")]
+    InvalidVideoIndex(u32),
     /// A declared video is absent from both supported neighboring directories.
     #[error("missing linked video {filename} (source index {file_index})")]
     MissingVideo {
@@ -242,7 +257,7 @@ fn duplicate_hash(path: &Path) -> Result<[u8; 32], VideoLinkError> {
         }
         consumed += count as u64;
         if consumed > MAX_DUPLICATE_BYTES {
-            return Err(limit(path, "duplicate VBO exceeds 128 MiB"));
+            return Err(limit(path, "duplicate recording exceeds 128 MiB"));
         }
         hasher.update(&buffer[..count]);
     }
@@ -363,6 +378,9 @@ pub fn resolve_linked_videos(
     let mut indices = BTreeSet::new();
     for video in videos {
         safe_basename(&video.filename)?;
+        if video.index == 0 {
+            return Err(VideoLinkError::InvalidVideoIndex(video.index));
+        }
         if !indices.insert(video.index) {
             return Err(VideoLinkError::DuplicateVideoIndex(video.index));
         }
@@ -392,15 +410,7 @@ pub fn resolve_linked_videos(
         let declared = Path::new(&video.filename);
         let mut matches = BTreeSet::new();
         for path in &paths {
-            if path.file_stem() == declared.file_stem()
-                && (path.extension().is_none() && declared.extension().is_none()
-                    || path
-                        .extension()
-                        .and_then(|value| value.to_str())
-                        .zip(declared.extension().and_then(|value| value.to_str()))
-                        .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected)))
-                && !path.is_dir()
-            {
+            if basename_matches(path, declared) && !path.is_dir() {
                 matches.insert(canonical_file(path, Some(boundary))?);
             }
         }
@@ -427,4 +437,133 @@ pub fn resolve_linked_videos(
         }
     }
     Ok(result)
+}
+
+/// Match a video to caller-supplied native catalogs without opening source rows.
+///
+/// Catalogs must come from their associated converted objects; the library does
+/// not fetch or decode them. Existing video/recording targets (including stubs)
+/// obey canonical collection-root checks. Native metadata paths must be regular
+/// files and may live in an external cache. Every supplied basename and source
+/// index is validated. Stems match exactly; extensions are ASCII case insensitive.
+///
+/// Multiple matches choose lexical canonical recording order only when they
+/// share a source index and one canonical metadata object or byte-identical
+/// native objects. Native-byte equality establishes identical *converted*
+/// recordings, never original source-byte or video-payload identity. Nonidentical
+/// matches are explicit ambiguity. Comparisons are bounded to 128 MiB/object and
+/// 512 MiB total, and at most 4096 catalogs/references are accepted per call.
+pub fn find_video_recording_in_catalogs(
+    video_path: impl AsRef<Path>,
+    catalogs: &[VideoRecordingCatalog],
+    root_path: Option<&Path>,
+) -> Result<Option<VideoRecordingLink>, VideoLinkError> {
+    let root = root(root_path)?;
+    let video = canonical_file(video_path.as_ref(), root.as_deref())?;
+    if catalogs.len() > MAX_ENTRIES {
+        return Err(limit(&video, "more than 4096 recording catalogs"));
+    }
+    let mut remaining = MAX_ENTRIES;
+    let mut candidates = Vec::new();
+    for catalog in catalogs {
+        remaining = remaining
+            .checked_sub(catalog.videos.len())
+            .ok_or_else(|| limit(&video, "more than 4096 catalog video references"))?;
+        let recording = canonical_file(&catalog.recording_path, root.as_deref())?;
+        let native = canonical_file(&catalog.metadata_path, None)?;
+        if fs::metadata(&native)
+            .map_err(|error| io(&native, error))?
+            .len()
+            == 0
+        {
+            return Err(invalid(&native, "native cache object must not be empty"));
+        }
+        let mut indices = BTreeSet::new();
+        for reference in &catalog.videos {
+            safe_basename(&reference.filename)?;
+            if reference.index == 0 {
+                return Err(VideoLinkError::InvalidVideoIndex(reference.index));
+            }
+            if !indices.insert(reference.index) {
+                return Err(VideoLinkError::DuplicateVideoIndex(reference.index));
+            }
+            if basename_matches(&video, Path::new(&reference.filename)) {
+                candidates.push((
+                    VideoRecordingLink {
+                        recording_path: recording.clone(),
+                        file_index: reference.index,
+                    },
+                    native.clone(),
+                ));
+            }
+        }
+    }
+    candidates.sort_by(|(left, left_native), (right, right_native)| {
+        left.recording_path
+            .cmp(&right.recording_path)
+            .then(left.file_index.cmp(&right.file_index))
+            .then(left_native.cmp(right_native))
+    });
+    candidates.dedup();
+    let Some((first, _)) = candidates.first() else {
+        return Ok(None);
+    };
+    if candidates.len() == 1 {
+        return Ok(Some(first.clone()));
+    }
+    let ambiguous = || VideoLinkError::AmbiguousRecording {
+        video_path: video.clone(),
+        candidates: candidates
+            .iter()
+            .map(|(link, _)| link.recording_path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    };
+    if candidates
+        .iter()
+        .any(|(link, _)| link.file_index != first.file_index)
+    {
+        return Err(ambiguous());
+    }
+    let identities = candidates
+        .iter()
+        .map(|(_, native)| native.clone())
+        .collect::<BTreeSet<_>>();
+    if identities.len() == 1 {
+        return Ok(Some(first.clone()));
+    }
+    let mut total = 0u64;
+    let mut expected = None;
+    for path in identities {
+        let size = fs::metadata(&path).map_err(|error| io(&path, error))?.len();
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| limit(&video, "native comparison size overflow"))?;
+        if size > MAX_DUPLICATE_BYTES || total > MAX_DUPLICATE_TOTAL_BYTES {
+            return Err(limit(
+                &path,
+                "native duplicate comparison exceeds telemetry byte budget",
+            ));
+        }
+        let identity = (size, duplicate_hash(&path)?);
+        if expected
+            .as_ref()
+            .is_some_and(|previous| *previous != identity)
+        {
+            return Err(ambiguous());
+        }
+        expected = Some(identity);
+    }
+    Ok(Some(first.clone()))
+}
+
+fn basename_matches(actual: &Path, declared: &Path) -> bool {
+    actual.file_stem() == declared.file_stem()
+        && (actual.extension().is_none() && declared.extension().is_none()
+            || actual
+                .extension()
+                .and_then(|value| value.to_str())
+                .zip(declared.extension().and_then(|value| value.to_str()))
+                .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected)))
 }

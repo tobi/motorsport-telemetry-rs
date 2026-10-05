@@ -43,12 +43,13 @@ pub use track_metadata::{
     TrackMetadataError, TrackMetadataLayers,
 };
 pub use video_links::{
-    find_video_recording, resolve_linked_videos, ResolvedVideoFile, VideoLinkError,
-    VideoRecordingLink,
+    find_video_recording, find_video_recording_in_catalogs, resolve_linked_videos,
+    ResolvedVideoFile, VideoLinkError, VideoRecordingCatalog, VideoRecordingLink,
 };
 #[cfg(not(target_os = "emscripten"))]
 pub use video_media::{
-    inspect_video_media, VideoMediaError, VideoMediaMetadata, VideoStreamMetadata,
+    inspect_video_media, inspect_video_media_reader, VideoMediaError, VideoMediaMetadata,
+    VideoStreamMetadata,
 };
 
 pub use motorsport_telemetry_core;

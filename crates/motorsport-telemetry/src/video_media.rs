@@ -2,6 +2,7 @@
 
 use crate::video_links::{canonical_file, root};
 use crate::VideoLinkError;
+use std::io::{Read, Seek};
 use std::path::Path;
 use thiserror::Error;
 
@@ -32,4 +33,16 @@ pub fn inspect_video_media(
     let root = root(root_path)?;
     let path = canonical_file(path.as_ref(), root.as_deref())?;
     Ok(aim_telemetry::inspect_mp4_media(path)?)
+}
+
+/// Inspect caller-owned seekable media, including an HTTP Range adapter.
+///
+/// Source size must be independently known. Uses the same bounded MP4 metadata
+/// policy as local inspection. Transport failures propagate; video payloads are
+/// skipped and there is no whole-source download fallback or path traversal.
+pub fn inspect_video_media_reader(
+    reader: &mut (impl Read + Seek),
+    byte_size: u64,
+) -> Result<VideoMediaMetadata, VideoMediaError> {
+    Ok(aim_telemetry::inspect_mp4_media_reader(reader, byte_size)?)
 }
