@@ -34,6 +34,8 @@ use thiserror::Error;
 mod track_audit;
 mod track_metadata;
 mod video_links;
+#[cfg(not(target_os = "emscripten"))]
+mod video_media;
 pub use motorsport_telemetry_core::{driver_name_for_id, MetadataMap};
 pub use track_audit::{audit_track, TrackAuditOptions, TrackAuditReport, TrackFinding};
 pub use track_metadata::{
@@ -43,6 +45,10 @@ pub use track_metadata::{
 pub use video_links::{
     find_video_recording, resolve_linked_videos, ResolvedVideoFile, VideoLinkError,
     VideoRecordingLink,
+};
+#[cfg(not(target_os = "emscripten"))]
+pub use video_media::{
+    inspect_video_media, VideoMediaError, VideoMediaMetadata, VideoStreamMetadata,
 };
 
 pub use motorsport_telemetry_core;
