@@ -466,6 +466,21 @@ fn write_videos(
         write!(writer, ",\"vo\":{offset}")?;
     }
     let videos = linked_videos(source);
+    if let Some(timeline) = source.video_timeline() {
+        for segment in timeline.segments() {
+            if videos
+                .iter()
+                .filter(|video| video.index == segment.file_index)
+                .count()
+                != 1
+            {
+                return Err(invalid(
+                    "video timeline index requires one matching video catalog entry",
+                )
+                .into());
+            }
+        }
+    }
     if videos.is_empty() {
         return Ok(());
     }

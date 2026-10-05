@@ -4,6 +4,7 @@ use super::*;
 use motorsport_telemetry_core::{
     Channel, ChannelPlot, Chunk, LapKind, LapMetadata, SampleTimes, SampleType, SourceIdentity,
     SourceLapMetadata, Span, SpanMetaValue, SpanPrimary, TelemetrySource, UnitSource, VideoFileRef,
+    VideoSyncPoint, VideoSyncSegment,
 };
 
 struct TinySource {
@@ -463,6 +464,33 @@ fn rejects_invalid_normalized_video_clocks_and_sidecar_clocks() {
         .unwrap_err()
         .to_string()
         .contains("video belongs to the host"));
+}
+
+#[test]
+fn writer_rejects_missing_and_duplicate_timeline_catalog_entries() {
+    let mut source = tiny();
+    source.video_timeline = Some(
+        VideoTimeline::from_segments(vec![VideoSyncSegment {
+            file_index: 1,
+            points: vec![VideoSyncPoint {
+                telemetry_time_ns: 0,
+                presentation_time_ns: 0,
+            }],
+        }])
+        .unwrap(),
+    );
+    let reference = |index| VideoFileRef {
+        filename: format!("run_{index:04}.mp4"),
+        index,
+        blake3: None,
+        frame_count: 0,
+        presentation_offset_ns: None,
+    };
+    for videos in [vec![], vec![reference(2)], vec![reference(1), reference(1)]] {
+        source.videos = videos;
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        assert!(write_jsonl_from_source(&source, destination.path()).is_err());
+    }
 }
 
 #[test]

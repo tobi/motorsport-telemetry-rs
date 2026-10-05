@@ -911,6 +911,7 @@ fn video_timeline(
         .position(|name| names::eq(name, "avitime") || names::eq(name, "avisynctime"))?;
     let mut segments = Vec::<VideoSyncSegment>::new();
     let mut current = None::<VideoSyncSegment>;
+    let mut previous_observation = None;
     let finish = |current: &mut Option<VideoSyncSegment>, segments: &mut Vec<VideoSyncSegment>| {
         if let Some(segment) = current.take() {
             segments.push(segment);
@@ -928,27 +929,24 @@ fn video_timeline(
             .copied()
             .and_then(native_integer)
             .and_then(|milliseconds| milliseconds.checked_mul(1_000_000));
-        let (Some(index), Some(presentation)) = (index, presentation) else {
-            finish(&mut current, &mut segments);
-            continue;
-        };
-        // Broken telemetry timestamps must not make an overlapping segment.
-        let last_segment = current.as_ref().or_else(|| segments.last());
-        if let Some((segment, last)) =
-            last_segment.and_then(|segment| segment.points.last().map(|point| (segment, point)))
-        {
-            if time == last.telemetry_time_ns
-                && index == segment.file_index
-                && presentation == last.presentation_time_ns
-            {
-                continue; // duplicate native observation, raw samples stay intact
+        let observation = index.zip(presentation);
+        // Invalid/no-video rows are evidence too: at the same telemetry
+        // instant they contradict a valid sync observation in either order.
+        if let Some((last_time, last_observation)) = previous_observation {
+            if time == last_time && observation == last_observation {
+                continue; // exact clock duplicate; preserve every raw row
             }
-            if time <= last.telemetry_time_ns {
+            if time <= last_time {
                 diagnostics.push(Diagnostic::warning("vbo.video_clock_conflict",
                     "conflicting or reversed telemetry-time video observations; synchronization disabled"));
                 return None;
             }
         }
+        previous_observation = Some((time, observation));
+        let (Some(index), Some(presentation)) = (index, presentation) else {
+            finish(&mut current, &mut segments);
+            continue;
+        };
         let split = current.as_ref().is_some_and(|segment| {
             segment.file_index != index
                 || segment.points.last().is_some_and(|last| {
@@ -1117,6 +1115,23 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "vbo.video_clock_conflict"));
+    }
+
+    #[test]
+    fn invalid_duplicate_clock_rows_conflict_in_both_orders() {
+        for rows in [
+            "120000.000 0.040 1 10\n120000.000 0.040 0 0\n120000.040 0.040 1 50\n",
+            "120000.000 0.040 0 0\n120000.000 0.040 1 10\n120000.040 0.040 1 50\n",
+            "120000.000 0.040 1 10\n120000.000 0.040 1 -1\n120000.040 0.040 1 50\n",
+        ] {
+            let file = clock_fixture(rows);
+            assert_eq!(file.channels[0].sample_count, 3);
+            assert!(file.video_timeline().is_none());
+            assert!(file
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "vbo.video_clock_conflict"));
+        }
     }
 
     fn fixture(contents: &str) -> tempfile::NamedTempFile {

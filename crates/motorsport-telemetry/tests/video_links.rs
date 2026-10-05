@@ -95,10 +95,12 @@ fn byte_identical_telemetry_copies_choose_lexical_canonical_path() {
 #[test]
 fn missing_video_is_explicit_and_source_indices_and_catalog_order_survive() {
     let temp = tempfile::tempdir().unwrap();
-    let recording = temp.path().join("source.telemetry");
+    let folder = temp.path().join("session");
+    fs::create_dir(&folder).unwrap();
+    let recording = folder.join("source.telemetry");
     fs::write(&recording, []).unwrap();
     for name in ["run_0001.mp4", "run_0002.mp4"] {
-        fs::write(temp.path().join(name), []).unwrap();
+        fs::write(folder.join(name), []).unwrap();
     }
     let videos = [reference("run_0002.mp4", 2), reference("run_0001.mp4", 1)];
     let resolved = resolve_linked_videos(&recording, &videos, Some(temp.path())).unwrap();
@@ -109,10 +111,14 @@ fn missing_video_is_explicit_and_source_indices_and_catalog_order_survive() {
             .collect::<Vec<_>>(),
         [2, 1]
     );
-    assert!(matches!(
-        resolve_linked_videos(&recording, &[reference("missing.mp4", 9)], None),
-        Err(VideoLinkError::MissingVideo { file_index: 9, .. })
-    ));
+    let missing = resolve_linked_videos(&recording, &[reference("missing.mp4", 9)], None);
+    assert!(
+        matches!(
+            missing,
+            Err(VideoLinkError::MissingVideo { file_index: 9, .. })
+        ),
+        "{missing:?}"
+    );
 }
 
 #[test]
