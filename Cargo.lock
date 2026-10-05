@@ -561,6 +561,7 @@ dependencies = [
  "cosworth-telemetry",
  "motec-telemetry",
  "motorsport-telemetry-core",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

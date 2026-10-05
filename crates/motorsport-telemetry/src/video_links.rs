@@ -448,11 +448,13 @@ pub fn resolve_linked_videos(
 /// index is validated. Stems match exactly; extensions are ASCII case insensitive.
 ///
 /// Multiple matches choose lexical canonical recording order only when they
-/// share a source index and one canonical metadata object or byte-identical
-/// native objects. Native-byte equality establishes identical *converted*
-/// recordings, never original source-byte or video-payload identity. Nonidentical
-/// matches are explicit ambiguity. Comparisons are bounded to 128 MiB/object and
-/// 512 MiB total, and at most 4096 catalogs/references are accepted per call.
+/// share a source index and one canonical metadata object, byte-identical native
+/// objects, or native content differing only in root `srcp` origin provenance.
+/// All other header values and decoded body bytes must agree exactly. This is
+/// converted-native identity, never source-byte or video-payload identity.
+/// Unprovable/different content is explicit ambiguity. Comparisons are bounded
+/// to 128 MiB/object and 512 MiB of candidate input, plus one shared 512 MiB
+/// decoded fallback budget; at most 4096 catalogs/references are accepted.
 pub fn find_video_recording_in_catalogs(
     video_path: impl AsRef<Path>,
     catalogs: &[VideoRecordingCatalog],
@@ -535,27 +537,59 @@ pub fn find_video_recording_in_catalogs(
     }
     let mut total = 0u64;
     let mut expected = None;
-    for path in identities {
-        let size = fs::metadata(&path).map_err(|error| io(&path, error))?.len();
+    let mut identical_bytes = true;
+    for path in &identities {
+        let size = fs::metadata(path).map_err(|error| io(path, error))?.len();
         total = total
             .checked_add(size)
             .ok_or_else(|| limit(&video, "native comparison size overflow"))?;
         if size > MAX_DUPLICATE_BYTES || total > MAX_DUPLICATE_TOTAL_BYTES {
             return Err(limit(
-                &path,
+                path,
                 "native duplicate comparison exceeds telemetry byte budget",
             ));
         }
-        let identity = (size, duplicate_hash(&path)?);
+        let identity = (size, duplicate_hash(path)?);
         if expected
             .as_ref()
             .is_some_and(|previous| *previous != identity)
         {
-            return Err(ambiguous());
+            identical_bytes = false;
         }
         expected = Some(identity);
     }
+    if !identical_bytes && !matching_native_contents(&identities, 512 * 1024 * 1024)? {
+        return Err(ambiguous());
+    }
     Ok(Some(first.clone()))
+}
+
+fn matching_native_contents(
+    paths: &BTreeSet<PathBuf>,
+    mut remaining_decoded: u64,
+) -> Result<bool, VideoLinkError> {
+    let mut expected_content = None;
+    for path in paths {
+        let content =
+            match telemetry_format::native_recording_content_fingerprint(path, remaining_decoded) {
+                Ok(content) => content,
+                Err(telemetry_format::NativeContentFingerprintError::Invalid(_)) => {
+                    return Ok(false)
+                }
+                Err(telemetry_format::NativeContentFingerprintError::Io(error)) => {
+                    return Err(io(path, error))
+                }
+                Err(error @ telemetry_format::NativeContentFingerprintError::LimitExceeded(_)) => {
+                    return Err(limit(path, &error.to_string()))
+                }
+            };
+        remaining_decoded -= content.decoded_bytes;
+        if expected_content.is_some_and(|expected| expected != content.fingerprint) {
+            return Ok(false);
+        }
+        expected_content = Some(content.fingerprint);
+    }
+    Ok(true)
 }
 
 fn basename_matches(actual: &Path, declared: &Path) -> bool {
@@ -566,4 +600,26 @@ fn basename_matches(actual: &Path, declared: &Path) -> bool {
                 .and_then(|value| value.to_str())
                 .zip(declared.extension().and_then(|value| value.to_str()))
                 .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn normalized_comparison_shares_its_decoded_budget_across_objects() {
+        let temp = tempfile::tempdir().expect("private tempdir");
+        let one = temp.path().join("one.telemetry");
+        let two = temp.path().join("two.telemetry");
+        let bytes = b"{\"mtj\":1,\"srcp\":\"a\"}\n{\"laps\":[]}\n";
+        fs::write(&one, bytes).expect("native one");
+        fs::write(&two, bytes).expect("native two");
+        let paths = BTreeSet::from([one, two]);
+        assert!(
+            matching_native_contents(&paths, bytes.len() as u64 * 2).expect("budget allows both")
+        );
+        assert!(matches!(
+            matching_native_contents(&paths, bytes.len() as u64 * 2 - 1),
+            Err(VideoLinkError::LimitExceeded { .. })
+        ));
+    }
 }

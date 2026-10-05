@@ -53,17 +53,49 @@ names/indices, without parsing those objects again.
 The canonical collection root applies to videos and original recording paths.
 Native objects must be existing nonempty regular files but may live outside
 that root in a shared cache. Multiple matching candidates select deterministically
-only if their source indices agree and they share one canonical native object
-or have byte-identical native objects. Different native contents or conflicting
-source indices are explicit ambiguity. Original zero-byte stub equality never
-establishes duplicate identity. Native-byte equality proves identical converted
-recordings, not original source bytes or media payloads. Catalog objects must
+only if their source indices agree and they share one canonical native object,
+have byte-identical native objects, or match the path-independent native-content
+fingerprint described below. Different native contents or conflicting source
+indices are explicit ambiguity. Original zero-byte stub equality never
+establishes duplicate identity. These checks establish converted-native identity,
+not original source bytes or media payloads. Catalog objects must
 actually be converted recordings; never supply a video as `metadata_path`.
 
 Each call accepts at most 4096 catalogs and 4096 total video references. Distinct
-native objects use the same 128 MiB/object / 512 MiB total comparison budget.
+native objects use the same 128 MiB/object / 512 MiB total candidate-size budget.
+The normalized fallback has an additional shared 512 MiB decoded-byte budget.
 Sharing one canonical native object needs no hash. Zero/no-video source indices
 and duplicate indices are rejected by both catalog selection and resolution.
+
+### Origin-independent native content
+
+When encoded bytes differ, catalog selection can compare MTJ content using
+`telemetry_format::native_recording_content_fingerprint(path, decoded_byte_limit)`.
+It returns `NativeContentFingerprint { fingerprint, decoded_bytes }` or a typed
+`NativeContentFingerprintError` (`Io`, `Invalid`, `LimitExceeded`). Only
+`fingerprint` is identity; `decoded_bytes` includes ignored origin provenance and
+is used to account for a caller's shared budget.
+
+Only the documented **root header** `srcp` origin path is excluded. The writer
+preserves it in each original converted document. All other root values,
+including native clocks, catalog, source format/identity, placement, passes,
+unknown fields and nested `srcp` metadata, remain significant. Header root keys
+are sorted and length-framed; values retain exact raw JSON, preserving numeric
+lexemes without floating-point conversion. Post-header bytes, including laps
+and every channel record, are streamed verbatim into the fingerprint.
+
+Compression representation and root-key order may differ. Whitespace within
+values/body, number representations and nested-object order must still agree;
+the comparator deliberately does not normalize arbitrary data. It never parses
+channel samples, rewrites provenance, or establishes original-source/video
+identity. Invalid or unprovable normalized content stays ambiguous. Bounds and
+I/O failures remain explicit errors.
+
+The format API accepts plain MTJ or zstd by magic. Limits are 128 MiB input,
+32 MiB header, a 32 MiB zstd window, and decoded bytes capped at the caller's
+limit or 512 MiB. It rejects duplicate root keys, MTX/unsupported header versions,
+non-string `srcp` and absent bodies. This comparison verifies an MTJ envelope,
+not full channel validity; callers supply already-converted native documents.
 
 ## Bounded MP4 media inspection
 

@@ -20,7 +20,12 @@
 )]
 
 mod jsonl;
+mod native_content;
 mod write;
+
+pub use native_content::{
+    native_recording_content_fingerprint, NativeContentFingerprint, NativeContentFingerprintError,
+};
 
 pub use jsonl::{
     is_jsonl_ext_path, is_jsonl_path, is_jsonl_zstd_path, period_ns_from_hz,
