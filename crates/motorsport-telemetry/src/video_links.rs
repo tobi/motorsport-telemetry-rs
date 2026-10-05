@@ -110,7 +110,10 @@ fn limit(path: &Path, message: &str) -> VideoLinkError {
     }
 }
 
-fn canonical_file(path: &Path, boundary: Option<&Path>) -> Result<PathBuf, VideoLinkError> {
+pub(crate) fn canonical_file(
+    path: &Path,
+    boundary: Option<&Path>,
+) -> Result<PathBuf, VideoLinkError> {
     let canonical = fs::canonicalize(path).map_err(|error| io(path, error))?;
     if boundary.is_some_and(|root| !canonical.starts_with(root)) {
         return Err(invalid(path, "file escapes the canonical root"));
@@ -121,7 +124,7 @@ fn canonical_file(path: &Path, boundary: Option<&Path>) -> Result<PathBuf, Video
     Ok(canonical)
 }
 
-fn root(path: Option<&Path>) -> Result<Option<PathBuf>, VideoLinkError> {
+pub(crate) fn root(path: Option<&Path>) -> Result<Option<PathBuf>, VideoLinkError> {
     path.map(|path| {
         let root = fs::canonicalize(path).map_err(|error| io(path, error))?;
         if !root.is_dir() {

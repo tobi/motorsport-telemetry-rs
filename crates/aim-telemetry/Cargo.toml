@@ -10,6 +10,7 @@ description = "Streaming AiM Sports aimd telemetry reader for MP4 recordings"
 [dependencies]
 motorsport-telemetry-core.workspace = true
 thiserror.workspace = true
+blake3.workspace = true
 
 [lints]
 workspace = true
