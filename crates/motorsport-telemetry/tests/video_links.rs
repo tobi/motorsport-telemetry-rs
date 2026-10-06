@@ -295,14 +295,21 @@ fn escaping_symlinks_are_rejected_and_same_identity_aliases_are_deduplicated() {
             .recording_path,
         fs::canonicalize(&recording).unwrap()
     );
-    symlink(&video, root.join("run_0001.MP4")).unwrap();
+    // Put the case-variant alias in the other searched directory so it is a
+    // distinct entry even on case-insensitive filesystems.
+    let alias = temp.path().join("run_0001.MP4");
+    symlink(&video, &alias).unwrap();
     assert_eq!(
-        resolve_linked_videos(&recording, &[reference("run_0001.mp4", 1)], Some(&root))
-            .unwrap()
-            .len(),
+        resolve_linked_videos(
+            &recording,
+            &[reference("run_0001.mp4", 1)],
+            Some(temp.path())
+        )
+        .unwrap()
+        .len(),
         1
     );
-    fs::remove_file(root.join("run_0001.MP4")).unwrap();
+    fs::remove_file(alias).unwrap();
     fs::remove_file(&video).unwrap();
     fs::write(temp.path().join("run_0001.mp4"), []).unwrap();
     symlink(temp.path().join("run_0001.mp4"), &video).unwrap();
