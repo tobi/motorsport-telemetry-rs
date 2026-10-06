@@ -476,6 +476,30 @@ impl RacelogicFile {
             .unwrap_or(0)
             .saturating_add(sample_period);
 
+        // Only an explicitly declared cadence establishes missing acquisition
+        // evidence. Permit jitter and up to two missed nominal rows (including
+        // native 39/81 ms pairs and duplicates followed by 80 ms); longer gaps
+        // split supported runs. An inferred first delta is not such a contract.
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        for end in 1..=rows {
+            let split = end == rows
+                || tsample_period.is_some_and(|period| {
+                    period > 0
+                        && time_ns[end].saturating_sub(time_ns[end - 1]) > period.saturating_mul(3)
+                });
+            if split {
+                chunks.push(Chunk {
+                    sample_period_ns: sample_period,
+                    sample_count: (end - start) as u64,
+                    data_ptr: start as u64,
+                    sample_base: start as u64,
+                    time_base_ns: time_ns[start],
+                });
+                start = end;
+            }
+        }
+
         // `[channel units]` declares one unit per custom (non-builtin) column.
         // Real VBOX loggers (VBVDHD2 firmware 1.x) emit one extra leading entry
         // covering the last builtin column (`avisynctime`, "s"), so the list
@@ -538,16 +562,7 @@ impl RacelogicFile {
                 unit,
                 unit_source,
                 sample_type: SampleType::F64,
-                chunks: sampled
-                    .then_some(Chunk {
-                        sample_period_ns: sample_period,
-                        sample_count: rows as u64,
-                        data_ptr: 0,
-                        sample_base: 0,
-                        time_base_ns: 0,
-                    })
-                    .into_iter()
-                    .collect(),
+                chunks: if sampled { chunks.clone() } else { Vec::new() },
                 sample_count: if sampled { rows as u64 } else { 0 },
                 duration_ns: if sampled { duration } else { 0 },
             });
@@ -989,11 +1004,23 @@ impl TelemetrySource for RacelogicFile {
     fn video_timeline(&self) -> Option<&VideoTimeline> {
         self.video_timeline.as_ref()
     }
-    fn decode(&self, channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
+    fn decode(&self, channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
+        let Some(chunk) = self
+            .channels
+            .get(channel_index)
+            .and_then(|channel| channel.chunks.get(chunk_index))
+            .filter(|chunk| local_index < chunk.sample_count)
+        else {
+            return f64::NAN;
+        };
         let Some(values) = self.values.get(channel_index) else {
             return f64::NAN;
         };
-        let Some(index) = usize::try_from(local_index).ok() else {
+        let Some(index) = chunk
+            .sample_base
+            .checked_add(local_index)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
             return f64::NAN;
         };
         values.get(index).copied().unwrap_or(f64::NAN)
@@ -1154,6 +1181,65 @@ mod tests {
         assert_eq!(file.time_ns, [0, 500_000_000, 1_500_000_000]);
         assert_eq!(file.decode(1, 0, 2), 40.0);
         assert_eq!(file.sample_at(1, 1_000_000_000, true), Some(30.0));
+    }
+
+    #[test]
+    fn declared_cadence_splits_long_gaps_without_losing_native_rows() {
+        let text = "[header]\ntime\nsampleperiod\nvelocity kmh\ngear\n[column names]\ntime Tsample velocity Gear\n[data]\n120000.000 0.040 10 3\n120000.039 0.040 20 3\n120000.120 0.040 30 4\n120000.120 0.040 31 4\n120000.200 0.040 40 4\n120000.320 0.040 50 5\n130000.000 0.040 60 6\n130000.040 0.040 70 6\n";
+        let fixture = fixture(text);
+        let file = RacelogicFile::open(fixture.path()).unwrap();
+        let indexed = RacelogicFile::open_metadata(fixture.path()).unwrap();
+        assert_eq!(file.time_ns, indexed.time_ns);
+        assert_eq!(file.metadata().laps, indexed.metadata().laps);
+        assert_eq!(file.video_timeline(), indexed.video_timeline());
+        for (index, channel) in indexed.channels.iter().enumerate() {
+            if channel.sample_count == 0 {
+                continue;
+            }
+            assert_eq!(channel.chunks.len(), 2);
+            assert_eq!(channel.chunks[1].sample_base, 6);
+            for (chunk_index, chunk) in channel.chunks.iter().enumerate() {
+                for local in 0..chunk.sample_count {
+                    assert_eq!(
+                        indexed.decode(index, chunk_index, local),
+                        file.decode(index, chunk_index, local)
+                    );
+                    assert_eq!(
+                        indexed.sample_time_ns(index, chunk_index, local),
+                        file.sample_time_ns(index, chunk_index, local)
+                    );
+                }
+            }
+        }
+        assert_eq!(file.channels[2].sample_count, 8);
+        assert_eq!(file.channels[2].chunks.len(), 2);
+        assert_eq!(file.channels[2].chunks[1].sample_base, 6);
+        assert_eq!(file.decode(2, 1, 0), 60.0);
+        assert_eq!(file.sample_time_ns(2, 1, 0), 3_600_000_000_000);
+        assert_eq!(file.sample_at(2, 120_000_000, true), Some(31.0));
+        assert_eq!(
+            file.sample_at(2, 80_000_000, true),
+            Some(20.0 + 10.0 * 41.0 / 81.0)
+        );
+        assert_eq!(file.sample_at(2, 260_000_000, true), Some(45.0));
+        for linear in [false, true] {
+            assert_eq!(file.sample_at(2, 340_000_000, linear), Some(50.0));
+            assert_eq!(file.sample_at(2, 360_000_000, linear), None);
+            assert_eq!(file.sample_at(2, 1_000_000_000, linear), None);
+            assert_eq!(file.sample_at(3, 1_000_000_000, linear), None);
+            assert_eq!(file.sample_at(2, 3_600_000_000_000, linear), Some(60.0));
+        }
+        for channel in &file.channels {
+            assert_eq!(
+                channel
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.sample_count)
+                    .sum::<u64>(),
+                8
+            );
+        }
+        assert!(file.decode(2, 1, 2).is_nan());
     }
 
     #[test]

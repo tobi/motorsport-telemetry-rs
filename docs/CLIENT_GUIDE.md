@@ -23,6 +23,37 @@ Everything below is in **file-relative integer nanoseconds** (`time_ns`,
 `start_ns`, `end_ns`, `duration_ns`): zero is the first sample of the
 recording, and there is no other time axis inside a file.
 
+### Sampling and missing acquisition
+
+`sample_at(channel, time_ns, true)` uses timestamp-aware linear interpolation
+for floating continuous channels. Integer storage and recognized state,
+counter, flag, and gear names always use hold sampling. This storage-based
+policy also applies to physically continuous signals stored as integers;
+clients should not assume that every speed or pressure channel interpolates.
+Passing `false` requests hold sampling for every channel. Neither mode adds
+measured bandwidth or applies a smoothing or anti-alias filter.
+
+Grid sampling refuses acquisition gaps. Explicit timestamp sampling respects
+chunk breaks with a positive nominal period: the last observation is held for
+one period, then a gap returns `None` until the next run starts. Contiguous
+storage chunks still interpolate. Within an explicit run, timestamps determine
+the interpolation interval; no universal maximum interval is inferred.
+
+VBO files with a positive declared `Tsample` split runs when the interval
+exceeds three nominal periods. This conservative support policy permits short
+jitter, duplicate rows, and up to two missed nominal rows (including native
+39/81 ms pairs at 25 Hz). It does not imply that the intervening values were
+measured. Without declared cadence, irregular VBO timestamps remain supported
+by adjacent-observation interpolation. All native rows and stamps are retained;
+video-clock support is checked separately and can be stricter.
+
+MTJ conversion places observations on its channel lattice. Empty slots contain
+`null`, which samples as `Some(NaN)` rather than a finite value. Treat both
+`None` and non-finite values as missing; forward-filling them can conceal gaps.
+Finite values retain their numeric precision, but native timestamps and lap
+boundaries can move during lattice quantization. Exact observations on the
+lattice remain available even when the following slot is missing.
+
 ```rust,no_run
 use motorsport_telemetry::{open, motorsport_telemetry_core::TelemetrySource, SourceExt};
 

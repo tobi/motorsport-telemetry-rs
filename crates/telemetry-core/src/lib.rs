@@ -669,6 +669,9 @@ pub trait TelemetrySource: Send + Sync {
     ///
     /// Grid channels use the chunk time base and period; Explicit channels
     /// bisect the per-sample stamps and interpolate between adjacent stamps.
+    /// Across an Explicit chunk break with a positive nominal period, the last
+    /// sample is held for that period; a later next chunk leaves a gap returning
+    /// `None`. No interval cutoff is inferred within an Explicit chunk.
     fn sample_at(&self, channel_index: usize, time_ns: u64, linear: bool) -> Option<f64> {
         let channel = self.channels().get(channel_index)?;
         if channel.chunks.is_empty() || time_ns >= channel.duration_ns {
@@ -702,6 +705,9 @@ pub trait TelemetrySource: Send + Sync {
                 let sample_time = chunk
                     .time_base_ns
                     .saturating_add(sample.saturating_mul(chunk.sample_period_ns));
+                if time_ns == sample_time {
+                    return Some(a);
+                }
                 let next_sample = sample.saturating_add(1);
                 let (b, next_time) = if next_sample < chunk.sample_count {
                     (
@@ -741,6 +747,17 @@ pub trait TelemetrySource: Send + Sync {
                 let stamp = times[index];
                 let (chunk_index, local_index) = chunk_for_global(channel, index as u64)?;
                 let a = self.decode(channel_index, chunk_index, local_index);
+                if time_ns == stamp {
+                    return Some(a);
+                }
+                if index + 1 < times.len() {
+                    let (next_chunk, _) = chunk_for_global(channel, (index + 1) as u64)?;
+                    let period = channel.chunks[chunk_index].sample_period_ns;
+                    let end = stamp.saturating_add(period);
+                    if next_chunk != chunk_index && period > 0 && times[index + 1] > end {
+                        return (time_ns < end).then_some(a);
+                    }
+                }
                 if !linear || channel.uses_step_interpolation() || index + 1 >= times.len() {
                     return Some(a);
                 }
@@ -1029,8 +1046,8 @@ mod tests {
         fn channels(&self) -> &[Channel] {
             std::slice::from_ref(&self.channel)
         }
-        fn decode(&self, _channel_index: usize, _chunk_index: usize, local_index: u64) -> f64 {
-            self.values[local_index as usize]
+        fn decode(&self, _channel_index: usize, chunk_index: usize, local_index: u64) -> f64 {
+            self.values[(self.channel.chunks[chunk_index].sample_base + local_index) as usize]
         }
         fn sample_times(&self, _channel_index: usize) -> SampleTimes<'_> {
             SampleTimes::Explicit(&self.times)
@@ -1090,6 +1107,57 @@ mod tests {
         assert_eq!(source.sample_at(0, 99, false), None);
         // At or beyond duration is None.
         assert_eq!(source.sample_at(0, 2_000, true), None);
+    }
+
+    #[test]
+    fn explicit_chunk_breaks_refuse_gaps_but_interpolate_contiguous_storage() {
+        let mut source = explicit_source();
+        source.channel.chunks = vec![
+            Chunk {
+                sample_period_ns: 400,
+                sample_count: 2,
+                data_ptr: 0,
+                sample_base: 0,
+                time_base_ns: 100,
+            },
+            Chunk {
+                sample_period_ns: 400,
+                sample_count: 1,
+                data_ptr: 2,
+                sample_base: 2,
+                time_base_ns: 700,
+            },
+            Chunk {
+                sample_period_ns: 400,
+                sample_count: 1,
+                data_ptr: 3,
+                sample_base: 3,
+                time_base_ns: 1500,
+            },
+        ];
+        assert_eq!(source.sample_at(0, 500, true), Some(15.0));
+        for linear in [false, true] {
+            assert_eq!(source.sample_at(0, 700, linear), Some(20.0));
+            assert_eq!(source.sample_at(0, 900, linear), Some(20.0));
+            assert_eq!(source.sample_at(0, 1100, linear), None);
+            assert_eq!(source.sample_at(0, 1400, linear), None);
+            assert_eq!(source.sample_at(0, 1500, linear), Some(30.0));
+        }
+        source.channel.sample_type = SampleType::U8;
+        assert_eq!(source.sample_at(0, 500, true), Some(10.0));
+        assert_eq!(source.sample_at(0, 1100, true), None);
+    }
+
+    #[test]
+    fn exact_samples_survive_a_following_missing_value() {
+        let mut grid = two_sample_source(SampleType::F64);
+        grid.values[1] = f64::NAN;
+        assert_eq!(grid.sample_at(0, 0, true), Some(10.0));
+        assert!(grid.sample_at(0, 500_000_000, true).unwrap().is_nan());
+        let mut explicit = explicit_source();
+        explicit.values[1] = f64::NAN;
+        assert_eq!(explicit.sample_at(0, 100, true), Some(0.0));
+        assert!(explicit.sample_at(0, 200, true).unwrap().is_nan());
     }
 
     #[test]
