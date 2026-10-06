@@ -281,7 +281,7 @@ fn explicit_root_is_validated_even_when_track_yml_is_ignored() {
                     Some(1),
                     "{command}: {root:?}: {output:?}"
                 );
-                assert!(!output.stderr.is_empty());
+                assert_ne!(output.stderr, [] as [u8; 0]);
                 assert!(!dest.exists());
             }
         }
@@ -556,10 +556,12 @@ fn strip_passes_recovers_raw_bytes_in_all_recording_encodings() {
             assert!(out.status.success(), "{suffix}: {out:?}");
         }
         let raw_bytes = std::fs::read(&raw).unwrap();
-        assert!(!motorsport_telemetry::open(&passed)
-            .unwrap()
-            .applied_passes()
-            .is_empty());
+        assert_ne!(
+            motorsport_telemetry::open(&passed)
+                .unwrap()
+                .applied_passes(),
+            []
+        );
         // Both separate output and an in-place rewrite use the requested encoding.
         for dest in [&stripped, &passed] {
             let out = cli()
@@ -569,10 +571,10 @@ fn strip_passes_recovers_raw_bytes_in_all_recording_encodings() {
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{suffix}: {out:?}");
-            assert!(motorsport_telemetry::open(dest)
-                .unwrap()
-                .applied_passes()
-                .is_empty());
+            assert_eq!(
+                motorsport_telemetry::open(dest).unwrap().applied_passes(),
+                []
+            );
             assert_eq!(std::fs::read(dest).unwrap(), raw_bytes, "{suffix}");
         }
     }

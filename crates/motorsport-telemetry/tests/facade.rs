@@ -94,7 +94,7 @@ fn delayed_aim_gps_recovers_existing_coordinates_through_jsonl_conversion() {
     let raw = open(stripped).unwrap();
     assert_eq!(raw.channels().len(), source.channels().len());
     assert_eq!(raw.normalizer().sample(0).latitude_deg, anchor.latitude_deg);
-    assert!(raw.applied_passes().is_empty());
+    assert_eq!(raw.applied_passes(), []);
 }
 
 #[test]

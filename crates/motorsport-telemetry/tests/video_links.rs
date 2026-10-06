@@ -223,9 +223,10 @@ fn duplicate_indices_are_invalid_and_empty_catalog_requires_no_neighbor_scan() {
         ),
         Err(VideoLinkError::DuplicateVideoIndex(1))
     ));
-    assert!(resolve_linked_videos(&recording, &[], Some(temp.path()))
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        resolve_linked_videos(&recording, &[], Some(temp.path())).unwrap(),
+        [] as [motorsport_telemetry::ResolvedVideoFile; 0]
+    );
 }
 
 #[test]

@@ -762,7 +762,10 @@ fn extension_is_header_then_channels() {
     assert!(opened.is_extension());
     assert_eq!(opened.sidecar_groups()[0].header.name, "Ride height");
     assert!(opened.sidecar_groups()[0].header.visible);
-    assert!(opened.metadata().laps.is_empty());
+    assert_eq!(
+        opened.metadata().laps,
+        [] as [motorsport_telemetry_core::LapMetadata; 0]
+    );
     assert_eq!(opened.channels().len(), 1);
     assert_eq!(opened.channel_visible(), [true]);
     assert_eq!(opened.channels()[0].name, "Ride Height FL");
@@ -952,7 +955,7 @@ fn parses_foreign_channel_display() {
     assert_eq!(display.scale_max, Some(120.0));
     assert_eq!(display.decimals, Some(1));
     assert_eq!(display.format, "0.0°C");
-    assert!(opened.channel_labels(0).is_empty());
+    assert_eq!(opened.channel_labels(0), []);
 }
 
 #[test]

@@ -214,8 +214,8 @@ fn nulls_mask_identity_and_driver_wildcards() {
         "event: null\ntrack: null\ndriver:\n  mappings:\n    '*': Fallback\n    3: null\n",
     );
     let m = open(&file).unwrap().metadata();
-    assert!(m.identity.event.is_empty());
-    assert!(m.identity.venue.is_empty());
+    assert_eq!(m.identity.event, "");
+    assert_eq!(m.identity.venue, "");
     assert_eq!(m.driver_name_for_id(3.0), None);
     assert_eq!(m.driver_name_for_id(4.0), Some("Fallback"));
 }
@@ -515,16 +515,18 @@ fn directory_resolution_reads_only_defaults_and_can_exclude_target() {
             .unwrap()
             .clone()]
     );
-    assert!(
+    assert_eq!(
         load_track_directory_metadata(&child, &OpenOptions::default(), true)
             .unwrap()
-            .layers
-            .is_empty()
+            .layers,
+        [] as [serde_json::Map<String, serde_json::Value>; 0]
     );
-    assert!(load_track_directory_metadata(&root, &rooted(&root), true)
-        .unwrap()
-        .paths
-        .is_empty());
+    assert_eq!(
+        load_track_directory_metadata(&root, &rooted(&root), true)
+            .unwrap()
+            .paths,
+        [] as [PathBuf; 0]
+    );
     // Exclusion does not read the document being edited, but inherited files
     // still use the exact same validation policy as recording resolution.
     yaml(&child, "event: [\n");
@@ -648,15 +650,15 @@ fn public_resolvers_report_explicit_target_and_root_errors_including_opt_out() {
     assert!(read_track_metadata_document(temp.path(), None).is_err());
     assert!(read_track_metadata_document(temp.path().join("missing"), None).is_err());
     yaml(temp.path(), "invalid: [");
-    assert!(load_track_metadata(&file, &ignored())
-        .unwrap()
-        .paths
-        .is_empty());
-    assert!(
+    assert_eq!(
+        load_track_metadata(&file, &ignored()).unwrap().paths,
+        [] as [PathBuf; 0]
+    );
+    assert_eq!(
         load_track_directory_metadata(temp.path(), &ignored(), false)
             .unwrap()
-            .layers
-            .is_empty()
+            .layers,
+        [] as [serde_json::Map<String, serde_json::Value>; 0]
     );
 }
 
