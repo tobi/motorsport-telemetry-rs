@@ -36,6 +36,11 @@ fn yaml(directory: &Path, text: &str) {
     fs::create_dir_all(directory).unwrap();
     fs::write(directory.join("TRACK.yml"), text).unwrap();
 }
+fn metadata_path(directory: &Path) -> PathBuf {
+    // Contributor paths use canonical directories, retaining the document name
+    // even when TRACK.yml itself is a symlink. macOS's temp root is an alias.
+    fs::canonicalize(directory).unwrap().join("TRACK.yml")
+}
 fn ignored() -> OpenOptions {
     OpenOptions {
         ignore_track_yml: true,
@@ -429,7 +434,7 @@ fn public_recording_resolver_supports_empty_and_non_vendor_files_without_decodin
         let path = folder.join(name);
         fs::write(&path, []).unwrap();
         let resolved = load_track_metadata(&path, &OpenOptions::default()).unwrap();
-        assert_eq!(resolved.paths, vec![folder.join("TRACK.yml")]);
+        assert_eq!(resolved.paths, vec![metadata_path(&folder)]);
         let mut extra = MetadataMap::new();
         resolved.apply_to(&mut extra);
         assert_eq!(extra["event"], "Video");
@@ -454,7 +459,7 @@ fn public_layers_preserve_null_masks_rule_order_and_contributing_paths() {
     let resolved = load_track_metadata(&path, &rooted(&root)).unwrap();
     assert_eq!(
         resolved.paths,
-        vec![root.join("TRACK.yml"), folder.join("TRACK.yml")]
+        vec![metadata_path(&root), metadata_path(&folder)]
     );
     assert_eq!(resolved.layers.len(), 4);
     assert!(resolved.layers[0]["custom"].is_null());
@@ -493,10 +498,7 @@ fn directory_resolution_reads_only_defaults_and_can_exclude_target() {
     yaml(&child, "event: Child\ncustom: {new: true}\n");
     let all = load_track_directory_metadata(&child, &rooted(&root), false).unwrap();
     assert_eq!(all.layers.len(), 2);
-    assert_eq!(
-        all.paths,
-        vec![root.join("TRACK.yml"), child.join("TRACK.yml")]
-    );
+    assert_eq!(all.paths, vec![metadata_path(&root), metadata_path(&child)]);
     let mut extra = json!({"custom":{"old":true}}).as_object().unwrap().clone();
     all.apply_to(&mut extra);
     assert_eq!(
@@ -507,7 +509,7 @@ fn directory_resolution_reads_only_defaults_and_can_exclude_target() {
             .clone()
     );
     let inherited = load_track_directory_metadata(&child, &rooted(&root), true).unwrap();
-    assert_eq!(inherited.paths, vec![root.join("TRACK.yml")]);
+    assert_eq!(inherited.paths, vec![metadata_path(&root)]);
     assert_eq!(
         inherited.layers,
         vec![json!({"event":"Ancestor","custom":null})
@@ -685,7 +687,7 @@ fn public_resolvers_enforce_canonical_roots_and_metadata_symlink_boundaries() {
     let resolved = load_track_metadata(&file, &rooted(&root)).unwrap();
     assert_eq!(
         resolved.paths,
-        vec![root.join("TRACK.yml"), child.join("TRACK.yml")]
+        vec![metadata_path(&root), metadata_path(&child)]
     );
     assert_eq!(
         read_track_metadata_document(child.join("TRACK.yml"), Some(&root)).unwrap()["event"],
