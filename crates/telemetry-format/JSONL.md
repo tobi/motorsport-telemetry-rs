@@ -380,11 +380,13 @@ missing or non-finite native samples are `null`.
 
 Writers MUST write an integral value that is exactly representable in IEEE-754
 binary64 as a JSON integer (`12`, not `12.0`). Other finite values are JSON
-numbers with no insignificant trailing zeros. A value that is a promoted
-IEEE-754 binary32 SHOULD be written as that binary32's shortest decimal
-(`0.2`, not `0.20000000298023224`). Readers store the parsed JSON number;
-bit-identical binary64 is not required. Values are already in engineering
-units: no scale or bias is applied by the reader.
+numbers with no insignificant trailing zeros, using the shortest decimal that
+round-trips to their binary64 numeric value. Incidental binary32 representability
+MUST NOT select a lossy decimal: `2048.34375` cannot become `2048.3438`, and a
+promoted binary32 `0.2` is retained as `0.20000000298023224`. Readers preserve
+the stored binary64 numeric value. This does not preserve the vendor encoding,
+non-finite payloads or signed-zero representation. Values are already in
+engineering units: no scale or bias is applied by the reader.
 
 `u` is the source unit string. Do not invent a unit from the channel name.
 Readers MAY normalize aliases through the shared unit registry; the file

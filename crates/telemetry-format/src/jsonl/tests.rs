@@ -198,10 +198,13 @@ fn write_alignment_jsonl(source: &TinySource) -> (Vec<u8>, JsonlRecording) {
 }
 
 #[test]
-fn promoted_f32_values_write_short_decimals() {
+fn promoted_f32_values_keep_their_binary64_numeric_value() {
     let mut short = Vec::new();
     write_number(&mut short, f64::from(0.2f32)).unwrap();
-    assert_eq!(String::from_utf8(short).unwrap(), "0.2");
+    assert_eq!(
+        String::from_utf8(short).unwrap(),
+        format!("{}", f64::from(0.2f32))
+    );
     let mut exact = Vec::new();
     write_number(&mut exact, 1.0 / 3.0).unwrap();
     assert_eq!(String::from_utf8(exact).unwrap(), format!("{}", 1.0 / 3.0));
@@ -289,6 +292,29 @@ fn round_trip_preserves_alignment_and_values() {
     assert_eq!(opened.sample_time_ns(0, 0, 1), 10_000_000);
     assert_eq!(opened.sample_time_ns(1, 0, 0), 0);
     assert_eq!(opened.metadata().laps[0].end_ns, 40_000_000);
+}
+
+#[test]
+fn source_values_are_preserved_when_exactly_representable_as_f32() {
+    let mut source = tiny();
+    // Real VBO coordinates are binary64 source values. Their incidental
+    // binary32 representability must not select a lossy decimal encoding.
+    source.channels[0].name = "latitude".into();
+    source.channels[0].unit = "min".into();
+    source.values[0] = vec![2048.34375, 5029.03125, f64::from(0.2f32), 1.0 / 3.0];
+    for compressed in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("precision.telemetry");
+        write_jsonl_from_source_with(&source, &path, compressed).unwrap();
+        let opened = JsonlRecording::open(&path).unwrap();
+        for (index, expected) in source.values[0].iter().enumerate() {
+            assert_eq!(
+                opened.decode(0, 0, index as u64).to_bits(),
+                expected.to_bits(),
+                "source sample {index}, compressed={compressed}"
+            );
+        }
+    }
 }
 
 #[test]

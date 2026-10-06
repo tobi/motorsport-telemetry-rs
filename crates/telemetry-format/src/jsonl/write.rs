@@ -701,13 +701,10 @@ pub(super) fn write_number(
             return Ok(());
         }
     }
-    let as_f32 = value as f32;
-    let rendered = if as_f32.is_finite() && f64::from(as_f32) == value {
-        format!("{as_f32}")
-    } else {
-        format!("{value}")
-    };
-    writer.write_all(rendered.as_bytes())?;
+    // A value's incidental binary32 representability is not its source type.
+    // Its shortest binary32 decimal can change the binary64 number on read
+    // (e.g. a VBO coordinate of 2048.34375 becomes 2048.3438).
+    write!(writer, "{value}")?;
     Ok(())
 }
 fn write_opt_string(

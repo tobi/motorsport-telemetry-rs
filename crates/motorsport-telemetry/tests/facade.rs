@@ -352,7 +352,7 @@ fn jsonl_uncompressed_round_trip_keeps_cosworth_lap_summary() {
 }
 
 #[test]
-fn jsonl_is_not_a_bit_copy_of_native_float32() {
+fn jsonl_preserves_the_numeric_value_of_native_float32() {
     let source = open(fixture("synthetic_motec.ld")).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("synthetic_motec.telemetry.jsonl");
@@ -372,11 +372,11 @@ fn jsonl_is_not_a_bit_copy_of_native_float32() {
         .map(|index| jsonl.decode(index, 0, 1))
         .unwrap();
     assert_eq!(native, f64::from(0.2f32));
-    assert_eq!(stored, 0.2);
-    assert_ne!(
+    assert_eq!(stored, f64::from(0.2f32));
+    assert_eq!(
         native.to_bits(),
         stored.to_bits(),
-        "JSON 0.2 is not the promoted f32 bit pattern"
+        "conversion must preserve the promoted f32 numeric value"
     );
 }
 

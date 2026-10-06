@@ -11,9 +11,11 @@ short name is the default destination. Readers detect compression by
 content. MTX sidecars are separate JSONL documents joined with
 `JsonlRecording::attach`.
 
-MTJ aligns samples to each channel's `hz`/`t0` lattice and rounds values.
-Irregular event streams are omitted. Keep the original vendor recording
-when the exact source encoding or irregular samples are needed.
+MTJ aligns samples to each channel's `hz`/`t0` lattice and preserves finite
+numeric sample values as binary64. Timestamp placement can be quantized by
+up to half a channel period; collisions keep the earlier observation, gaps
+are `null`, and irregular event streams are omitted. Keep the original vendor
+recording when the exact source encoding or irregular samples are needed.
 Header-only reads stream decompression through the header and laps lines;
 they never parse channel values in current recordings.
 

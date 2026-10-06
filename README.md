@@ -15,8 +15,9 @@ and convert to compressed JSONL.
 
 `.telemetry` is an MTJ JSONL document in one zstd frame. Plain JSONL and MTX
 sidecars are also supported; readers detect compression from the contents.
-Conversion aligns samples to a time lattice, rounds values, and omits irregular
-channels. Keep the vendor recording when exact original samples are needed.
+Conversion aligns samples to a time lattice, preserves finite numeric values,
+and omits irregular channels. Timestamp quantization and slot collisions remain
+lossy. Keep the vendor recording when exact original samples are needed.
 Video files remain separate; their timestamps and references are preserved.
 
 ## CLI

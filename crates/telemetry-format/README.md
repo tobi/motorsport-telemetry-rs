@@ -12,7 +12,9 @@ Read and write MTJ recordings and MTX sidecars as time-aligned JSONL.
   sidecar metadata require a full parse.
 - MTX sidecars contain channels and/or spans, with UTC placement for joining.
 
-Conversion aligns samples, rounds values, and omits irregular channels.
+Conversion aligns samples to channel lattices, preserves finite numeric values,
+and omits irregular channels. Timestamp quantization and slot collisions remain
+lossy; keep original vendor recordings.
 Video linkage and processing provenance live in the recording header.
 `JSONL_VERSION` and `JSONL_EXT_VERSION` version recordings and sidecars.
 
