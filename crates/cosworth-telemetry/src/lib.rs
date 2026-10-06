@@ -1773,12 +1773,12 @@ mod tests {
                 late_brake.push(file.decode(brake_ch, 0, local));
             }
         }
-        assert!(!early_throttle.is_empty());
+        assert_ne!(early_throttle, [] as [f64; 0]);
         assert!(
             early_throttle.iter().all(|value| *value > 80.0),
             "front-straight throttle after lap-distance reset {early_throttle:?}"
         );
-        assert!(!late_throttle.is_empty());
+        assert_ne!(late_throttle, [] as [f64; 0]);
         assert!(
             late_throttle.iter().all(|value| *value >= 50.0)
                 && late_brake.iter().all(|value| *value == 0.0),
