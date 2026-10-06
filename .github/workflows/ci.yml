@@ -21,12 +21,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # validate-mtx.py runs under `uv run --with jsonschema` from a unit test.
       - uses: astral-sh/setup-uv@v6
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Name the installed toolchain explicitly: rust-toolchain.toml pins the
+      # MSRV, whose Clippy cannot read the current strict lint configuration.
+      - run: cargo +stable fmt --check
+      - run: cargo +stable clippy --workspace --all-targets -- -D warnings
       # Include example tests (the audit probe has NaN/unit regressions),
       # then run doctests separately: --all-targets does not include them.
-      - run: cargo test --workspace --all-targets
-      - run: cargo test --workspace --doc
+      - run: cargo +stable test --workspace --all-targets
+      - run: cargo +stable test --workspace --doc
 
   package:
     runs-on: ubuntu-latest
